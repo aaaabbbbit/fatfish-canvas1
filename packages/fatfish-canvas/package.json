@@ -1,0 +1,53 @@
+{
+  "name": "fatfish-canvas",
+  "version": "0.1.0",
+  "description": "肥鱼画布 — DeepSeek Harness 无限画布插件：左侧无限画布、右侧原生聊天，生成结果直接落到画布节点。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node scripts/test-model.mjs && node scripts/test-host.mjs",
+    "verify": "node scripts/verify-client.mjs",
+    "e2e": "node scripts/e2e-canvas.mjs",
+    "e2e:p4": "node scripts/e2e-p4.mjs",
+    "e2e:p5": "node scripts/e2e-p5.mjs",
+    "e2e:theme": "node scripts/e2e-theme.mjs",
+    "e2e:command": "node scripts/e2e-command.mjs",
+    "e2e:scope": "node scripts/e2e-scope.mjs",
+    "e2e:entry": "node scripts/e2e-entry.mjs",
+    "e2e:settings": "node scripts/e2e-settings.mjs",
+    "restart:verify": "node scripts/post-restart.mjs --delay 5000 --verify",
+    "e2e:ingest": "node scripts/e2e-ingest.mjs",
+    "fake-media": "node scripts/fake-media-server.mjs --port 8791 --delay 2500",
+    "probe": "node scripts/probe-gui.mjs",
+    "check": "node build.mjs && tsc -p tsconfig.json --noEmit && node scripts/test-model.mjs && node scripts/test-host.mjs && node scripts/verify-client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "license": "MIT"
+}

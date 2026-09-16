@@ -1,0 +1,263 @@
+/**
+ * 供应商目录（宿主与设置页**共用的一份**）。
+ *
+ * 放在 `src/client/shared/` 而不是 `src/shared/`，是因为客户端打包器只把
+ * `src/client` 当作解析根，跨出这个根目录的 import 无法解析。宿主半边则用
+ * `../client/shared/catalog` 反向引用 —— 目录里只有纯数据与纯函数，没有任何
+ * schemastery / Node 依赖，因此同时安全地存在于两个半边。
+ *
+ * ## P9：目录从「可配置清单」变成了**预设**
+ *
+ * 早期（P2–P8）用户能配的只有目录里那几条固定供应商（每条一个模型）。现在
+ * 供应商与模型都是**用户数据**（一个供应商可以挂多个模型，每个模型可单独配
+ * 密钥），目录退化成「一键添加」的模板：设置页拿它预填一条供应商记录，之后
+ * 一切都是用户自己的数据。
+ *
+ * 两条因此固定下来的约定：
+ *
+ * 1. **供应商 id 是用户的 slug**（预填时来自预设 id），只允许小写字母/数字/
+ *    短横线 —— 它要能安全地出现在设置字段路径与凭据引用名里。
+ * 2. **密钥一律不进设置**：设置里只存凭据**引用名**（`apiKeyEnv`），
+ *    值在 DSH 凭据库（`ctx.credentials`）里。这样脱敏视图与真实视图一致，
+ *    任何写入形状都不会抹掉别人的机密（旧设计要为此把字段摊平，见 P2 注释）。
+ *
+ * @module fatfish-canvas/shared/catalog
+ */
+
+/** 设置 namespace 名。宿主注册它、设置页绑定它，因此和目录一起放在共享模块。 */
+export const MEDIA_NS = 'media-generation';
+
+/** 媒体种类（一次**生成**的产物）。 */
+export type MediaKind = 'image' | 'video';
+
+/**
+ * 设置里一个**模型条目**的种类。
+ *
+ * `vision` 不是产物，而是「眼睛」：文本模型看不见参考图时，由它把图读成一段文字
+ * （见 host/vision 与 `defaultVision`）。它和图像 / 视频模型挂在同一个供应商字典下，
+ * 因此设置页里它们是并排的一行，用户不必去别处再配一次密钥。
+ */
+export type ModelKind = MediaKind | 'vision';
+
+/** 适配器种类。三种都按 OpenAI 兼容协议通信。 */
+export type MediaApi = 'openai-images' | 'openai-videos' | 'openai-vision';
+
+/**
+ * 模型种类 → 适配器。
+ *
+ * 由**模型**的种类决定，而不是供应商的：同一个 gateway 往往既提供图像模型
+ * 也提供视频模型（OpenAI 自己就是 gpt-image-1 + sora），把适配器挂在供应商上
+ * 会逼用户为同一个 baseURL 建两条记录。
+ * @param kind - 模型种类。
+ * @returns 适配器名。
+ */
+export function apiOf(kind: ModelKind): MediaApi {
+	if (kind === 'video') return 'openai-videos';
+	return kind === 'vision' ? 'openai-vision' : 'openai-images';
+}
+
+/** 预设里的一个模型。 */
+export interface PresetModel {
+	/** 线上模型名（原样发给供应商）。 */
+	id: string;
+	/** 图像 / 视频 / 视觉。 */
+	kind: ModelKind;
+}
+
+/** 目录里的一条供应商预设。 */
+export interface ProviderPreset {
+	/** 预设 id，同时是新建供应商时的默认 slug。 */
+	id: string;
+	/** 展示名。 */
+	label: string;
+	/** 预设接口基址。 */
+	baseURL: string;
+	/** 去哪里申请密钥（给用户的提示）。 */
+	hint: string;
+	/** 预设模型清单（至少一个）。 */
+	models: readonly PresetModel[];
+}
+
+/**
+ * 供应商预设目录。
+ *
+ * 只收录**确定提供 OpenAI 兼容端点**的服务：OpenAI 官方，以及国内常用的
+ * 方舟 / 硅基流动 / 智谱。其余服务（Replicate、Runway 等自有协议）需要各自的
+ * 适配器，属于目录扩张而非 schema 变更 —— 用户也可以直接「自定义供应商」，
+ * 只要对方是 OpenAI 兼容端点。
+ */
+export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
+	{
+		id: 'openai',
+		label: 'OpenAI',
+		baseURL: 'https://api.openai.com/v1',
+		hint: 'platform.openai.com → API keys',
+		models: [
+			{ id: 'gpt-image-1', kind: 'image' },
+			{ id: 'sora-2', kind: 'video' },
+		],
+	},
+	{
+		id: 'volces',
+		label: '火山方舟（豆包）',
+		baseURL: 'https://ark.cn-beijing.volces.com/api/v3',
+		hint: 'console.volcengine.com/ark → API Key',
+		models: [
+			{ id: 'doubao-seedream-3-0-t2i-250415', kind: 'image' },
+			{ id: 'doubao-seedance-1-0-pro-250528', kind: 'video' },
+		],
+	},
+	{
+		id: 'siliconflow',
+		label: '硅基流动',
+		baseURL: 'https://api.siliconflow.cn/v1',
+		hint: 'cloud.siliconflow.cn → API 密钥',
+		models: [
+			{ id: 'Kwai-Kolors/Kolors', kind: 'image' },
+			{ id: 'Wan-AI/Wan2.1-T2V-14B', kind: 'video' },
+		],
+	},
+	{
+		id: 'zhipu',
+		label: '智谱 AI',
+		baseURL: 'https://open.bigmodel.cn/api/paas/v4',
+		hint: 'open.bigmodel.cn → API Keys',
+		models: [{ id: 'cogview-4', kind: 'image' }],
+	},
+];
+
+// ─────────────────────── 凭据引用名 ───────────────────────
+
+/**
+ * 把一段文本收敛成合法的凭据引用名片段。
+ *
+ * 凭据引用必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`（POSIX 标识符），因此
+ * 大写、非字母数字一律换成下划线。
+ * @param text - 原始文本（供应商或模型 id）。
+ * @returns 合法片段（可能为空串）。
+ */
+export function refToken(text: string): string {
+	return text.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/**
+ * 供应商级密钥的凭据引用名。
+ * @param providerId - 供应商 id。
+ * @returns 形如 `FFC_ACME_API_KEY`。
+ */
+export function providerKeyRef(providerId: string): string {
+	return `FFC_${refToken(providerId)}_API_KEY`;
+}
+
+/**
+ * 模型级密钥的凭据引用名（覆盖供应商级）。
+ * @param providerId - 供应商 id。
+ * @param modelId - 模型 id。
+ * @returns 形如 `FFC_ACME_ACME_LARGE_API_KEY`。
+ */
+export function modelKeyRef(providerId: string, modelId: string): string {
+	return `FFC_${refToken(providerId)}_${refToken(modelId)}_API_KEY`;
+}
+
+// ─────────────────────── 默认模型的取值约定 ───────────────────────
+
+/**
+ * 默认模型的取值：`<供应商 id>::<模型 id>`。
+ *
+ * 刻意不用 `/` 分隔：模型 id 里**真的会**出现斜杠（硅基流动的
+ * `Kwai-Kolors/Kolors`），用 `/` 会让「默认值」无法可靠地拆回两段。
+ * `::` 出现在 id 里的概率可以忽略，且供应商 id 由我们收成 slug。
+ * @param providerId - 供应商 id。
+ * @param modelId - 模型 id。
+ * @returns 默认值字符串。
+ */
+export function modelRef(providerId: string, modelId: string): string {
+	return `${providerId}::${modelId}`;
+}
+
+/**
+ * 拆一个默认值。
+ * @param value - 形如 `acme::acme-large`（也兼容只写供应商 id 的旧值）。
+ * @returns 两段；`model` 为空表示「该供应商下第一个可用模型」。
+ */
+export function parseModelRef(value: string): { providerId: string; modelId: string } {
+	const at = value.indexOf('::');
+	if (at < 0) return { providerId: value.trim(), modelId: '' };
+	return { providerId: value.slice(0, at).trim(), modelId: value.slice(at + 2).trim() };
+}
+
+/** 默认图像模型字段。 */
+export const FIELD_DEFAULT_IMAGE = 'defaultImage';
+/** 默认视频模型字段。 */
+export const FIELD_DEFAULT_VIDEO = 'defaultVideo';
+/** 默认视觉模型字段（把参考图读成文字用的那个）。 */
+export const FIELD_DEFAULT_VISION = 'defaultVision';
+/** 单次生成整体超时字段。 */
+export const FIELD_TIMEOUT = 'timeoutMs';
+/** 供应商字典字段。 */
+export const FIELD_PROVIDERS = 'providers';
+
+/** 供应商 id 的合法形状：小写字母开头，只含小写字母 / 数字 / 短横线。 */
+export const PROVIDER_ID_RE = /^[a-z][a-z0-9-]*$/;
+
+/**
+ * 供应商 id 是否合法（它要能进设置字段路径与凭据引用名）。
+ * @param id - 待检查的 id。
+ * @returns 是否合法。
+ */
+export function isValidProviderId(id: string): boolean {
+	return PROVIDER_ID_RE.test(id) && id.length <= 40;
+}
+
+// ─────────────────────── 旧字段（P8 及以前） ───────────────────────
+//
+// 旧设计把每个目录供应商的密钥/模型/基址摊成三个顶层标量字段。P9 之后它们
+// 只用于**迁移**：宿主启动时把值搬进 providers 字典与凭据库，然后 unset 掉。
+// 仍然在 schema 里声明，是因为「不在 schema 里的字段」不会被脱敏 ——
+// 留在文档里的旧密钥会被原样下发给浏览器。
+
+/** 旧：目录 id → 字段名词干（`-` 不能出现在字段名里）。 */
+function stemOf(id: string): string {
+	return id.replace(/-/g, '_');
+}
+
+/**
+ * 旧字段名：密钥。
+ * @param id - 旧目录 id。
+ * @returns 顶层字段名。
+ */
+export function legacyKeyFieldOf(id: string): string {
+	return `key_${stemOf(id)}`;
+}
+
+/**
+ * 旧字段名：模型覆盖。
+ * @param id - 旧目录 id。
+ * @returns 顶层字段名。
+ */
+export function legacyModelFieldOf(id: string): string {
+	return `model_${stemOf(id)}`;
+}
+
+/**
+ * 旧字段名：基址覆盖。
+ * @param id - 旧目录 id。
+ * @returns 顶层字段名。
+ */
+export function legacyBaseURLFieldOf(id: string): string {
+	return `baseURL_${stemOf(id)}`;
+}
+
+/**
+ * 旧目录 id 清单（P8 及以前有六条，每条一个模型）。
+ *
+ * 迁移时要把这些 id 映射到新结构里的 `供应商::模型`。
+ */
+export const LEGACY_PROVIDER_IDS: readonly { id: string; providerId: string; modelId: string; kind: MediaKind; baseURL: string }[] = [
+	{ id: 'openai-images', providerId: 'openai', modelId: 'gpt-image-1', kind: 'image', baseURL: 'https://api.openai.com/v1' },
+	{ id: 'openai-videos', providerId: 'openai', modelId: 'sora-2', kind: 'video', baseURL: 'https://api.openai.com/v1' },
+	{ id: 'volces-images', providerId: 'volces', modelId: 'doubao-seedream-3-0-t2i-250415', kind: 'image', baseURL: 'https://ark.cn-beijing.volces.com/api/v3' },
+	{ id: 'volces-videos', providerId: 'volces', modelId: 'doubao-seedance-1-0-pro-250528', kind: 'video', baseURL: 'https://ark.cn-beijing.volces.com/api/v3' },
+	{ id: 'siliconflow-images', providerId: 'siliconflow', modelId: 'Kwai-Kolors/Kolors', kind: 'image', baseURL: 'https://api.siliconflow.cn/v1' },
+	{ id: 'zhipu-images', providerId: 'zhipu', modelId: 'cogview-4', kind: 'image', baseURL: 'https://open.bigmodel.cn/api/paas/v4' },
+];

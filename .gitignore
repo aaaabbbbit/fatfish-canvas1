@@ -1,0 +1,14 @@
+node_modules/
+*.tsbuildinfo
+.DS_Store
+.reference/
+
+# 构建产物（含 lib/client/ 分块）。必须锚定到 package 路径：
+# 无锚点的 lib/ 会连 scripts/lib/ 和 src/client/ 一起吞掉。
+/packages/fatfish-canvas/lib/
+
+# machine-local stores and debug scratch
+.npm-cache/
+.pnpm-store/
+.tmp-dbg-profile/
+.tmp-*.mjs

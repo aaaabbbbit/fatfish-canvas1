@@ -1,0 +1,24 @@
+# fatfish-canvas 组合包 patch。
+#
+# 本文件刻意留空 —— 激活行写在 profile 自己的 patch 层：
+#
+#   $DSH_HOME/profiles/web/cordis.patch.yml
+#
+# 为什么这样分：
+#   profile 的 bundle 列表在**启动时**组合，运行中的服务器没有全量重扫路径
+#   （dsh-client-modules 的扫描是增量式、按包响应 cordis internal/plugin 事件）。
+#   而 profile 的 patch 层是被监听并实时重放的 —— 改动会在约 1 秒内重新组合、
+#   创建新行、触发增量扫描，因此客户端 bundle 无需重启即可被服务。
+#
+#   profile 层与 bundle 层**不能同时**插入同一个 id：
+#   applyEntryPatches 的插入语义是 `data.push(...insert)`，不做任何去重，
+#   重复插入会让本插件被加载两次 —— P2 注册 settings namespace 时会直接
+#   以「重复 namespace」报错。
+#
+# 若要在别的 profile 上以标准方式启用（装完重启 dsh 即可），
+# 取消下面两行的注释，并同时删掉 profile patch 里的对应行：
+#
+# - insert:
+#     - id: fatfish-canvas
+#       name: fatfish-canvas
+[]

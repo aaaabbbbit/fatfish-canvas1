@@ -1,0 +1,12 @@
+{
+  "name": "fatfish-canvas-workspace",
+  "private": true,
+  "version": "0.0.1",
+  "description": "肥鱼画布 — DeepSeek Harness 无限画布插件工作区",
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "build": "pnpm --filter fatfish-canvas build",
+    "typecheck": "pnpm --filter fatfish-canvas typecheck"
+  }
+}
