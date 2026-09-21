@@ -14,9 +14,29 @@
  * @module fatfish-canvas/client/canvas/dropfiles
  */
 
-import { mediaNodeSize } from '../shared/media';
+import { isReferenceHandle, mediaNodeSize } from '../shared/media';
+import { unwrapProbeResult } from '../shared/probe';
 import { dropLayout, toWorld } from './model';
-import { addNodes, getBoard } from './store';
+import { pushNotice } from './notice';
+import { readPngText } from './pngmeta';
+import { addNodes, getBoard, updateNodes } from './store';
+import { parseWorkflow } from './workflow';
+
+/**
+ * 宿主探测面里本模块用到的那一条（把内联图存成参考图句柄，见 `host/probe.ts`）。
+ *
+ * 刻意**注入**而不是 `import { getProbeFace } from '../index'`：
+ * 那样会把 `index.tsx`（JSX、整个插件体）拖进这个纯逻辑模块 —— 离线测试里
+ * `ts.transpileModule` 不转 JSX，一加载就炸；顺带还多一个循环 import。
+ * 与 `regenerate.ts` 的 `setRegenerateTarget` 是同一个套路。
+ */
+export interface ReferenceStore {
+	/** 把 `data:` 内联图存成宿主句柄。 */
+	storeReference(dataUrl: string): Promise<unknown>;
+}
+
+/** 当前注入的参考图存储面取法（由 `installCanvasDrop` 接上）。 */
+let referenceStoreOf: (() => ReferenceStore | undefined) | undefined;
 
 /**
  * 判断这次拖拽该不该由画布接管。
@@ -105,15 +125,48 @@ function measure(url: string): Promise<{ w: number; h: number } | null> {
 }
 
 /**
+ * 一个图片文件里自带的工作流块。
+ *
+ * 三种结果都要分清楚，因为用户看到的话完全不同：
+ *   `ours`    本插件导出的 → 提示可以还原
+ *   `foreign` 有 `workflow` 块但不是我们的（真 ComfyUI 导出的）→ 如实说还原不了
+ *   `null`    没有这个块 → 什么都不说
+ */
+type WorkflowProbe = { kind: 'ours'; text: string } | { kind: 'foreign' } | null;
+
+/**
+ * 从文件字节里探工作流块。
+ *
+ * 只读 PNG 的 tEXt（ComfyUI 与我们自己都写在那里）；读不出来就当没有 ——
+ * 「拖一张图进来」本身是完全正常且必须成功的操作，探元数据失败不能连累它。
+ * @param file - 图片文件。
+ * @returns 探测结果。
+ */
+async function probeWorkflow(file: File): Promise<WorkflowProbe> {
+	try {
+		const text = readPngText(new Uint8Array(await file.arrayBuffer())).workflow;
+		if (text === undefined) return null;
+		return parseWorkflow(text) === null ? { kind: 'foreign' } : { kind: 'ours', text };
+	} catch {
+		return null;
+	}
+}
+
+/**
  * 读一个图片文件并量出它的尺寸。
  * @param file - 图片文件。
  * @returns 可直接落成节点的素材；读不出来时为 null。
  */
 async function loadImage(
 	file: File,
-): Promise<{ file: File; src: string; size: { w: number; h: number } } | null> {
+): Promise<{
+	file: File;
+	src: string;
+	size: { w: number; h: number };
+	workflow: WorkflowProbe;
+}> {
 	const src = await readAsDataUrl(file);
-	if (src === '') return null;
+	if (src === '') throw new Error('读不出这个文件');
 	const pixels = await measure(src);
 	return {
 		file,
@@ -122,6 +175,7 @@ async function loadImage(
 			kind: 'image',
 			...(pixels === null ? {} : { width: pixels.w, height: pixels.h }),
 		}),
+		workflow: await probeWorkflow(file),
 	};
 }
 
@@ -154,7 +208,7 @@ async function dropImages(files: readonly File[], at: { x: number; y: number }):
 		anchor,
 		items.map((item) => item.size),
 	);
-	addNodes(
+	const created = addNodes(
 		items.map((item, index) => ({
 			kind: 'image' as const,
 			status: 'ready' as const,
@@ -162,10 +216,95 @@ async function dropImages(files: readonly File[], at: { x: number; y: number }):
 			title: item.file.name === '' ? '拖入的图片' : item.file.name,
 			...item.size,
 			...(spots[index] ?? anchor),
+			// 自带工作流的图把文档一起存到节点上：右键就能还原（见 NodeMenu）
+			...(item.workflow?.kind === 'ours' ? { workflow: item.workflow.text } : {}),
 		})),
 	);
+
+	// 检测到工作流要说一声 —— 不然用户根本不知道这张图「能还原」。
+	// 不自动还原：那会把用户手上的画布直接换掉。
+	const ours = items.filter((item) => item.workflow?.kind === 'ours').length;
+	const foreign = items.filter((item) => item.workflow?.kind === 'foreign').length;
+	if (ours > 0) pushNotice('检测到工作流：右键这张图 →「还原工作流」');
+	else if (foreign > 0) pushNotice('这张图带的是 ComfyUI 的工作流，本版本还不能还原');
 	// 拖进来的东西落点由用户决定，跟焦只会把视野抢走 —— `addNodes` 只选中它们，
 	// 不带过去（这正是想要的行为）。
+
+	// P22：顺手请宿主把这些内联图存成**参考图句柄**。不这么做的话，本地拖进来的图
+	// 连不上生成节点 —— 几兆的 data: URL 塞不进 `/generate --ref` 那一行。
+	void attachReferenceHandles(created.map((node) => node.id));
+}
+
+/**
+ * 请宿主把内联图存成参考图句柄（P22），并把句柄写回节点。
+ *
+ * 三条刻意的做法：
+ * 1. **在落图之后异步做**（不阻塞拖放）：拖进来的图必须立刻出现，存句柄是加分项；
+ * 2. **只处理塞不进命令行的那些**（`isReferenceHandle` 判否）：http 地址本来就够短；
+ * 3. **失败要说一声**：不说的话，用户会在连参考图时撞上一句「重新拖一次」，
+ *    而真正的原因（格式不支持 / 图太大）已经在这一刻发生了。
+ *
+ * 第二处调用点是**连线被拒的那一刻**（`CanvasStage` 的 `linkAfterStoringReference`）：
+ * 落图那一刻是唯一的时机会漏掉两类节点 —— 供应商内联返回的生成结果、刷新前就在画布
+ * 上的老节点，它们都到不了这里（那时用户只会看到「重新拖进画布一次」，而重拖不可能）。
+ * @param ids - 目标节点 id。
+ * @returns 是否已经把**具体原因**推给用户（调用方据此避免用泛泛的判定理由盖掉它）。
+ */
+export async function attachReferenceHandles(ids: readonly string[]): Promise<boolean> {
+	// **取的时候才解析**：宿主探测面是 `$mount` 之后才出现的派生服务，
+	// 装拖放的那一刻它常常还没就绪（装早了会永远拿到 undefined）。
+	const probe = referenceStoreOf?.();
+	// 还没就绪：什么都别做，也别说 —— 连线那一刻还会再试一次（`CanvasStage`）。
+	if (probe === undefined) return false;
+	let problem = '';
+	for (const id of ids) {
+		const node = getBoard().nodes.find((item) => item.id === id);
+		if (node === undefined || node.ref !== undefined) continue;
+		const src = node.src ?? '';
+		if (!src.startsWith('data:') || isReferenceHandle(src)) continue;
+		try {
+			// 远程面回的是**信封**（`{ok,value}`），不是宿主方法自己的结果对象 ——
+			// 不拆信封就永远拿到 undefined：句柄写不上，用户只看到连线被拒。
+			const answer = unwrapProbeResult<{ ok?: boolean; message?: string; ref?: string }>(
+				await probe.storeReference(src),
+			);
+			if (!answer.ok) {
+				problem = answer.message;
+				continue;
+			}
+			const result = answer.value;
+			if (result !== undefined && result.ok === true && typeof result.ref === 'string' && result.ref !== '') {
+				updateNodes([id], { ref: result.ref });
+			} else if (result !== undefined && typeof result.message === 'string') {
+				problem = result.message;
+			} else {
+				// 回话既不是成功也不是「一句原因」——例如宿主返回了半截对象。
+				// 这里**不能**沉默：调用方会据此以为「没出事」，用户则只会看到连线被拒。
+				problem = '宿主没有回话（存参考图这件事没成功），先刷新页面或重启 dsh web 再试';
+			}
+		} catch (error) {
+			problem = error instanceof Error ? error.message : String(error);
+		}
+	}
+	if (problem !== '') pushNotice(problem);
+	return problem !== '';
+}
+
+/**
+ * 接上宿主的参考图存储面（P22）。
+ *
+ * 单独开一个口子而不是只藏在 `installCanvasDrop` 里：装上拖放需要 `document`，
+ * 而这条接线本身与 DOM 无关 —— 离线测试直接调这个就能验「落图之后请宿主存句柄」。
+ * @param getStore - 取服务面的函数；传 undefined 表示摘掉。
+ * @returns 撤销函数（只会清掉自己装上的那个）。
+ */
+export function setReferenceStore(
+	getStore: (() => ReferenceStore | undefined) | undefined,
+): () => void {
+	referenceStoreOf = getStore;
+	return () => {
+		if (referenceStoreOf === getStore) referenceStoreOf = undefined;
+	};
 }
 
 /**
@@ -173,10 +312,12 @@ async function dropImages(files: readonly File[], at: { x: number; y: number }):
  *
  * 用捕获阶段（`capture: true`）：本体的附件 drop 在 document 的 bubble 阶段，
  * 捕获阶段跑在它前面，`stopPropagation` 之后它收不到事件。
+ * @param getStore - 取宿主参考图存储面（`() => getProbeFace()`）；未就绪时返回 undefined。
  * @returns 卸载函数。
  */
-export function installCanvasDrop(): () => void {
-	if (typeof document === 'undefined') return () => {};
+export function installCanvasDrop(getStore?: () => ReferenceStore | undefined): () => void {
+	const uninstall = setReferenceStore(getStore);
+	if (typeof document === 'undefined') return uninstall;
 
 	const onDragOver = (event: DragEvent): void => {
 		claimDragEvent(event);
@@ -208,5 +349,6 @@ export function installCanvasDrop(): () => void {
 		document.removeEventListener('dragenter', onDragOver, true);
 		document.removeEventListener('dragover', onDragOver, true);
 		document.removeEventListener('drop', onDrop, true);
+		uninstall();
 	};
 }

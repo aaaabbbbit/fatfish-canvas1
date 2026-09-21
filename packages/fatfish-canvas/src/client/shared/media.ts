@@ -241,8 +241,9 @@ export const GENERATE_USAGE =
  * 命令行里能内联的**参考图地址**长度上限。
  *
  * `data:` 大图（一兆以上）进命令行会连同会话日志一起膨胀，而命令行是它唯一的通路。
- * ponytail: 上限之下的内联地址直接走命令行，超过的（大 data: 图）在画布菜单里禁用；
- * 升级路径是让客户端把字节经附件面上传、宿主用 `ctx.attachments.readImage` 读回。
+ * 上限之下的内联地址直接走命令行；超过的走**宿主句柄**那条路（P22：客户端把字节交给
+ * `mediaProbe.storeReference`，宿主存进附件库、回一个短路径放在节点的 `ref` 上，
+ * 命令行里带的是那个路径）—— 见 `canvas/graph.ts` 的 `referenceProblem`。
  */
 export const REFERENCE_MAX_INLINE = 8192;
 
@@ -252,6 +253,9 @@ export const REFERENCE_MAX_INLINE = 8192;
  * 只有两种成立：`http(s):` 地址（宿主原样转给供应商，零下载）与足够小的
  * `data:` 内联地址。`blob:`（浏览器进程内的地址，宿主取不到）与相对路径一律不行 ——
  * 那种情况下宁可禁用入口，也不要发出一个必然失败的生成。
+ *
+ * ⚠️ 这只是**命令行**这一条通路的判据。本地拖进来的大图另有一条路：宿主先把它
+ * 存成附件、回一个短路径（节点的 `ref`，P22），那时根本不必过这个函数。
  * @param value - 候选地址（任意类型）。
  * @returns 能否当参考图。
  */
@@ -278,6 +282,14 @@ export interface GenerateCommandArgs {
 	provider?: string;
 	/** 参考图地址（`http(s)` / `data:` / 本地路径 / 附件 id）。 */
 	reference?: string;
+	/**
+	 * 发起这次生成的**画布生成节点 id**（画布工作流用；宿主忽略它）。
+	 *
+	 * 它是一次生成「该回到哪个节点」的唯一凭据：命令行是客户端与宿主之间唯一的
+	 * 通路，结果又只能从会话事件里回来（见 `canvas/ingest.ts` 的 `--wf` 分支）。
+	 * 不加这个标记的话，工作流每跑一次都会在画布上多落一张来源不明的散图。
+	 */
+	wf?: string;
 }
 
 /** 解析结果：要么是参数，要么是一句可读的错误（直接回给用户）。 */
@@ -285,20 +297,23 @@ export type GenerateCommandParse =
 	| { ok: true; args: GenerateCommandArgs }
 	| { ok: false; error: string };
 
-/** 需要取值的开关。 */
-const VALUE_FLAGS: Record<string, 'kind' | 'ratio' | 'provider' | 'resolution' | 'duration' | 'ref'> = {
+/** 需要取值的开关。`wf` 是画布内部参数（宿主读到就忽略），刻意不写进用法说明。 */
+const VALUE_FLAGS: Record<string, 'kind' | 'ratio' | 'provider' | 'resolution' | 'duration' | 'ref' | 'wf'> = {
 	kind: 'kind',
 	ratio: 'ratio',
 	provider: 'provider',
 	resolution: 'resolution',
 	duration: 'duration',
 	ref: 'ref',
+	wf: 'wf',
 };
 
-/** 合法画幅比例（与工具参数的枚举一致）。 */
-const RATIOS = ['1:1', '16:9', '4:3', '3:4', '9:16'];
-/** 合法视频分辨率。 */
-const RESOLUTIONS = ['480p', '1080p'];
+/** 合法画幅比例（与工具参数的枚举一致）。生成节点的参数面板读的就是它。 */
+export const ASPECT_RATIOS: readonly string[] = ['1:1', '16:9', '4:3', '3:4', '9:16'];
+/** 合法视频分辨率（面板与命令行共用一份）。 */
+export const VIDEO_RESOLUTIONS: readonly string[] = ['480p', '1080p'];
+/** 视频时长档位（秒）。命令行本身接受任意正数，这里只是面板上的常用档。 */
+export const VIDEO_DURATIONS: readonly number[] = [4, 5, 8, 10];
 
 /**
  * 解析 `/generate` 的一行输入。
@@ -355,13 +370,13 @@ export function parseGenerateLine(rawInput: unknown): GenerateCommandParse {
 			}
 			args.kind = value;
 		} else if (key === 'ratio') {
-			if (!RATIOS.includes(value)) {
-				return { ok: false, error: `--ratio 只能是 ${RATIOS.join(' / ')}（收到 ${value}）。${GENERATE_USAGE}` };
+			if (!ASPECT_RATIOS.includes(value)) {
+				return { ok: false, error: `--ratio 只能是 ${ASPECT_RATIOS.join(' / ')}（收到 ${value}）。${GENERATE_USAGE}` };
 			}
 			args.aspectRatio = value;
 		} else if (key === 'resolution') {
-			if (!RESOLUTIONS.includes(value)) {
-				return { ok: false, error: `--resolution 只能是 ${RESOLUTIONS.join(' / ')}（收到 ${value}）。${GENERATE_USAGE}` };
+			if (!VIDEO_RESOLUTIONS.includes(value)) {
+				return { ok: false, error: `--resolution 只能是 ${VIDEO_RESOLUTIONS.join(' / ')}（收到 ${value}）。${GENERATE_USAGE}` };
 			}
 			args.resolution = value;
 		} else if (key === 'duration') {
@@ -372,6 +387,8 @@ export function parseGenerateLine(rawInput: unknown): GenerateCommandParse {
 			args.duration = seconds;
 		} else if (key === 'ref') {
 			args.reference = value;
+		} else if (key === 'wf') {
+			args.wf = value;
 		} else {
 			args.provider = value;
 		}

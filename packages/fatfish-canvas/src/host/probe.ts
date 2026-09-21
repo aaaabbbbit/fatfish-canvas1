@@ -25,6 +25,7 @@
  */
 
 import type { ModelKind } from '../client/shared/catalog';
+import { decodeDataUrl } from './reference';
 
 /** 探测目标：一个供应商的基址与已解析出来的密钥。 */
 export interface ProbeTarget {
@@ -66,6 +67,39 @@ export interface ProbeDeps {
 	providerOf: (providerId: string) => Promise<ProbeTarget | undefined>;
 	/** 单次请求超时（毫秒）。 */
 	timeoutMs: () => number;
+	/**
+	 * 把一段图片字节**持久存下来**，返回宿主文件路径（P22）。
+	 *
+	 * 存在附件服务里（`ctx.attachments.saveImage`）而不是临时文件：内容是
+	 * 内容寻址的，重复拖同一张图不会存两份，也不会在磁盘上留一堆没人清理的垃圾。
+	 * 附件服务缺席（裁剪过的组合）时不给这个函数 —— 那时「本地图当参考图」会
+	 * 明确报不可用，而不是静默失败。
+	 */
+	storeImage?: StoreImageBytes;
+}
+
+/** 把图片字节存成持久附件并给出宿主文件路径。 */
+export type StoreImageBytes = (
+	input: { data: Uint8Array; mediaType: string; name?: string },
+	signal?: AbortSignal,
+) => Promise<{ path: string; bytes: number }>;
+
+/** `storeReference` 的结果。 */
+export interface StoreReferenceResult {
+	/** 是否成功。 */
+	ok: boolean;
+	/** 人类可读的一句话（成功与失败都给）。 */
+	message: string;
+	/**
+	 * 存好之后的**句柄**：宿主机上的绝对路径。
+	 *
+	 * 为什么是路径而不是 `attachment:<id>`：`--ref` 只能带一个字符串，而
+	 * `host/reference.ts` 的「其它一律当文件路径」分支本来就读得懂它 ——
+	 * 附件 id 那种写法要额外带上 MIME 才校验得过，字符串里塞不下。
+	 */
+	ref?: string;
+	/** 落盘后的字节数（附件服务会做规范化，可能与传入的不同）。 */
+	bytes?: number;
 }
 
 /**
@@ -325,7 +359,66 @@ export class MediaProbeCore {
 			clearTimeout(timer);
 		}
 	}
+
+	/**
+	 * 把画布上传来的**内联图片**存成参考图句柄（P22）。
+	 *
+	 * 为什么需要这一步：参考图从画布传到宿主的唯一通路是 `/generate --ref <地址>`
+	 * 那一行**文本**，而它会被记进会话日志。一张本地照片 base64 之后上百万字符，
+	 * 塞不进去（客户端的 `isReferenceHandle` 卡在 8192 字符）。于是让客户端把字节
+	 * 先交给宿主一次，宿主存进附件库、回一个**短句柄**（宿主文件路径），
+	 * 之后 `--ref <路径>` 就走 `host/reference.ts` 里那条「其它一律当文件路径」的分支。
+	 *
+	 * 三条刻意的取舍：
+	 * 1. **只收 `data:` 内联图**：http(s) 地址本来就塞得进命令行，不需要过这一趟；
+	 * 2. **有上限**（{@link STORE_REFERENCE_MAX_BYTES}）：字节要经 RPC 过一遍页面，
+	 *    16MB 够覆盖所有真实照片，再大就该让用户先缩小；
+	 * 3. **存在附件库里**（内容寻址）：重复拖同一张图不会存两份，也不留无人清理的临时文件。
+	 * @param dataUrl - `data:image/...;base64,...`。
+	 * @returns 句柄或一句可展示的失败原因。
+	 */
+	async storeReference(dataUrl: string): Promise<StoreReferenceResult> {
+		const inline = decodeDataUrl(dataUrl);
+		if (inline === null) {
+			return { ok: false, message: '只支持 data: 内联图片（从本地拖进画布的图就是这种）' };
+		}
+		if (inline.data.byteLength > STORE_REFERENCE_MAX_BYTES) {
+			return {
+				ok: false,
+				message:
+					`这张图太大（${(inline.data.byteLength / 1024 / 1024).toFixed(1)} MB，` +
+					`上限 ${String(STORE_REFERENCE_MAX_BYTES / 1024 / 1024)} MB），存不成参考图；先缩小一点再拖进来`,
+			};
+		}
+		const store = this.deps.storeImage;
+		if (store === undefined) {
+			return {
+				ok: false,
+				message: '宿主没有装配附件服务，本地图暂时不能当参考图（可以改用 http 地址的图）',
+			};
+		}
+		try {
+			const stored = await store({ data: inline.data, mediaType: inline.mediaType });
+			if (stored.path === '') {
+				return { ok: false, message: '附件服务没有给出可用的文件路径，参考图句柄做不出来' };
+			}
+			return {
+				ok: true,
+				message: `已存为参考图（${(stored.bytes / 1024).toFixed(0)} KB）`,
+				ref: stored.path,
+				bytes: stored.bytes,
+			};
+		} catch (error) {
+			return {
+				ok: false,
+				message: `存不成参考图：${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
 }
+
+/** `storeReference` 的体积上限：字节要经 RPC 过一次页面，再大就该让用户先缩小。 */
+export const STORE_REFERENCE_MAX_BYTES = 16 * 1024 * 1024;
 
 /** `fetchImage` 的体积上限：字节要经 RPC 过一次页面，再大就不是「顺手存附件」了。 */
 export const FETCH_IMAGE_MAX_BYTES = 8 * 1024 * 1024;

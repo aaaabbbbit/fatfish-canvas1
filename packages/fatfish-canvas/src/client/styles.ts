@@ -210,6 +210,29 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	outline-offset: 1px;
 }
 
+/* 主行动按钮（P18：「运行工作流」）。
+   它是画布上唯一会真的花掉一次生成的动作，因此给它一点品牌色 —— 混在
+   一片灰按钮里既容易误点，也看不出哪个是「正事」。
+
+   刻意用**描边 + 品牌色文字**而不是实心填充：label-primary-inverted 是
+   「主色的反色」而不是恒为白（深色主题下是深灰），压在品牌色实心块上会糊 ——
+   这正是 .ffc-node-bar 那段注释里记着的坑。 */
+.ffc-tbtn-primary {
+	color: var(--dsw-alias-brand-primary);
+	box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
+	font-weight: 500;
+}
+
+.ffc-tbtn-primary:hover {
+	color: var(--dsw-alias-brand-primary);
+	background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.ffc-tbtn-primary:disabled {
+	color: var(--dsw-alias-label-tertiary);
+	box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
+}
+
 /* 画布视口（P0 为占位；P1 接管为无限画布） */
 
 .ffc-viewport {
@@ -368,6 +391,10 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	position: fixed;
 	z-index: 31;
 	min-width: 180px;
+	/* 菜单会长（节点菜单 P20 起有十项左右），窗口矮时必须能滚 ——
+	   否则 clampToViewport 只能把顶部压到 8px，下面几项永远点不到。 */
+	max-height: min(420px, 100vh - 32px);
+	overflow-y: auto;
 	padding: 4px;
 	box-sizing: border-box;
 	border: 1px solid var(--dsw-alias-border-l2);
@@ -595,6 +622,81 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	}
 }
 
+/* ── 连线（P18） ──
+
+   画在世界层里（跟着节点走），但线宽用 non-scaling-stroke 固定在屏幕上的
+   1.5px —— 否则放大 10 倍会变成一条 15px 的带子。 */
+
+.ffc-links {
+	position: absolute;
+	left: 0;
+	top: 0;
+	overflow: visible;
+	pointer-events: none;
+}
+
+.ffc-link {
+	fill: none;
+	stroke: var(--dsw-alias-border-l3);
+	stroke-width: 1.5;
+	vector-effect: non-scaling-stroke;
+}
+
+.ffc-link-hit {
+	fill: none;
+	stroke: transparent;
+	stroke-width: 14;
+	vector-effect: non-scaling-stroke;
+	/* 只有它接指针：线本身太细，靠 14px 的透明描边才能悬停到 */
+	pointer-events: stroke;
+	cursor: pointer;
+}
+
+.ffc-link-draft {
+	stroke: var(--dsw-alias-brand-primary);
+	stroke-dasharray: 5 4;
+}
+
+/* 连线中点的删除按钮（屏幕尺寸恒定，靠内联的 scale(1/zoom)）。
+
+   ⚠️ 它是**常驻**的（不是悬停才出现，P23 实测改的）：按钮正好长在指针底下，
+   而「显示它」这个动作本身会把指针从连线的命中路径上抢走 → 线失去 hover →
+   按钮收起 → 指针又回到线上 → 再出现……来回抖，鼠标实际点不到它
+   （e2e 量到的那一刻：中点上命中的是 path.ffc-link-hit，而按钮不在 DOM 里）。
+   常驻 + 平时淡一点、指针一到就实心：零 React 状态、零定时器，也没有抖动。 */
+.ffc-link-x {
+	position: absolute;
+	width: 20px;
+	height: 20px;
+	margin: -10px 0 0 -10px;
+	padding: 0;
+	box-sizing: border-box;
+	appearance: none;
+	border: 1px solid var(--dsw-alias-border-l2);
+	border-radius: 999px;
+	background: var(--dsw-alias-bg-layer-2);
+	color: var(--dsw-alias-label-secondary);
+	font-size: 12px;
+	line-height: 1;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	pointer-events: auto;
+	cursor: pointer;
+	/* 常驻但淡（见上面的说明）：一眼看得见「这条线能删」，又不至于喧宾夺主 */
+	opacity: 0.55;
+	/* 压在所有节点之上：节点的 z-index 是 1、2、3…（每次新增 +1），而删除按钮
+	   只有一个（悬停时），压在谁上面都不会挡住别的东西。用一个足够大的数，
+	   省掉「把按钮挪到屏幕层」那一套坐标换算。 */
+	z-index: 1000000;
+}
+
+.ffc-link-x:hover {
+	opacity: 1;
+	background: var(--dsw-alias-state-error-primary, #d33);
+	color: #fff;
+}
+
 /* ── 节点卡片 ── */
 
 .ffc-node {
@@ -602,7 +704,10 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	pointer-events: auto;
 	box-sizing: border-box;
 	border-radius: 10px;
-	overflow: hidden;
+	/* ⚠️ 这里**不能**是 hidden（P18 改的）：连接点在四条边的中点上，一半探出卡片
+	   外面，hidden 会把它们切掉一半、只剩半个圆可点。裁剪改由 .ffc-node-media
+	   与 .ffc-node-bar 各自负责（它们才是需要跟着圆角裁的东西）。 */
+	overflow: visible;
 	background: var(--dsw-alias-bg-layer-2);
 	border: 1px solid var(--dsw-alias-border-l2);
 	box-shadow: var(--dsw-shadow-lv1, 0 1px 3px rgba(0, 0, 0, 0.12));
@@ -627,6 +732,9 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	align-items: center;
 	justify-content: center;
 	background: var(--dsw-alias-bg-layer-1);
+	/* 圆角裁剪搬到这里（见 .ffc-node 的 overflow 说明） */
+	overflow: hidden;
+	border-radius: 9px;
 }
 
 .ffc-node-el {
@@ -638,6 +746,163 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	-webkit-user-drag: none;
 }
 
+/* ── 连接点（P18） ──
+
+   每个节点四条边的中点各一个，进出合一。可见性**全靠 CSS**：
+
+     默认           opacity 0 + pointer-events none（不抢节点拖拽的指针）
+     悬停节点       该节点的四个一起淡入
+     悬停某个连接点 它自己保持可见（pointer-events 变 auto 之后 :hover 才成立）
+
+   因此不需要任何「鼠标靠近判定」的 JS —— 命中区（28px）比可见圆点（16px）大，
+   所以是「靠近就出现」，而离开时 opacity 的过渡把它淡出。
+
+   margin 负责把中心对到边的中点上，transform: scale(1/zoom) 由内联样式给
+   （屏幕尺寸恒定），两者互不干扰 —— 用 translate(-50%) 的话会和 scale 的
+   变换原点纠缠在一起，缩放后中心会偏。 */
+
+.ffc-port {
+	position: absolute;
+	width: 28px;
+	height: 28px;
+	margin: -14px 0 0 -14px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	opacity: 0;
+	pointer-events: none;
+	cursor: crosshair;
+	transition: opacity 140ms var(--ds-ease-out, ease-out);
+	z-index: 3;
+}
+
+.ffc-port[data-ffc-port='n'] {
+	left: 50%;
+	top: 0;
+}
+
+.ffc-port[data-ffc-port='s'] {
+	left: 50%;
+	top: 100%;
+}
+
+.ffc-port[data-ffc-port='w'] {
+	left: 0;
+	top: 50%;
+}
+
+.ffc-port[data-ffc-port='e'] {
+	left: 100%;
+	top: 50%;
+}
+
+.ffc-port::after {
+	content: '';
+	width: 16px;
+	height: 16px;
+	box-sizing: border-box;
+	border-radius: 999px;
+	border: 1px solid var(--dsw-alias-border-l3);
+	background-color: var(--dsw-alias-bg-layer-2);
+	/* 加号：两条 1.5px 的实线交叉（不引图标组件，端口尺寸随 zoom 反向缩放，
+	   图标组件的 viewBox 反而不好对齐） */
+	background-image:
+		linear-gradient(var(--dsw-alias-label-secondary), var(--dsw-alias-label-secondary)),
+		linear-gradient(var(--dsw-alias-label-secondary), var(--dsw-alias-label-secondary));
+	background-size:
+		8px 1.5px,
+		1.5px 8px;
+	background-position: center;
+	background-repeat: no-repeat;
+	box-shadow: var(--dsw-shadow-lv1, 0 1px 3px rgba(0, 0, 0, 0.12));
+}
+
+.ffc-node:hover .ffc-port,
+.ffc-port:hover {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+.ffc-port:hover::after {
+	border-color: var(--dsw-alias-brand-primary);
+	background-color: var(--dsw-alias-brand-primary);
+	background-image:
+		linear-gradient(#fff, #fff),
+		linear-gradient(#fff, #fff);
+}
+
+/* 生成节点还没出图时的占位说明 */
+.ffc-node-gen {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	padding: 14px;
+	text-align: center;
+}
+
+.ffc-node-gen-title {
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--dsw-alias-label-primary);
+}
+
+.ffc-node-gen-hint {
+	font-size: 11px;
+	line-height: 16px;
+	color: var(--dsw-alias-label-tertiary);
+}
+
+/* 生成节点的参数条（P19）：卡片变成「上条 + 内容」的竖排。
+   只有 gen 节点这样，媒体节点仍旧是内容铺满整张卡片。 */
+.ffc-node[data-kind='gen'] {
+	display: flex;
+	flex-direction: column;
+}
+
+.ffc-node[data-kind='gen'] .ffc-node-media {
+	flex: 1;
+	height: auto;
+	min-height: 0;
+}
+
+.ffc-node-gen-head {
+	flex: none;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 6px;
+	box-sizing: border-box;
+	background: var(--dsw-alias-bg-layer-1);
+	border-bottom: 1px solid var(--dsw-alias-border-l1);
+	/* 跟着卡片圆角裁（.ffc-node 是 overflow:visible，见那里的说明） */
+	border-radius: 9px 9px 0 0;
+	cursor: default;
+}
+
+.ffc-node-gen-select {
+	flex: 1;
+	min-width: 0;
+	height: 20px;
+	padding: 0 2px;
+	box-sizing: border-box;
+	appearance: none;
+	border: 1px solid var(--dsw-alias-border-l2);
+	border-radius: 4px;
+	background: var(--dsw-alias-bg-layer-2);
+	color: var(--dsw-alias-label-secondary);
+	font-family: inherit;
+	font-size: 11px;
+	cursor: pointer;
+}
+
+.ffc-node-gen-select:hover {
+	border-color: var(--dsw-alias-border-l3);
+	color: var(--dsw-alias-label-primary);
+}
+
 .ffc-node-text {
 	padding: 12px;
 	font-size: 13px;
@@ -646,6 +911,29 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	white-space: pre-wrap;
 	word-break: break-word;
 	overflow: hidden;
+}
+
+/* 空文字节点的占位（不然是一张纯白卡片，没人知道能双击） */
+.ffc-node-text-empty {
+	color: var(--dsw-alias-label-tertiary);
+}
+
+/* 文字节点的内联编辑框（双击进入，P18）。
+   跟着世界层缩放，所以字体用与 .ffc-node-text 相同的一份 —— 进出编辑态
+   文字大小不跳。 */
+.ffc-node-edit {
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	resize: none;
+	border: none;
+	outline: none;
+	padding: 12px;
+	font-family: inherit;
+	font-size: 13px;
+	line-height: 20px;
+	color: var(--dsw-alias-label-primary);
+	background: var(--dsw-alias-bg-layer-2);
 }
 
 .ffc-node-pending,
@@ -732,6 +1020,8 @@ body[data-ffc-mode='canvas-only'] .ffc-panel {
 	font-size: 11px;
 	opacity: 0;
 	transition: opacity var(--ffc-transition);
+	/* 跟着卡片圆角裁（.ffc-node 不再 overflow:hidden，见那里的说明） */
+	border-radius: 0 0 9px 9px;
 }
 
 .ffc-node:hover .ffc-node-bar,

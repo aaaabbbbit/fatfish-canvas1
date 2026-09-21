@@ -1256,6 +1256,86 @@ console.log('\n10) P9：mediaProbe 探测服务');
 			nonHttp.ok === false && String(nonHttp.message).includes('http'),
 			String(nonHttp.message));
 	}
+
+	// ── 10.y `storeReference`：画布内联图 → 参考图句柄（P22） ──
+	//
+	// 反方向的那一趟：字节从页面到宿主。命令行塞不下一张本地照片的 base64，
+	// 所以宿主先把它存进附件库，回一个短路径当句柄。
+	const pixelPng = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
+	const dataUrlOf = (bytes, mime = 'image/png') =>
+		`data:${mime};base64,${Buffer.from(bytes).toString('base64')}`;
+
+	{
+		const seen = [];
+		const core = new probe.MediaProbeCore({
+			providerOf: async () => target,
+			timeoutMs: () => 5000,
+			storeImage: async (input) => {
+				seen.push(input);
+				return { path: 'C:\\tmp\\attachments\\abc.png', bytes: input.data.byteLength };
+			},
+		});
+		const result = await core.storeReference(dataUrlOf(pixelPng));
+		check('storeReference 存成附件并回一个短句柄',
+			result.ok === true && result.ref === 'C:\\tmp\\attachments\\abc.png' && result.bytes === pixelPng.length,
+			JSON.stringify(result));
+		check('传给附件服务的字节与 MIME 都对（base64 解码无误）',
+			seen.length === 1 &&
+				seen[0].mediaType === 'image/png' &&
+				Buffer.from(seen[0].data).equals(Buffer.from(pixelPng)),
+			JSON.stringify({ mime: seen[0]?.mediaType, bytes: seen[0]?.data?.byteLength }));
+	}
+
+	{
+		const core = new probe.MediaProbeCore({
+			providerOf: async () => target,
+			timeoutMs: () => 5000,
+			storeImage: async () => {
+				throw new Error('附件服务拒绝了：不支持的图片格式');
+			},
+		});
+		const result = await core.storeReference(dataUrlOf(pixelPng, 'image/gif'));
+		check('附件服务拒绝时把原因原样说出来（不静默失败）',
+			result.ok === false && String(result.message).includes('不支持的图片格式'),
+			String(result.message));
+	}
+
+	{
+		const core = new probe.MediaProbeCore({ providerOf: async () => target, timeoutMs: () => 5000 });
+		const result = await core.storeReference(dataUrlOf(pixelPng));
+		check('宿主没装配附件服务时明确说不可用（而不是回一个空句柄）',
+			result.ok === false && String(result.message).includes('附件服务'),
+			String(result.message));
+	}
+
+	{
+		const core = new probe.MediaProbeCore({
+			providerOf: async () => target,
+			timeoutMs: () => 5000,
+			storeImage: async () => ({ path: 'x', bytes: 1 }),
+		});
+		const http = await core.storeReference('https://cdn.example/a.png');
+		check('http 地址不必过这一趟（本来就塞得进命令行）',
+			http.ok === false && String(http.message).includes('data:'),
+			String(http.message));
+	}
+
+	// `decodeDataUrl` 是两处共用的解析（参考图字节 + 上面的 storeReference）
+	{
+		const ref = await libImport('lib/host/reference.js');
+		const decoded = ref.decodeDataUrl(dataUrlOf(pixelPng, 'image/jpeg'));
+		check('decodeDataUrl 解出字节与 MIME',
+			decoded !== null &&
+				decoded.mediaType === 'image/jpeg' &&
+				Buffer.from(decoded.data).equals(Buffer.from(pixelPng)),
+			JSON.stringify(decoded === null ? null : { mime: decoded.mediaType, bytes: decoded.data.byteLength }));
+		check('decodeDataUrl 对非 data: 与坏格式返回 null',
+			ref.decodeDataUrl('https://x/a.png') === null && ref.decodeDataUrl('data:image/png;base64') === null,
+		);
+		check('没写 MIME 的 data URL 按 png 兜底',
+			ref.decodeDataUrl(`data:;base64,${Buffer.from(pixelPng).toString('base64')}`)?.mediaType === 'image/png',
+		);
+	}
 }
 
 // 探测那一节的替身是**临时**换上去的：换回来，否则后面每一节的请求都会打到它身上

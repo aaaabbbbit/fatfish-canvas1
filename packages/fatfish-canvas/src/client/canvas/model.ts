@@ -14,8 +14,14 @@
  * @module fatfish-canvas/client/canvas/model
  */
 
-/** 节点承载的媒体种类。P2/P3 会真正产生 image / video。 */
-export type NodeKind = 'image' | 'video' | 'text';
+/**
+ * 节点承载的媒体种类。
+ *
+ * `image` / `video` / `text` 是媒体卡片；`gen` 是**生成节点** —— 它自己不带提示词，
+ * 提示词与参考图由连线喂进来（见 `canvas/graph.ts`），产物落在节点自己身上
+ * （pending → ready），因此它同时也是「输出」。
+ */
+export type NodeKind = 'image' | 'video' | 'text' | 'gen';
 
 /** 节点状态：生成中 / 就绪 / 失败。 */
 export type NodeStatus = 'pending' | 'ready' | 'failed';
@@ -40,6 +46,15 @@ export interface CanvasNode {
 	status: NodeStatus;
 	/** 媒体地址（http(s)、blob: 或 data:）。pending 时通常为空。 */
 	src?: string;
+	/**
+	 * 这张图的**参考图句柄**（P22：宿主文件系统上的绝对路径）。
+	 *
+	 * 为什么不能直接用 `src`：`src` 要能喂给 `<img>`（http / data / blob），而参考图
+	 * 必须塞进 `/generate --ref` 那一行**文本**。本地拖进来的图 `src` 是一张几兆的
+	 * `data:` URL，塞不进去 —— 于是让宿主把字节存进附件库，回一个短路径放在这里。
+	 * 连线判定与命令行都优先用它。
+	 */
+	ref?: string;
 	/** 视频封面。 */
 	poster?: string;
 	/** 卡片标题。 */
@@ -54,6 +69,110 @@ export interface CanvasNode {
 	createdAt: number;
 	/** 生成它的会话 id（P3 用于回溯）。 */
 	sessionId?: string;
+	/**
+	 * 这张图**自带的工作流文档**（P18：拖进来的 PNG 里读出的 `workflow` tEXt 块）。
+	 *
+	 * 存在节点上而不是内存表里：刷新之后「还原工作流」还得在（用户完全可能先拖
+	 * 进来、过一会儿再还原）。文档本身只有几 KB，且里面的 `src` 只留 http(s) 地址。
+	 */
+	workflow?: string;
+	/**
+	 * 生成节点的**产物种类**（P19）。缺省 `image`。
+	 *
+	 * 刻意不复用 `kind`：`kind` 说的是「这是个什么节点」（`gen`），这里说的是
+	 * 「它会画出什么」（图像 / 视频）—— 两者混成一个字段之后 `NodeCard` 的分支
+	 * 就再也读不懂了。
+	 */
+	genKind?: 'image' | 'video';
+	/** 生成节点的**画幅比例**（P19，如 `16:9`）。缺省 `1:1`。 */
+	ratio?: string;
+	/** 生成节点的**视频时长（秒）**（P19）。缺省 = 用管线的默认值。 */
+	duration?: number;
+	/** 生成节点的**视频分辨率**（P19，如 `1080p`）。缺省 = 用管线的默认值。 */
+	resolution?: string;
+}
+
+/** 生成节点画什么（缺省图像）。 */
+export function genKindOf(node: { genKind?: 'image' | 'video' | undefined }): 'image' | 'video' {
+	return node.genKind === 'video' ? 'video' : 'image';
+}
+
+/** 生成节点的画幅比例（缺省 1:1 —— 与生成管线的默认值一致）。 */
+export function genRatioOf(node: { ratio?: string | undefined }): string {
+	const value = (node.ratio ?? '').trim();
+	return value === '' ? '1:1' : value;
+}
+
+/**
+ * 生成节点的视频时长。
+ *
+ * 返回 `undefined` 表示**用管线的默认值** —— 与「0 秒」是两回事，因此这里只认
+ * 正数，坏值一律当成没设。
+ * @param node - 生成节点。
+ * @returns 秒数；没设或坏值时 undefined。
+ */
+export function genDurationOf(node: { duration?: number | undefined }): number | undefined {
+	const value = node.duration;
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * 生成节点的视频分辨率。
+ * @param node - 生成节点。
+ * @returns 分辨率；没设时 undefined（用管线的默认值）。
+ */
+export function genResolutionOf(node: { resolution?: string | undefined }): string | undefined {
+	const value = (node.resolution ?? '').trim();
+	return value === '' ? undefined : value;
+}
+
+// ─────────────────────── 连线（P18） ───────────────────────
+
+/**
+ * 节点四条边的中点 —— 也就是**连接点**的位置。
+ *
+ * 进出合一：同一个点既是入口也是出口（用户要的形态，参考 ComfyUI 但把
+ * 左侧输入点与右侧输出点合并成一个）。方向因此不记在连接点上，只记在连线上。
+ */
+export type PortSide = 'n' | 'e' | 's' | 'w';
+
+/** 一条连线：`from` 节点的产物喂给 `to` 节点的输入。 */
+export interface CanvasLink {
+	/** 稳定唯一 id。 */
+	id: string;
+	/** 起点节点 id。 */
+	from: string;
+	/** 终点节点 id。 */
+	to: string;
+	/** 用户从起点节点的哪条边的连接点拉出来的（渲染要从这个点出发）。 */
+	fromSide: PortSide;
+	/** 落在终点节点的哪条边上。 */
+	toSide: PortSide;
+}
+
+/**
+ * 命中测试：世界坐标下最上层（z 最大）的那个节点。
+ *
+ * 连线拖拽的落点判定用它 —— 指针被视口 capture 之后 `event.target` 永远是视口，
+ * 因此落点必须自己算，不能指望 DOM 的命中。
+ * @param nodes - 节点表（按 z 升序）。
+ * @param point - 世界坐标点。
+ * @returns 命中的节点；没命中时为 null。
+ */
+export function nodeAt(nodes: readonly CanvasNode[], point: Point): CanvasNode | null {
+	for (let i = nodes.length - 1; i >= 0; i -= 1) {
+		const node = nodes[i];
+		if (node === undefined) continue;
+		if (
+			point.x >= node.x &&
+			point.x <= node.x + node.w &&
+			point.y >= node.y &&
+			point.y <= node.y + node.h
+		) {
+			return node;
+		}
+	}
+	return null;
 }
 
 /** 瞬时视口状态。 */
@@ -478,6 +597,11 @@ export function snapMove(moving: Rect, others: readonly Rect[], tolerance: numbe
 /** 生成一个短 id（画布内唯一即可，不追求全局唯一性）。 */
 export function makeNodeId(): string {
 	return `n_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 生成一条连线的短 id（与节点 id 同一套做法，前缀不同便于肉眼区分）。 */
+export function makeLinkId(): string {
+	return `l_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /**

@@ -9,6 +9,8 @@
  *   选择   单击选中 · Shift 单击加选/减选 · 空白处拖拽 = 框选
  *   移动   拖拽节点（多选时整组移动）· 方向键微调 1px，Shift 为 10px
  *   删除   Delete / Backspace · Esc 取消选择 · Ctrl(⌘)+A 全选
+ *   连线   从节点四条边中点的**连接点**拖到另一个节点（P18，见 canvas/ports.ts）
+ *   新建   空白处右键 → 新建文字 / 生成节点（P18）
  *
  * 键盘处理刻意挂在**画布元素自身**（tabIndex=0）而不是 window 上：
  * 右侧就是聊天输入框，若监听 window，用户在聊天里按 Delete 会误删画布节点。
@@ -21,6 +23,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import {
 	boundsOf,
+	nodeAt,
 	rectFromPoints,
 	rectsIntersect,
 	snapMove,
@@ -30,14 +33,22 @@ import {
 	zoomAround,
 	type Guide,
 	type Point,
+	type PortSide,
 	type Rect,
 	type Viewport,
 } from './model';
+import { nearestPort } from './ports';
+import { canLink, needsReferenceHandle } from './graph';
+import { attachReferenceHandles } from './dropfiles';
+import { pushNotice, useNotice } from './notice';
 import {
+	addLinks,
 	bringToFront,
 	clearSelection,
+	getBoard,
 	nodeRect,
 	patchNodes,
+	removeLinks,
 	removeNodes,
 	setSelection,
 	setViewport,
@@ -63,6 +74,7 @@ import {
 import { getFollowNewNodes, useViewMode } from '../state';
 import { attachImageToComposer, insertIntoComposer, isComposerFocused, isEditableTarget } from '../dom';
 import { getProbeFace } from '../index';
+import { unwrapProbeResult } from '../shared/probe';
 import { nodeClickIntent } from './clickintent';
 
 /**
@@ -100,12 +112,19 @@ async function sendImageToComposer(url: string): Promise<string> {
 		const probe = getProbeFace();
 		if (probe !== undefined) {
 			try {
-				const raw = (await probe.fetchImage(url)) as {
+				// 远程面回的是信封，先拆（不拆就永远拿不到 dataUrl，只会静默退回插地址）
+				const answer = unwrapProbeResult<{
 					ok?: boolean;
 					message?: string;
 					dataUrl?: string;
 					name?: string;
-				};
+				}>(await probe.fetchImage(url));
+				if (!answer.ok) {
+					// 这次**调用**本身失败（远程面没就绪 / 网关错）：转述原因，仍退回插地址
+					if (insertIntoComposer(`${url}\n`)) return `${answer.message}（已插入图片地址）`;
+					return answer.message;
+				}
+				const raw = answer.value;
 				if (raw !== undefined && raw.ok === true && typeof raw.dataUrl === 'string') {
 					const done = await attach(raw.dataUrl, raw.name ?? 'canvas-image.png');
 					if (done !== null) return done;
@@ -124,6 +143,8 @@ async function sendImageToComposer(url: string): Promise<string> {
 	return '没能送进聊天框（找不到输入框）';
 }
 import { NodeCard } from './NodeCard';
+import { LinkLayer } from './LinkLayer';
+import { CanvasMenu } from './CanvasMenu';
 import { NodeMenu } from './NodeMenu';
 import { ZoomControls } from './ZoomControls';
 
@@ -151,6 +172,15 @@ type Interaction =
 			/** 上一次真正写回的偏移（吸附后常常没有新变化，据此避免空提交）。 */
 			offset: Point;
 			moved: boolean;
+	  }
+	| {
+			kind: 'link';
+			/** 从哪个节点的连接点拉出来的。 */
+			fromId: string;
+			/** 拉出来的那条边。 */
+			fromSide: PortSide;
+			/** 指针当前的世界坐标（画那条虚线用）。 */
+			to: Point;
 	  };
 
 /** 右键菜单的打开状态。 */
@@ -175,8 +205,13 @@ export function CanvasStage(): ReactNode {
 	const [animating, setAnimating] = useState(false);
 	/** 节点右键菜单（打开时才有值）。 */
 	const [nodeMenu, setNodeMenu] = useState<NodeMenuState | null>(null);
-	/** 「图片送聊天框」的即时提示文案（空 = 不显示；每次设置都会重播动画）。 */
-	const [sentNotice, setSentNotice] = useState('');
+	/** 空白处右键菜单（新建节点，P18）。 */
+	const [canvasMenu, setCanvasMenu] = useState<{
+		at: { x: number; y: number };
+		world: Point;
+	} | null>(null);
+	/** 底部提示（跨模块：拖入文件、导出、运行都会往里推，见 canvas/notice.ts）。 */
+	const sentNotice = useNotice();
 	/** 拖动时命中的对齐辅助线（世界坐标，渲染时换算成屏幕坐标）。 */
 	const [guides, setGuides] = useState<readonly Guide[]>([]);
 
@@ -196,34 +231,46 @@ export function CanvasStage(): ReactNode {
 		setAnimating((prev) => (prev ? false : prev));
 	}, []);
 
-	/**
-	 * 右键：在节点上打开操作菜单，在空白处只吞掉浏览器默认菜单。
-	 *
-	 * 选中语义与拖拽一致 —— 右键目标是当前选择的一部分就保留整组，
-	 * 否则先把选择收敛到这一个（这样「删除」永远符合直觉）。
-	 */
-	const onContextMenu = useCallback((event: unknown) => {
-		const e = event as MouseEvent & { target: EventTarget; preventDefault(): void };
-		e.preventDefault();
-		const target = e.target;
-		const el = target instanceof Element ? target.closest('.ffc-node') : null;
-		if (el === null) {
-			setNodeMenu(null);
-			return;
-		}
-		const nodeId = el.getAttribute('data-node-id');
-		if (nodeId === null || nodeId === '') return;
-		const selection = boardRef.current.selection;
-		if (!selection.includes(nodeId)) setSelection([nodeId]);
-		setNodeMenu({ nodeId, at: { x: e.clientX, y: e.clientY } });
-	}, []);
-
 	/** 视口元素的屏幕原点（指针坐标要减掉它才落进画布坐标系）。 */
 	const screenOf = useCallback((clientX: number, clientY: number): Point => {
 		const rect = viewportRef.current?.getBoundingClientRect();
 		if (rect === undefined) return { x: clientX, y: clientY };
 		return { x: clientX - rect.left, y: clientY - rect.top };
 	}, []);
+
+	/**
+	 * 右键：在节点上打开操作菜单，在空白处打开「新建节点」菜单。
+	 *
+	 * 选中语义与拖拽一致 —— 右键目标是当前选择的一部分就保留整组，
+	 * 否则先把选择收敛到这一个（这样「删除」永远符合直觉）。
+	 *
+	 * ⚠️ 定义在 `screenOf` **之后**：`useCallback` 的依赖数组是当场求值的，
+	 * 写在前面会踩进 `const` 的暂时性死区。
+	 */
+	const onContextMenu = useCallback(
+		(event: unknown) => {
+			const e = event as MouseEvent & { target: EventTarget; preventDefault(): void };
+			e.preventDefault();
+			const target = e.target;
+			const el = target instanceof Element ? target.closest('.ffc-node') : null;
+			if (el === null) {
+				setNodeMenu(null);
+				// 空白处：新节点就落在指针底下（用世界坐标，缩放平移都跟着走）
+				setCanvasMenu({
+					at: { x: e.clientX, y: e.clientY },
+					world: toWorld(screenOf(e.clientX, e.clientY), viewportValue.current),
+				});
+				return;
+			}
+			setCanvasMenu(null);
+			const nodeId = el.getAttribute('data-node-id');
+			if (nodeId === null || nodeId === '') return;
+			const selection = boardRef.current.selection;
+			if (!selection.includes(nodeId)) setSelection([nodeId]);
+			setNodeMenu({ nodeId, at: { x: e.clientX, y: e.clientY } });
+		},
+		[screenOf],
+	);
 
 	// ── 尺寸观测：fit / 缩放锚点 / 居中都需要真实尺寸 ──
 	//
@@ -335,6 +382,11 @@ export function CanvasStage(): ReactNode {
 		if (el === null) return undefined;
 
 		const onWheel = (event: WheelEvent): void => {
+			// 滚轮落在菜单上 = 滚菜单自己（菜单可能比窗口还高），
+			// 既不该缩放画布、也不该把菜单收掉。这里**不** preventDefault，
+			// 让浏览器把菜单滚起来。
+			const wheelTarget = event.target;
+			if (wheelTarget instanceof Element && wheelTarget.closest('[data-ffc-menu]') !== null) return;
 			event.preventDefault();
 			noteUserInput();
 			setNodeMenu(null);
@@ -393,8 +445,35 @@ export function CanvasStage(): ReactNode {
 		(event: ReactPointerEvent<HTMLDivElement>) => {
 			const el = viewportRef.current;
 			if (el === null) return;
-			// 任何指针交互都先收起右键菜单（右键本身也会走到这里）
-			setNodeMenu(null);
+
+			/**
+			 * 点在**菜单自己**（或它的触发按钮）身上时绝不能收起菜单（P21 修的真 bug）。
+			 *
+			 * `pointerdown` 先于 `click`：若在这里 `setCanvasMenu(null)`，React 会在
+			 * pointerdown 结束时就把菜单卸载掉，随后的 `click` 便落在画布上而不是那个
+			 * 按钮上 —— 症状是「**鼠标点菜单项毫无反应**」。
+			 *
+			 * 这个 bug 从 P5 活到现在，因为 e2e-p5 是用**方向键 + Enter** 选菜单项的，
+			 * 鼠标点击从来没被测过（P17 的 composer 模型菜单 portal 到了 body，
+			 * 所以它一直好的 —— 也就没人往这上面想）。
+			 *
+			 * 判据用属性而不是类名：画布里有**三个**菜单容器，类名各不相同
+			 * （`.ffc-menu` / `.ffc-zoom-menu`），漏一个就漏一个菜单；
+			 * 触发按钮同理（`useMenuDismiss` 的 `buttonRef` 认的就是它，
+			 * 视口这边不认的话，点触发器会「先关再开」＝永远关不掉）。
+			 *
+			 * 菜单自己会在选中后关闭（`choose` → `onClose`），点菜单**外面**
+			 * 由 `useMenuDismiss` 的 document 捕获监听负责，两条路都不靠这里。
+			 */
+			const target = event.target;
+			const menuOwned =
+				target instanceof Element &&
+				target.closest('[data-ffc-menu], [data-ffc-menu-trigger]') !== null;
+			if (!menuOwned) {
+				// 任何指针交互都先收起右键菜单（右键本身也会走到这里）
+				setNodeMenu(null);
+				setCanvasMenu(null);
+			}
 			setGuides([]);
 			// 只处理左键与中键
 			if (event.button !== 0 && event.button !== 1) return;
@@ -402,10 +481,13 @@ export function CanvasStage(): ReactNode {
 			// 视口内的交互控件（缩放条按钮、播放按钮、链接…）自己处理指针，视口不得抢。
 			// 这是必须的一道闸：下面的 setPointerCapture 会把后续 pointerup 与
 			// 随之而来的 click 全部改派给「捕获元素」，于是按钮的 onClick 永不触发。
-			const target = event.target;
+			// `[data-ffc-port]` / `[data-ffc-link]` 是 P18 加的：连接点与连线的
+			// 命中路径在视口里，抢走指针就等于连线永远拉不出来。
 			if (
 				target instanceof Element &&
-				target.closest('button, a, input, select, textarea, [data-ffc-ui]') !== null
+				target.closest(
+					'button, a, input, select, textarea, [data-ffc-ui], [data-ffc-port], [data-ffc-link]',
+				) !== null
 			) {
 				return;
 			}
@@ -476,7 +558,20 @@ export function CanvasStage(): ReactNode {
 				return;
 			}
 
+			if (interaction.kind === 'link') {
+				// 只更新那条虚线；成不成边在 pointerup 时判（松手才作数）
+				setInteraction({ ...interaction, to: toWorld(point, viewportValue.current) });
+				return;
+			}
+
 			if (interaction.kind === 'move') {
+				// 拖节点要捕获指针（挪出视口、盖到别的元素上都还要收到 move），
+				// 但**必须等到真的动了才捕获**：见 onNodePointerDown 里的说明 ——
+				// pointerdown 就捕获会把 click / dblclick 改派给视口。
+				const el = viewportRef.current;
+				if (el !== null && !el.hasPointerCapture(event.pointerId)) {
+					el.setPointerCapture(event.pointerId);
+				}
 				const vp = viewportValue.current;
 				const world = toWorld(point, vp);
 				// 位移按「相对按下点的绝对值」算，而不是按上一帧的增量累加 ——
@@ -518,6 +613,39 @@ export function CanvasStage(): ReactNode {
 		[interaction, screenOf],
 	);
 
+	/**
+	 * 内联图（本地拖进来的、供应商内联回的生成结果）还没有宿主句柄时，
+	 * **当场**请宿主存一次再连上。
+	 *
+	 * 为什么不只丢一句「重新拖进画布一次」：那句话只对「刚从资源管理器拖进来、
+	 * 且当次存句柄成功」的图成立。生成结果的内联图根本没法「重拖」，而刷新前就
+	 * 在画布上的节点也不会再经过落图那条路（P22 只在落图那一刻存句柄）——
+	 * 于是那句提示对它们是一条死路，用户看到的正是「拖了还是这句」。
+	 * @param fromId - 参考图来源节点。
+	 * @param toId - 目标生成节点。
+	 * @param fromSide - 起点连接点。
+	 * @param toSide - 终点连接点。
+	 */
+	const linkAfterStoringReference = useCallback(
+		async (fromId: string, toId: string, fromSide: PortSide, toSide: PortSide): Promise<void> => {
+			pushNotice('正在请宿主把这张图存成参考图…');
+			const reported = await attachReferenceHandles([fromId]);
+			// ⚠️ 必须读 store，不能读 `boardRef`：句柄是 store **同步**写好的，而
+			// `boardRef.current` 要等下一次渲染才更新 —— 用它就会拿着「还没有 ref」的
+			// 旧快照去判，于是**明明存成功了却报「没能存成参考图」**（实测踩到）。
+			const board = getBoard();
+			const retry = canLink(board.nodes, board.links, fromId, toId);
+			if (retry.ok) {
+				addLinks([{ from: fromId, to: toId, fromSide, toSide }]);
+				return;
+			}
+			// 还是连不上：存句柄时已经把具体原因（图太大 / 后端不收）说在屏幕上了，
+			// 再推一遍判定理由只会把它盖掉 —— 只有「原因不明」时才说。
+			if (!reported) pushNotice(retry.reason);
+		},
+		[],
+	);
+
 	const onPointerUp = useCallback(
 		(event: ReactPointerEvent<HTMLDivElement>) => {
 			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -529,6 +657,43 @@ export function CanvasStage(): ReactNode {
 					Math.abs(interaction.current.y - interaction.start.y) > 3;
 				// 没真的拖出框 = 点空白，等价于取消选择
 				if (!moved && !interaction.additive) clearSelection();
+			} else if (interaction.kind === 'link') {
+				// 落点判定必须自己算：指针被视口 capture 之后 event.target 永远是视口。
+				const world = toWorld(screenOf(event.clientX, event.clientY), viewportValue.current);
+				const target = nodeAt(boardRef.current.nodes, world);
+				const fromNode = boardRef.current.nodes.find(
+					(node) => node.id === interaction.fromId,
+				);
+				if (target !== null) {
+					const check = canLink(
+						boardRef.current.nodes,
+						boardRef.current.links,
+						interaction.fromId,
+						target.id,
+					);
+					if (check.ok) {
+						addLinks([
+							{
+								from: interaction.fromId,
+								to: target.id,
+								fromSide: interaction.fromSide,
+								// 松手不要求精确命中某个连接点：落在节点上就取最近的那个
+								toSide: nearestPort(nodeRect(target), world),
+							},
+						]);
+					} else if (fromNode !== undefined && needsReferenceHandle(fromNode)) {
+						// 内联图缺宿主句柄：现在就补存一次再连，别让用户去猜「重拖」
+						void linkAfterStoringReference(
+							interaction.fromId,
+							target.id,
+							interaction.fromSide,
+							nearestPort(nodeRect(target), world),
+						);
+					} else {
+						// 拒绝必须说出来 —— 静默不生效是最难查的一类反馈
+						pushNotice(check.reason);
+					}
+				}
 			} else if (
 				interaction.kind === 'pan' &&
 				// 点空白（平移手势里没真的移动）= 取消选择。
@@ -542,7 +707,7 @@ export function CanvasStage(): ReactNode {
 			setInteraction({ kind: 'idle' });
 			setGuides([]);
 		},
-		[interaction],
+		[interaction, linkAfterStoringReference],
 	);
 
 	/** 节点上的按下：负责选中语义并发起整组移动。 */
@@ -563,9 +728,9 @@ export function CanvasStage(): ReactNode {
 				composerFocused: isComposerFocused(),
 			});
 			if (intent.kind === 'send-to-composer' && url !== null) {
-				setSentNotice('正在取图…');
+				pushNotice('正在取图…');
 				void sendImageToComposer(url).then((text) => {
-					setSentNotice(text);
+					pushNotice(text);
 				});
 				return;
 			}
@@ -594,7 +759,11 @@ export function CanvasStage(): ReactNode {
 			const group = boardRef.current.nodes.filter((node) => next.includes(node.id));
 			const bounds = boundsOf(group);
 			if (bounds === null) return;
-			el.setPointerCapture(e.pointerId);
+			// ⚠️ 这里**不**设指针捕获（P23 修的真 bug）：`pointerdown` 里一捕获，
+			// 随后的 `click` / `dblclick` 会被改派给捕获元素（视口），于是
+			// **文字节点的双击永远进不了编辑态**（鼠标点了没反应，键盘也没有别的路）。
+			// 捕获改在「真的开始移动」的那一帧设（见 onPointerMove 的 move 分支）：
+			// 拖拽照样顺滑，而原地双击的两下仍然是节点自己的点击事件。
 			setInteraction({
 				kind: 'move',
 				start: toWorld(screenOf(e.clientX, e.clientY), viewportValue.current),
@@ -603,6 +772,31 @@ export function CanvasStage(): ReactNode {
 				ids: next,
 				offset: { x: 0, y: 0 },
 				moved: false,
+			});
+		},
+		[screenOf, noteUserInput],
+	);
+
+	/**
+	 * 连接点上的按下：发起一次连线拖拽。
+	 *
+	 * 与拖节点是**两种手势**，靠 NodeCard 里那个 `stopPropagation` 分流：
+	 * 端口可见时它先接到事件，节点就收不到，于是不会变成搬运节点。
+	 */
+	const onPortPointerDown = useCallback(
+		(event: unknown, nodeId: string, side: PortSide) => {
+			const e = event as ReactPointerEvent<HTMLDivElement>;
+			if (e.button !== 0) return;
+			const el = viewportRef.current;
+			if (el === null) return;
+			el.focus({ preventScroll: true });
+			noteUserInput();
+			el.setPointerCapture(e.pointerId);
+			setInteraction({
+				kind: 'link',
+				fromId: nodeId,
+				fromSide: side,
+				to: toWorld(screenOf(e.clientX, e.clientY), viewportValue.current),
 			});
 		},
 		[screenOf, noteUserInput],
@@ -717,12 +911,28 @@ export function CanvasStage(): ReactNode {
 			onContextMenu={onContextMenu}
 		>
 			<div className="ffc-world" style={{ transform: worldTransform }}>
+				{/* 连线画在节点**之前**：线被卡片压住，符合节点编辑器的通行观感 */}
+				<LinkLayer
+					nodes={board.nodes}
+					links={board.links}
+					zoom={board.viewport.zoom}
+					draft={
+						interaction.kind === 'link'
+							? { fromId: interaction.fromId, fromSide: interaction.fromSide, to: interaction.to }
+							: null
+					}
+					onRemove={(id) => {
+						removeLinks([id]);
+					}}
+				/>
 				{board.nodes.map((node) => (
 					<NodeCard
 						key={node.id}
 						node={node}
 						selected={selected.has(node.id)}
+						zoom={board.viewport.zoom}
 						onPointerDown={onNodePointerDown}
+						onPortPointerDown={onPortPointerDown}
 						onRemove={(id) => {
 							removeNodes([id]);
 						}}
@@ -804,6 +1014,18 @@ export function CanvasStage(): ReactNode {
 				}}
 				onFit={fitAll}
 			/>
+
+			{/* 空白处右键：新建节点（P18）。新节点落在右键那一点上。 */}
+			{canvasMenu !== null ? (
+				<CanvasMenu
+					key={`${String(canvasMenu.at.x)},${String(canvasMenu.at.y)}`}
+					at={canvasMenu.at}
+					world={canvasMenu.world}
+					onClose={() => {
+						setCanvasMenu(null);
+					}}
+				/>
+			) : null}
 
 			{/* 节点右键菜单：`position: fixed` + 视口夹紧，因此不会被视口的
 			    overflow 裁掉（fixed 的包含块是视口，不是这个 overflow 容器）。 */}

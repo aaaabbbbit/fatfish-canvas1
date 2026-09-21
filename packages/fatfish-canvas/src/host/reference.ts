@@ -145,6 +145,27 @@ async function readAttachmentRef(
 }
 
 /**
+ * 解析一个 `data:` 地址。
+ *
+ * 抽出来给两处共用：参考图字节（`referenceBytes`）与「把画布上的内联图存成
+ * 参考图句柄」（`host/probe.ts` 的 `storeReference`）—— data URL 的格式只有一份
+ * 实现，免得两处各自正则、各自漏掉一种写法。
+ * @param value - 候选地址。
+ * @returns 字节与 MIME；不是 `data:` 或格式不对时 null。
+ */
+export function decodeDataUrl(value: string): { data: Uint8Array; mediaType: string } | null {
+	if (!value.startsWith('data:')) return null;
+	const match = /^data:([^;,]*)[^,]*,(.*)$/s.exec(value);
+	if (match === null) return null;
+	const declared = match[1] ?? '';
+	return {
+		data: new Uint8Array(Buffer.from(match[2] ?? '', 'base64')),
+		// 没写 MIME 的 data URL 按 png 报（与 `toDataUrl` 的兜底一致）
+		mediaType: declared === '' ? 'image/png' : declared,
+	};
+}
+
+/**
  * 取参考图的**字节**（`/images/edits` 这类 multipart 端点要的是文件而不是地址）。
  *
  * `data:` 就地解码；`http(s)` 则下载一次 —— 这一条是真会多一次往返的，所以只在
@@ -158,14 +179,8 @@ export async function referenceBytes(
 	reference: string,
 	signal?: AbortSignal,
 ): Promise<{ data: Uint8Array; mediaType: string }> {
-	if (reference.startsWith('data:')) {
-		const match = /^data:([^;,]*)[^,]*,(.*)$/s.exec(reference);
-		if (match === null) throw new Error('参考图的 data: 地址格式不对，无法解码。');
-		return {
-			data: new Uint8Array(Buffer.from(match[2] ?? '', 'base64')),
-			mediaType: match[1] === '' ? 'image/png' : (match[1] ?? 'image/png'),
-		};
-	}
+	const inline = decodeDataUrl(reference);
+	if (inline !== null) return inline;
 
 	let response: Response;
 	try {

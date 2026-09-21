@@ -33,7 +33,7 @@ import { ModelPicker } from './settings/ModelPicker';
 import { MediaToolRow } from './toolview/MediaToolRow';
 import { installCanvasIngest } from './canvas/bridge';
 import { installCanvasDrop } from './canvas/dropfiles';
-import { installBoardScope } from './canvas/scope';
+import { installBoardScope, installBoardGc } from './canvas/scope';
 import { installViewShortcut } from './shortcut';
 import { MEDIA_NS } from './shared/catalog';
 import { setMediaApi, setMediaScope } from './settings/models';
@@ -67,6 +67,15 @@ export interface MediaProbeFace {
 	 * @param url - 图片地址。
 	 */
 	fetchImage(url: string): Promise<unknown>;
+	/**
+	 * 把画布上的**内联图**（本地拖进来的那种）存成参考图句柄（P22）。
+	 *
+	 * 反方向的那一趟：字节从页面送到宿主，宿主存进附件库、回一个短句柄（宿主路径），
+	 * 之后 `--ref <路径>` 才塞得进命令行。返回值形状见 `host/probe.ts` 的
+	 * `StoreReferenceResult`。
+	 * @param dataUrl - `data:image/...;base64,...`。
+	 */
+	storeReference(dataUrl: string): Promise<unknown>;
 }
 
 /**
@@ -293,12 +302,19 @@ export function apply(ctx: Context): void {
 	// 画布作用域（P7）必须**先**装上：桥一旦报来会话 id，作用域就要换好键，
 	// 结果才落得进正确的那块画布。
 	ctx.effect(() => installBoardScope(), 'fatfish-canvas: board scope');
+	// 会话画布的回收（P25）：删掉的会话不会删它那块画布，键会一直堆到配额满
+	// （满了以后 setItem 直接抛 = 画布再也不落盘）。判据全部来自平台，见 scope.ts。
+	installBoardGc(ctx);
 	installCanvasIngest(ctx);
 
 	// ── 6b. 拖进画布的本地图片 → 画布节点 ────────────────────────────
 	// 本体把附件 drop 挂在 document 上，捕获阶段先接管「落在画布上」的那些，
 	// 否则从屏幕外拖进来的图会被塞进聊天输入框。见 canvas/dropfiles.ts。
-	ctx.effect(() => installCanvasDrop(), 'fatfish-canvas: canvas file drop');
+	// 传进去的是**取法**而不是服务本身：探测面是 `$mount` 之后才出现的派生服务。
+	ctx.effect(
+		() => installCanvasDrop(() => getProbeFace()),
+		'fatfish-canvas: canvas file drop',
+	);
 
 	// ── 7. 聊天侧：`media_generate` 的工具行 ───────────────────────────
 	// `tool.call.toolview` 是 keyed 席位（key = 线上工具名）。登记自己那个工具

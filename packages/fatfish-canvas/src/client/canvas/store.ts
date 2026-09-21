@@ -4,7 +4,7 @@
  * 沿用 `state.ts` 的外部 store 模式（`useSyncExternalStore`），不引状态库。
  * 快照是不可变对象，仅在真正变化时替换引用，因此选择器可以安全依赖身份比较。
  *
- * 持久化只落**节点、视口与落图记账**：选择集是瞬时视图状态，重载后清空。
+ * 持久化只落**节点、连线、视口与落图记账**：选择集是瞬时视图状态，重载后清空。
  * 反序列化逐字段校验 —— localStorage 里可能有旧版本或被手工改坏的数据，
  * 宁可退回空画布，也不要让坏数据把画布渲染成 NaN 坐标。
  *
@@ -20,12 +20,16 @@
  */
 
 import { useEffect, useState } from 'react';
+import { ASPECT_RATIOS, VIDEO_RESOLUTIONS } from '../shared/media';
 import {
 	clampZoom,
 	DEFAULT_VIEWPORT,
+	makeLinkId,
 	makeNodeId,
+	type CanvasLink,
 	type CanvasNode,
 	type NodeKind,
+	type PortSide,
 	type Rect,
 	type Viewport,
 } from './model';
@@ -40,8 +44,8 @@ const BOARD_KEY = 'fatfish-canvas:board';
  */
 export type BoardScope = string | null;
 
-/** 当前持久化格式版本（v1 没有 ingested 字段，读到时按空表处理）。 */
-const BOARD_VERSION = 2;
+/** 当前持久化格式版本（v1 没有 ingested；v2 没有 links，读到时按空表处理）。 */
+const BOARD_VERSION = 3;
 
 /**
  * 作用域 → 存储键。
@@ -52,10 +56,32 @@ export function boardKeyFor(scope: BoardScope): string {
 	return scope === null || scope === '' ? BOARD_KEY : `${BOARD_KEY}:${scope}`;
 }
 
+/**
+ * **会话画布键**的前缀（回收用，P25）。
+ *
+ * ⚠️ 必须带那个冒号：`fatfish-canvas:board-scope`（作用域偏好）也以
+ * `fatfish-canvas:board` 开头，按不带冒号的前缀筛「会话画布键」会把偏好键
+ * 当成一块画布 —— 而回收的下一个动作就是把它删掉（§8.17 记着这个坑）。
+ */
+export const SESSION_BOARD_PREFIX = `${BOARD_KEY}:`;
+
+/**
+ * 从存储键反解出它属于哪个会话。
+ * @param key - localStorage 键。
+ * @returns 会话 id；不是会话画布键时为 null。
+ */
+export function sessionOfBoardKey(key: string): string | null {
+	if (!key.startsWith(SESSION_BOARD_PREFIX)) return null;
+	const id = key.slice(SESSION_BOARD_PREFIX.length);
+	return id === '' ? null : id;
+}
+
 /** store 快照。 */
 export interface BoardState {
 	/** 全部节点，按 z 升序（后面的画在上面）。 */
 	nodes: readonly CanvasNode[];
+	/** 全部连线（P18）。端点一定存在于 `nodes` 里 —— 见 `removeNodes` 的级联。 */
+	links: readonly CanvasLink[];
 	/** 当前视口。 */
 	viewport: Viewport;
 	/** 选中节点 id。 */
@@ -64,14 +90,23 @@ export interface BoardState {
 	ingested: readonly string[];
 }
 
-const EMPTY: BoardState = { nodes: [], viewport: DEFAULT_VIEWPORT, selection: [], ingested: [] };
+const EMPTY: BoardState = {
+	nodes: [],
+	links: [],
+	viewport: DEFAULT_VIEWPORT,
+	selection: [],
+	ingested: [],
+};
 
 // ─────────────────────────── 反序列化校验 ───────────────────────────
 
 const isFiniteNumber = (value: unknown): value is number =>
 	typeof value === 'number' && Number.isFinite(value);
 
-const KINDS: readonly NodeKind[] = ['image', 'video', 'text'];
+const KINDS: readonly NodeKind[] = ['image', 'video', 'text', 'gen'];
+
+/** 合法的连接点方位。 */
+const SIDES: readonly PortSide[] = ['n', 'e', 's', 'w'];
 
 /**
  * 校验并规范化一个节点。
@@ -101,6 +136,7 @@ function reviveNode(raw: unknown): CanvasNode | null {
 		z: isFiniteNumber(o.z) ? o.z : 0,
 		status,
 		...(typeof o.src === 'string' ? { src: o.src } : {}),
+		...(typeof o.ref === 'string' && o.ref !== '' ? { ref: o.ref } : {}),
 		...(typeof o.poster === 'string' ? { poster: o.poster } : {}),
 		...(typeof o.title === 'string' ? { title: o.title } : {}),
 		...(typeof o.prompt === 'string' ? { prompt: o.prompt } : {}),
@@ -108,6 +144,39 @@ function reviveNode(raw: unknown): CanvasNode | null {
 		...(typeof o.error === 'string' ? { error: o.error } : {}),
 		createdAt: isFiniteNumber(o.createdAt) ? o.createdAt : Date.now(),
 		...(typeof o.sessionId === 'string' ? { sessionId: o.sessionId } : {}),
+		...(typeof o.workflow === 'string' && o.workflow !== '' ? { workflow: o.workflow } : {}),
+		// 生成节点的参数（P19）：坏值一律丢掉，让 `genKindOf` / `genRatioOf` 的
+		// 缺省值兜底 —— 宁可回到「图像 · 1:1」，也不要让一个荒唐比例进命令行。
+		...(o.genKind === 'video' || o.genKind === 'image' ? { genKind: o.genKind } : {}),
+		...(typeof o.ratio === 'string' && ASPECT_RATIOS.includes(o.ratio) ? { ratio: o.ratio } : {}),
+		...(isFiniteNumber(o.duration) && o.duration > 0 ? { duration: o.duration } : {}),
+		...(typeof o.resolution === 'string' && VIDEO_RESOLUTIONS.includes(o.resolution)
+			? { resolution: o.resolution }
+			: {}),
+	};
+}
+
+/**
+ * 校验并规范化一条连线。
+ *
+ * 端点是否存在于节点表里**不在这里判**：反序列化时连线与节点是分别读的，
+ * 这个函数看不到节点表。悬空端点在 `load` 里统一剔除（见那里的一段）。
+ * @param raw - 来自存储的原始值。
+ * @returns 合法连线；不可修复时返回 null。
+ */
+function reviveLink(raw: unknown): CanvasLink | null {
+	if (raw === null || typeof raw !== 'object') return null;
+	const o = raw as Record<string, unknown>;
+	if (typeof o.id !== 'string' || o.id === '') return null;
+	if (typeof o.from !== 'string' || o.from === '') return null;
+	if (typeof o.to !== 'string' || o.to === '') return null;
+	if (!SIDES.includes(o.fromSide as PortSide) || !SIDES.includes(o.toSide as PortSide)) return null;
+	return {
+		id: o.id,
+		from: o.from,
+		to: o.to,
+		fromSide: o.fromSide as PortSide,
+		toSide: o.toSide as PortSide,
 	};
 }
 
@@ -152,7 +221,15 @@ function load(key: string): BoardState {
 		? o.ingested.filter((id): id is string => typeof id === 'string' && id !== '')
 		: [];
 
-	return { nodes, viewport, selection: [], ingested };
+	// v2 及更早没有连线。**悬空连线必须在这里剔除**：渲染时它要按 id 找端点，
+	// 找不到就会在原点画出一条谁也不知道从哪来的线（或直接抛错）。
+	const ids = new Set(nodes.map((node) => node.id));
+	const links = (Array.isArray(o.links) ? o.links : [])
+		.map(reviveLink)
+		.filter((link): link is CanvasLink => link !== null)
+		.filter((link) => ids.has(link.from) && ids.has(link.to));
+
+	return { nodes, links, viewport, selection: [], ingested };
 }
 
 // ─────────────────────────── store 本体 ───────────────────────────
@@ -186,6 +263,7 @@ function persistNow(): void {
 			JSON.stringify({
 				version: BOARD_VERSION,
 				nodes: state.nodes,
+				links: state.links,
 				viewport: state.viewport,
 				ingested: state.ingested,
 			}),
@@ -276,6 +354,11 @@ export function useViewport(): Viewport {
 /** 订阅选择集。 */
 export function useSelection(): readonly string[] {
 	return useStoreValue(() => state.selection);
+}
+
+/** 订阅连线表（P18）。 */
+export function useLinks(): readonly CanvasLink[] {
+	return useStoreValue(() => state.links);
 }
 
 // ─────────────────────────── 作用域 ───────────────────────────
@@ -420,6 +503,10 @@ export function translateNodes(ids: readonly string[], dx: number, dy: number): 
 
 /**
  * 删除节点。
+ *
+ * **级联删连线**：连线的一端没了，线就必须一起走。放在这里而不是让渲染层
+ * 跳过悬空连线 —— 后者会让坏数据永远留在 localStorage 里，而且每个读
+ * 连线的地方都得自己再防一次。
  * @param ids - 目标节点 id。
  */
 export function removeNodes(ids: readonly string[]): void {
@@ -428,8 +515,37 @@ export function removeNodes(ids: readonly string[]): void {
 	commit({
 		...state,
 		nodes: state.nodes.filter((node) => !target.has(node.id)),
+		links: state.links.filter((link) => !target.has(link.from) && !target.has(link.to)),
 		selection: state.selection.filter((id) => !target.has(id)),
 	});
+}
+
+/**
+ * 新增连线。
+ * @param inputs - 除 id 外的字段。
+ * @returns 新增的连线。
+ */
+export function addLinks(
+	inputs: readonly (Omit<CanvasLink, 'id'> & { id?: string })[],
+): CanvasLink[] {
+	if (inputs.length === 0) return [];
+	const created = inputs.map(
+		(input) => ({ ...input, id: input.id ?? makeLinkId() }) satisfies CanvasLink,
+	);
+	commit({ ...state, links: [...state.links, ...created] });
+	return created;
+}
+
+/**
+ * 删除连线。
+ * @param ids - 目标连线 id。
+ */
+export function removeLinks(ids: readonly string[]): void {
+	if (ids.length === 0) return;
+	const target = new Set(ids);
+	const next = state.links.filter((link) => !target.has(link.id));
+	if (next.length === state.links.length) return;
+	commit({ ...state, links: next });
 }
 
 /**
@@ -493,11 +609,11 @@ export function clearSelection(): void {
 	commit({ ...state, selection: [] });
 }
 
-/** 清空整块画布（节点 + 视口）。 */
+/** 清空整块画布（节点 + 连线 + 视口）。 */
 export function clearBoard(): void {
 	// 刻意**保留 ingested**：清空画布之后，刚生成过的那几张图不应该立刻
 	// 又从会话快照里被重放回来。下一次生成照常落图。
-	commit({ ...state, nodes: [], viewport: DEFAULT_VIEWPORT, selection: [] });
+	commit({ ...state, nodes: [], links: [], viewport: DEFAULT_VIEWPORT, selection: [] });
 }
 
 /**

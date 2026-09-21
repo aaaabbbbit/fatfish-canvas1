@@ -82,22 +82,47 @@ export function regeneratePrompt(prompt: string, kind: string, ratio?: string): 
 
 /**
  * 组装 `/generate` 的那一行（尾部留一个空格，便于用户接着补参数）。
+ *
+ * 参数收成一个对象而不是继续加位置参数：调用点已经有五种组合（重新生成 /
+ * 参考图 / 工作流 / 视频…），再往下加位置参数就会出现「第 5 个参数是 ref 还是 wf」
+ * 这种只有写的人记得住的问题。
  * @param prompt - 原始提示词。
- * @param kind - 媒体种类。
- * @param ratio - 画幅比例。
- * @param reference - 参考图地址（画布右键那条路用它，见 `referenceOf`）。
+ * @param options - 种类、比例、参考图、工作流节点 id、视频参数。
  * @returns 完整命令行。
  */
 export function regenerateCommandLine(
 	prompt: string,
-	kind = 'image',
-	ratio?: string,
-	reference?: string,
+	options: {
+		/** 媒体种类（`video` 会带上 `--video`）。 */
+		kind?: string;
+		/** 画幅比例。 */
+		ratio?: string | undefined;
+		/** 参考图地址（画布右键那条路用它，见 `referenceOf`）。 */
+		reference?: string | undefined;
+		/** 画布生成节点 id（工作流那条路用它，见 `canvas/run.ts`）。 */
+		wf?: string | undefined;
+		/** 视频时长（秒）。 */
+		duration?: number | undefined;
+		/** 视频分辨率。 */
+		resolution?: string | undefined;
+	} = {},
 ): string {
 	const parts = [`/${MEDIA_COMMAND_NAME}`];
-	if (kind === 'video') parts.push('--video');
-	if (ratio !== undefined && ratio !== '') parts.push(`--ratio ${ratio}`);
-	if (reference !== undefined && reference !== '') parts.push(`--ref ${reference}`);
+	if (options.kind === 'video') parts.push('--video');
+	if (options.ratio !== undefined && options.ratio !== '') parts.push(`--ratio ${options.ratio}`);
+	if (options.reference !== undefined && options.reference !== '') {
+		parts.push(`--ref ${options.reference}`);
+	}
+	if (options.wf !== undefined && options.wf !== '') parts.push(`--wf ${options.wf}`);
+	// 视频参数只对视频有意义：图像那边带上它们只会让命令行变长
+	if (options.kind === 'video') {
+		if (options.duration !== undefined && options.duration > 0) {
+			parts.push(`--duration ${String(options.duration)}`);
+		}
+		if (options.resolution !== undefined && options.resolution !== '') {
+			parts.push(`--resolution ${options.resolution}`);
+		}
+	}
 	parts.push(prompt);
 	return `${parts.join(' ')} `;
 }
@@ -116,6 +141,23 @@ function commandMissed(result: unknown): boolean {
 }
 
 /**
+ * 直接把一行命令投给当前会话（**不**退回提示词那条路）。
+ *
+ * 工作流必须用这条：退回提示词是「让模型再调一次工具」，那条路带不上 `--wf`，
+ * 结果就回不到生成节点上（会变成一张散图）。
+ * @param line - 完整命令行。
+ * @returns 命令是否真的被执行（`matched: false` 与异常都算没执行）。
+ */
+export async function runCommandLine(line: string): Promise<boolean> {
+	if (target === null) return false;
+	try {
+		return !commandMissed(await target.command(line));
+	} catch {
+		return false;
+	}
+}
+
+/**
  * 触发一次重新生成。
  *
  * 先走 `/generate` 直达命令（零 token），命令不可用再退回提示词
@@ -123,31 +165,39 @@ function commandMissed(result: unknown): boolean {
  *
  * ⚠️ 带参考图时**只有命令这条路**：退回的那条提示词要靠模型把地址抄进工具参数，
  * 而模型看不见图、也没有节点上下文 —— 让它「参考图生成」只会得到一句空话。
+ *
+ * 退回提示词那条路只带**种类与比例**（视频时长 / 分辨率不进那句自然语言）——
+ * 模型本来就要重新调工具，多写两个参数只会让它更容易抄错。
  * @param prompt - 原始提示词。
- * @param kind - 媒体种类（默认 image）。
- * @param ratio - 画幅比例。
- * @param reference - 参考图地址（可选）。
+ * @param options - 种类、比例、参考图（与 `regenerateCommandLine` 同一套）。
  * @returns 实际走通的路径；都失败时 null。
  */
 export async function regenerate(
 	prompt: string,
-	kind = 'image',
-	ratio?: string,
-	reference?: string,
+	options: {
+		kind?: string;
+		ratio?: string | undefined;
+		reference?: string | undefined;
+		duration?: number | undefined;
+		resolution?: string | undefined;
+	} = {},
 ): Promise<'command' | 'prompt' | null> {
 	if (target === null || prompt === '') return null;
 	const session = target;
 
 	try {
-		const result = await session.command(regenerateCommandLine(prompt, kind, ratio, reference));
+		const result = await session.command(regenerateCommandLine(prompt, options));
 		if (!commandMissed(result)) return 'command';
 	} catch {
 		/* 命令面不可用：退回提示词 */
 	}
-	if (reference !== undefined && reference !== '') return null;
+	if (options.reference !== undefined && options.reference !== '') return null;
 
 	try {
-		await session.prompt([{ type: 'text', text: regeneratePrompt(prompt, kind, ratio) }], 'queue');
+		await session.prompt(
+			[{ type: 'text', text: regeneratePrompt(prompt, options.kind ?? 'image', options.ratio) }],
+			'queue',
+		);
 		return 'prompt';
 	} catch {
 		return null;

@@ -100,6 +100,9 @@ export function ZoomControls({
 					title="选择缩放档位"
 					aria-haspopup="menu"
 					aria-expanded={menuOpen}
+					// 视口靠这个属性认出「这是菜单的触发按钮」，不去抢它的 pointerdown
+					// （否则点它 = 先被视口关掉菜单、再被自己的 onClick 打开 = 永远关不掉）
+					data-ffc-menu-trigger="true"
 					onClick={() => {
 						setMenuOpen((prev) => !prev);
 					}}
@@ -142,6 +145,8 @@ export function ZoomControls({
 				<div
 					ref={menuRef}
 					className="ffc-zoom-menu"
+					// 画布视口靠这个属性认「这是菜单自己」（见 NodeMenu 的说明）
+					data-ffc-menu="true"
 					role="menu"
 					aria-label="缩放档位"
 					tabIndex={-1}

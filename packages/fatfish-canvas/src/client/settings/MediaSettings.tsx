@@ -47,6 +47,7 @@ import {
 	type ModelKind,
 	type ProviderPreset,
 } from '../shared/catalog';
+import { unwrapProbeResult, type ProbeEnvelope } from '../shared/probe';
 import { mutateSettings } from './models';
 import { clampToViewport, useMenuDismiss, useMenuFocus, useMenuNav } from '../menu';
 
@@ -86,17 +87,6 @@ interface ProbeResult {
 	status?: number;
 }
 
-/**
- * 远程调用的返回信封。
- *
- * ⚠️ Typert 的客户端方法**不直接返回结果值**，而是 `{ok:true,value}` /
- * `{ok:false,error}` 这个判别联合（网关层统一包装）。忘了拆信封的典型症状是
- * 「`result.ok` 永远是 undefined」→ 界面把成功也当成失败。
- */
-type ProbeEnvelope =
-	| { ok: true; value: ProbeResult }
-	| { ok: false; error: { code: string; message: string } };
-
 /** 宿主探测服务（远程命名空间的客户端面）。 */
 export interface MediaSettingsProbe {
 	/**
@@ -104,13 +94,13 @@ export interface MediaSettingsProbe {
 	 * @param providerId - 供应商 id。
 	 * @returns 结果信封。
 	 */
-	testConnection(providerId: string): Promise<ProbeEnvelope>;
+	testConnection(providerId: string): Promise<ProbeEnvelope<ProbeResult>>;
 	/**
 	 * 获取模型列表。
 	 * @param providerId - 供应商 id。
 	 * @returns 结果信封。
 	 */
-	listModels(providerId: string): Promise<ProbeEnvelope>;
+	listModels(providerId: string): Promise<ProbeEnvelope<ProbeResult>>;
 }
 
 /** 组件属性（由 apply 的 inject 面注入）。 */
@@ -664,10 +654,11 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 			const profile = providersOf(scope.getSnapshot().value)[id];
 			const existing = new Set((profile?.models ?? []).map((model) => model.id));
 			run(id, what, async () => {
-				// 远程方法返回的是信封，先拆再判成败
+				// 远程方法返回的是信封，先拆再判成败（拆信封在共享契约里，见 shared/probe.ts）
 				const envelope = what === 'test' ? await probe.testConnection(id) : await probe.listModels(id);
-				if (!envelope.ok) throw new Error(envelope.error.message);
-				const result = envelope.value;
+				const answer = unwrapProbeResult<ProbeResult>(envelope);
+				if (!answer.ok) throw new Error(answer.message);
+				const result = answer.value;
 				const found =
 					result.ok && Array.isArray(result.models)
 						? result.models.map((modelId, index) => ({

@@ -57,6 +57,7 @@ const PROBE = `(() => {
     status: q('.ffc-zoombar-readout') ? q('.ffc-zoombar-readout').textContent : null,
     nodes: Array.from(document.querySelectorAll('.ffc-node')).map((n) => ({
       left: parseFloat(n.style.left), top: parseFloat(n.style.top),
+      box: (() => { const r = n.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; })(),
       selected: n.dataset.selected === 'true', status: n.dataset.status,
     })),
     btnZoomIn: btn('放大 10%'),
@@ -233,15 +234,36 @@ try {
 	const node = s.nodes[0];
 	const nodeCenter = screenOfWorld(s, node.left + 120, node.top + 80);
 	const beforeLeft = node.left;
+	// ⚠️ 先点一下空白处再拖节点：**本体的输入框默认是聚焦的**，而 P15 定的规矩是
+	// 「输入框里正在打字时点图片 = 把这张图引用进聊天框」（canvas/clickintent.ts，
+	// 有真值表测试）。那一下按下去就走「送进聊天框」而不是「拖节点」——
+	// 症状是节点既没动也没被选中，看着像拖拽坏了。真人要先点一下画布（视口拿到焦点）才拖。
+	await click(browser.cdp, emptyPoint(s.vp).x, emptyPoint(s.vp).y);
+	// 诊断：按下去的那一点上到底是谁？焦点在谁身上？（「拖不动」时唯一能指路的东西）
+	const diagBefore = await evaluate(
+		browser.cdp,
+		`(() => {
+			const el = document.elementFromPoint(${String(Math.round(nodeCenter.x))}, ${String(Math.round(nodeCenter.y))});
+			const cls = el && el.className ? (el.className.baseVal !== undefined ? el.className.baseVal : el.className) : '';
+			const a = document.activeElement;
+			const notice = document.querySelector('.ffc-sent-notice');
+			return JSON.stringify({
+				top: el ? el.tagName + '.' + cls : null,
+				active: a ? a.tagName + '.' + (typeof a.className === 'string' ? a.className : '') : null,
+				notice: notice ? (notice.textContent || '') : '',
+			});
+		})()`,
+	);
 	await drag(browser.cdp, nodeCenter, { x: nodeCenter.x + 120, y: nodeCenter.y + 60 });
 	s = JSON.parse(await evaluate(browser.cdp, PROBE));
 	const moved = s.nodes[0];
 	check(
 		'拖拽节点真的移动了它',
 		num(moved.left) > beforeLeft + 80,
-		`left ${String(beforeLeft)} -> ${String(moved.left)} (Δ=${(num(moved.left) - beforeLeft).toFixed(1)}, 期望约 120)`,
+		`left ${String(beforeLeft)} -> ${String(moved.left)} (Δ=${(num(moved.left) - beforeLeft).toFixed(1)}, 期望约 120)；` +
+			`节点盒=${JSON.stringify(node.box)} 按下点=(${String(Math.round(nodeCenter.x))},${String(Math.round(nodeCenter.y))}) 该点上是 ${diagBefore}`,
 	);
-	check('拖拽后节点被选中', moved.selected === true);
+	check('拖拽后节点被选中', moved.selected === true, `移动后盒=${JSON.stringify(moved.box)}；按下前 ${diagBefore}`);
 
 	await sleep(800); // 等去抖持久化落盘
 	const persisted = JSON.parse(
@@ -257,9 +279,12 @@ try {
 	console.log('\n7) Shift + 拖拽框选');
 	s = JSON.parse(await evaluate(browser.cdp, PROBE));
 	const nodeNow = s.nodes[0];
-	// 从节点的左上外侧拉一个大框覆盖整个节点
-	const boxFrom = { x: s.vp.x + 6, y: s.vp.y + 6 };
-	const boxTo = screenOfWorld(s, nodeNow.left + 240 + 20, nodeNow.top + 160 + 20);
+	// 从节点的**右下方空白处**拉一个框盖住它。⚠️ 起点不能落在节点自己身上：种子把节点
+	// 摆在世界原点、视口也是 (0,0)，于是节点正好压着视口左上角 —— 老写法从
+	// (vp.x+6, vp.y+6) 起手，那一点在节点里面，按下去变成「拖节点」，
+	// 选框根本不出现（实测：没有 .ffc-marquee，但松手后节点被选中）。
+	const boxFrom = { x: Math.round(s.vp.x + 420), y: Math.round(s.vp.y + 320) };
+	const boxTo = { x: Math.round(s.vp.x + 20), y: Math.round(s.vp.y + 20) };
 	await browser.cdp.send('Input.dispatchMouseEvent', {
 		type: 'mousePressed',
 		x: boxFrom.x,

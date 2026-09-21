@@ -30,6 +30,9 @@ export function isComposerFocused(): boolean {
 	if (typeof document === 'undefined') return false;
 	const active = document.activeElement;
 	if (!(active instanceof HTMLElement)) return false;
+	// 画布自己的输入控件（文字节点的编辑框，P18）**不算**「正在聊天框里打字」：
+	// 否则用户在画布里改提示词时点一下图片，那张图会被当成「引用它」送进聊天框。
+	if (active.closest('.ffc-panel') !== null) return false;
 	return isEditableTarget(active) || active.closest('[contenteditable="true"]') !== null;
 }
 

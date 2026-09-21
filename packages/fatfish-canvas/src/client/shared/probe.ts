@@ -26,7 +26,7 @@ export const PROBE_NAMESPACE = 'mediaProbe';
 /** 一个探测方法的声明。 */
 interface ProbeMethodSpec {
 	/** 方法名。 */
-	method: 'testConnection' | 'listModels' | 'fetchImage';
+	method: 'testConnection' | 'listModels' | 'fetchImage' | 'storeReference';
 	/** 一句说明（进描述符，便于诊断）。 */
 	summary: string;
 	/** 参数线名（`fetchImage` 收的是地址而不是供应商 id）。 */
@@ -100,9 +100,39 @@ function probeResultCodec(): StrictCodec {
 	};
 }
 
-/** 参数的编解码器（三个方法各自一条）。 */
+/** 参数的编解码器（各方法各自一条）。 */
 const providerIdCodec = stringCodec(`${PROBE_PKG}/types#ProviderId`);
 const imageUrlCodec = stringCodec(`${PROBE_PKG}/types#ImageUrl`);
+const dataUrlCodec = stringCodec(`${PROBE_PKG}/types#DataUrl`);
+
+/**
+ * `storeReference` 的结果编解码器：一个短句柄（宿主机上的文件路径）。
+ *
+ * 与 `fetchImage` 正好是**反方向**：那个把字节从宿主送到页面，这个把字节从页面
+ * 送到宿主。存在的理由见 `host/probe.ts` 的 `storeReference` ——
+ * 命令行塞不下一张本地照片的 base64。
+ */
+function storedReferenceCodec(): StrictCodec {
+	const typeSymbol = `${PROBE_PKG}/types#StoredReference`;
+	return {
+		mode: 'strict',
+		typeSymbol,
+		schema: {
+			parse(value: unknown): unknown {
+				if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+					throw new TypeError(`${typeSymbol}: 期望对象`);
+				}
+				const o = value as Record<string, unknown>;
+				if (typeof o.ok !== 'boolean') throw new TypeError(`${typeSymbol}: ok 必须是布尔`);
+				if (typeof o.message !== 'string') throw new TypeError(`${typeSymbol}: message 必须是字符串`);
+				const out: Record<string, unknown> = { ok: o.ok, message: o.message };
+				if (typeof o.ref === 'string' && o.ref !== '') out.ref = o.ref;
+				if (typeof o.bytes === 'number' && Number.isFinite(o.bytes)) out.bytes = o.bytes;
+				return out;
+			},
+		},
+	};
+}
 
 /**
  * `fetchImage` 的结果编解码器：一段可直接变成 `File` 的内联数据。
@@ -163,6 +193,13 @@ const SPECS: readonly ProbeMethodSpec[] = [
 		codec: imageUrlCodec,
 		result: imageBytesCodec(),
 	},
+	{
+		method: 'storeReference',
+		summary: '把画布上的内联图存成参考图句柄（本地图才能当参考图，见 host/probe.ts）',
+		param: 'dataUrl',
+		codec: dataUrlCodec,
+		result: storedReferenceCodec(),
+	},
 ];
 
 /**
@@ -206,6 +243,43 @@ export const PROBE_HOST_MANIFEST = {
 		sourceLocation: { file: `${PROBE_PKG}/lib/index.js`, line: 1, column: 1 },
 	})),
 };
+
+/**
+ * 远程面回包的**信封**。
+ *
+ * ⚠️ Typert 的客户端方法**不返回方法自己的结果**：网关
+ * （`dsh-api-gateway` 的 `invoke()`）统一包成 `{ok:true,value}` / `{ok:false,error}`。
+ * 忘了拆信封的症状是「结果永远是 undefined」——而且是**静默**的：成功的调用被当成
+ * 没有结果。画布侧为此栽过一次：参考图句柄永远写不上（宿主明明已经把附件存好了）、
+ * 点画布图片永远退回「插地址」。
+ */
+export type ProbeEnvelope<T> =
+	| { ok: true; value: T }
+	| { ok: false; error: { code?: string; message?: string } };
+
+/**
+ * 拆信封。
+ *
+ * 所有 `remote.<命名空间>.<方法>()` 的回包都要过这个函数再读字段 —— 直接当结果读
+ * 只会拿到 undefined（见 {@link ProbeEnvelope}）。
+ * @param raw - 远程方法的回包。
+ * @returns 结果值，或一句可直接展示给用户的原因。
+ */
+export function unwrapProbeResult<T>(
+	raw: unknown,
+): { ok: true; value: T } | { ok: false; message: string } {
+	if (raw === null || typeof raw !== 'object') {
+		return { ok: false, message: '宿主没有回话（远程面可能还没就绪），刷新页面再试' };
+	}
+	const envelope = raw as { ok?: unknown; value?: unknown; error?: { message?: unknown } | null };
+	if (envelope.ok === true) return { ok: true, value: envelope.value as T };
+	const message = envelope.error?.message;
+	return {
+		ok: false,
+		message:
+			typeof message === 'string' && message !== '' ? message : '宿主调用失败（没有给出原因）',
+	};
+}
 
 /**
  * 造一个远程服务的绑定对象。

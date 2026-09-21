@@ -504,22 +504,59 @@ export function syncCommands(
 	const patches = new Map<string, Partial<Omit<CanvasNode, 'id'>>>();
 	let failed = 0;
 
-	/** 命令行原文 → 提示词与形状（解析失败时退回一个安全的默认值）。 */
-	const shapeOf = (args: string): { prompt: string; kind: NodeKind; size: { w: number; h: number } } => {
+	/** 命令行原文 → 提示词、形状与工作流目标节点（解析失败时退回安全的默认值）。 */
+	const shapeOf = (args: string): {
+		prompt: string;
+		kind: NodeKind;
+		size: { w: number; h: number };
+		wf: string | null;
+	} => {
 		const parsed = parseGenerateLine(args);
-		if (!parsed.ok) return { prompt: '', kind: 'image', size: mediaNodeSize({ kind: 'image' }) };
+		if (!parsed.ok) {
+			return { prompt: '', kind: 'image', size: mediaNodeSize({ kind: 'image' }), wf: null };
+		}
 		return {
 			prompt: parsed.args.prompt,
 			kind: parsed.args.kind as NodeKind,
 			size: mediaNodeSize({ kind: parsed.args.kind, aspectRatio: parsed.args.aspectRatio }),
+			wf: parsed.args.wf ?? null,
 		};
+	};
+
+	/**
+	 * 这次生成是不是**画布工作流**发起的（命令行带了 `--wf <生成节点 id>`）。
+	 *
+	 * 是的话结果要回填到那个生成节点上，**不能**另落一个 `gencmd_*` 节点 ——
+	 * 否则工作流每跑一次，画布上就多一张来源不明的散图。
+	 * 目标节点不存在（用户删了）时返回 undefined，调用方退回普通落图，结果不丢。
+	 */
+	const wfTargetOf = (wf: string | null): CanvasNode | undefined =>
+		wf === null ? undefined : placed.find((node) => node.id === wf && node.kind === 'gen');
+
+	/** 把一次改动同步进 `placed`（不就地改节点对象：那是 board 里的同一份引用）。 */
+	const mergePlaced = (id: string, patch: Partial<Omit<CanvasNode, 'id'>>): void => {
+		const at = placed.findIndex((node) => node.id === id);
+		const current = placed[at];
+		if (at < 0 || current === undefined) return;
+		placed[at] = { ...current, ...patch };
 	};
 
 	// ── 1. 正在执行的命令 → pending 节点 ──
 	for (const command of runningMediaCommands(snapshot)) {
+		const shape = shapeOf(command.args);
+		const wfTarget = wfTargetOf(shape.wf);
+		if (wfTarget !== undefined) {
+			if (wfTarget.status === 'pending') continue;
+			const patch: Partial<Omit<CanvasNode, 'id'>> = {
+				status: 'pending',
+				...(shape.prompt === '' ? {} : { title: shape.prompt, prompt: shape.prompt }),
+			};
+			patches.set(wfTarget.id, { ...(patches.get(wfTarget.id) ?? {}), ...patch });
+			mergePlaced(wfTarget.id, patch);
+			continue;
+		}
 		const id = mediaCommandNodeId(command.commandId);
 		if (known.has(id) || ingested.has(id)) continue;
-		const shape = shapeOf(command.args);
 		const at = placeAmong(placed, shape.size);
 		const seed: NodeSeed = {
 			id,
@@ -540,8 +577,28 @@ export function syncCommands(
 	// ── 2. 已结束的命令 → 改状态（必要时直接落地） ──
 	for (const command of settledMediaCommands(snapshot)) {
 		if (!isFreshResult(command, baselineSeq, now)) continue;
-		const id = mediaCommandNodeId(command.commandId);
 		const shape = shapeOf(command.args);
+
+		// 工作流发起的生成：回填到它自己的生成节点上。
+		// 记账照写（`gencmd_<commandId>`），否则同一条结果重放会再回填一次。
+		const wfTarget = wfTargetOf(shape.wf);
+		if (wfTarget !== undefined) {
+			const patch: Partial<Omit<CanvasNode, 'id'>> = command.ok
+				? {
+						status: 'ready',
+						src: command.url ?? '',
+						...((shape.prompt === '' ? {} : { prompt: shape.prompt, title: shape.prompt })),
+					}
+				: { status: 'failed', error: command.error };
+			if (!command.ok) failed += 1;
+			ingested.add(mediaCommandNodeId(command.commandId));
+			if (sameFields(wfTarget, patch)) continue;
+			patches.set(wfTarget.id, { ...(patches.get(wfTarget.id) ?? {}), ...patch });
+			mergePlaced(wfTarget.id, patch);
+			continue;
+		}
+
+		const id = mediaCommandNodeId(command.commandId);
 		const patch: Partial<Omit<CanvasNode, 'id'>> = command.ok
 			? {
 					status: 'ready',

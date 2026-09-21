@@ -46,7 +46,7 @@ import {
 } from './host/schema';
 import { MEDIA_TOOL_NAME, createMediaTool, type MediaToolDeps } from './host/tool';
 import { createGenerateCommand } from './host/command';
-import { MediaProbeCore, type ProbeTarget } from './host/probe';
+import { MediaProbeCore, type ProbeTarget, type StoreImageBytes } from './host/probe';
 import { MEDIA_COMMAND_NAME } from './client/shared/media';
 import { PROBE_HOST_MANIFEST, PROBE_NAMESPACE, probeRemoteBinding } from './client/shared/probe';
 
@@ -101,9 +101,11 @@ writeStatus({ phase: 'module-evaluated', name: 'fatfish-canvas' });
 const probeHolder: {
 	target: (providerId: string) => Promise<ProbeTarget | undefined>;
 	timeoutMs: () => number;
+	storeImage: StoreImageBytes;
 } = {
 	target: () => Promise.resolve(undefined),
 	timeoutMs: () => 30000,
+	storeImage: () => Promise.reject(new Error('附件服务还没就绪')),
 };
 
 /** 宿主插件体。 */
@@ -121,6 +123,9 @@ export function apply(ctx: Context): void {
 	const probe = new MediaProbeCore({
 		providerOf: (providerId) => probeHolder.target(providerId),
 		timeoutMs: () => probeHolder.timeoutMs(),
+		// 附件写入面同样只有 settings scope 才拿得到（它才持有 scoped），
+		// 因此走 holder 在就绪后接入
+		storeImage: (input, signal) => probeHolder.storeImage(input, signal),
 	});
 	(probe as unknown as { typertRemote: unknown }).typertRemote = probeRemoteBinding(probe);
 
@@ -190,6 +195,25 @@ export function apply(ctx: Context): void {
 		// 而那恰恰是最自然的使用顺序（填基址 → 配密钥 → 测试连接 → 拉模型列表）。
 		// 实测踩到：界面报「找不到供应商 custom」，用户只会以为配置没保存上。
 		probeHolder.timeoutMs = (): number => Math.min(readConfig().timeoutMs, 30000);
+		/**
+		 * 把画布上的内联图存进附件库，回一个宿主文件路径（P22）。
+		 *
+		 * 与下面的 `readAttachment` 是同一条字节通路的两端：那个把附件读成字节，
+		 * 这个把字节写成附件。**服务缺席时抛可读错误** —— 让「本地图不能当参考图」
+		 * 有一个明确的原因，而不是一个空句柄。
+		 */
+		probeHolder.storeImage = async (input) => {
+			const store = scoped.get('attachments') as AttachmentService | undefined;
+			if (store === undefined || typeof store.saveImage !== 'function') {
+				throw new Error('宿主没有装配附件服务');
+			}
+			const ref = await store.saveImage(input);
+			const path = typeof store.imageHostPath === 'function' ? store.imageHostPath(ref) : undefined;
+			if (path === undefined || path === '') {
+				throw new Error('这个附件后端不提供本地文件路径');
+			}
+			return { path, bytes: input.data.byteLength };
+		};
 		probeHolder.target = async (providerId): Promise<ProbeTarget | undefined> => {
 			const providers = readConfig()[FIELD_PROVIDERS];
 			if (providers === null || typeof providers !== 'object') return undefined;
@@ -377,7 +401,8 @@ export function apply(ctx: Context): void {
 	});
 }
 
-/** 宿主侧附件服务在本插件用到的那一面（`dsh-attachment` 的 `AttachmentStore`）。 */interface AttachmentService {
+/** 宿主侧附件服务在本插件用到的那一面（`dsh-attachment` 的 `AttachmentStore`）。 */
+interface AttachmentService {
 	/**
 	 * 读一张图片并校验它与引用一致。
 	 * @param ref - 持久引用。
@@ -388,6 +413,22 @@ export function apply(ctx: Context): void {
 		ref: { attachmentId: string; mediaType: string },
 		signal?: AbortSignal,
 	): Promise<{ ref?: { mediaType?: string }; data: Uint8Array }>;
+	/**
+	 * 校验并**持久保存**一张图片（内容寻址）。
+	 * @param input - 字节、声明的 MIME 与可选的显示名。
+	 * @returns 持久引用。
+	 */
+	saveImage(input: {
+		data: Uint8Array;
+		mediaType: string;
+		name?: string;
+	}): Promise<{ attachmentId: string; mediaType?: string }>;
+	/**
+	 * 取这个持久引用在宿主文件系统里的**绝对路径**（非文件后端的实现返回 undefined）。
+	 * @param ref - 持久引用。
+	 * @returns 绝对路径；后端不提供时 undefined。
+	 */
+	imageHostPath(ref: { attachmentId: string; mediaType?: string }): string | undefined;
 }
 
 /** 宿主侧 llm 服务在本插件用到的那一面（只读模型目录，用来判断路由能力）。 */

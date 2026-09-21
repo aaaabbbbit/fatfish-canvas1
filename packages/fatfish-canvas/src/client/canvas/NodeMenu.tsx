@@ -18,14 +18,26 @@ import { writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives';
 import { CheckIcon } from '../icons';
 import { clampToViewport, useMenuDismiss, useMenuFocus, useMenuNav } from '../menu';
 import { focusNodes } from './actions';
+import { exportWorkflowPng } from './exportImage';
+import { pushNotice } from './notice';
 import {
 	hasRegenerateTarget,
 	referenceOf,
 	REFERENCE_FALLBACK_PROMPT,
 	regenerate,
 } from './regenerate';
-import { removeNodes } from './store';
-import { nodeRatio, type CanvasNode } from './model';
+import { addLinks, addNodes, getBoard, removeNodes } from './store';
+import {
+	genDurationOf,
+	genKindOf,
+	genRatioOf,
+	genResolutionOf,
+	PLACEMENT_SPACING,
+	nodeRatio,
+	type CanvasNode,
+} from './model';
+import { runSingleNode } from './run';
+import { parseWorkflow, planRestore } from './workflow';
 
 /** 菜单属性。 */
 export interface NodeMenuProps {
@@ -59,6 +71,32 @@ function promptOf(node: CanvasNode): string {
 }
 
 /**
+ * 「复制为新节点」要带走的字段。
+ *
+ * 刻意**不带**身份（id/z/createdAt）、**产物**（src/error/workflow）与运行状态：
+ * 复制出来的是「同一套参数的新活儿」，不是那张图的副本 —— 带 src 的话新节点
+ * 一上来就是 ready 且显示旧图，用户会以为它已经跑过了。
+ * @param node - 被复制的节点。
+ * @returns `addNodes` 的输入（落在右边一格）。
+ */
+function copyOf(node: CanvasNode): Omit<CanvasNode, 'id' | 'z' | 'createdAt'> {
+	return {
+		kind: node.kind,
+		x: Math.round(node.x + node.w + PLACEMENT_SPACING),
+		y: Math.round(node.y),
+		w: node.w,
+		h: node.h,
+		status: 'ready',
+		...(node.prompt === undefined ? {} : { prompt: node.prompt }),
+		...(node.title === undefined ? {} : { title: node.title }),
+		...(node.genKind === undefined ? {} : { genKind: node.genKind }),
+		...(node.ratio === undefined ? {} : { ratio: node.ratio }),
+		...(node.duration === undefined ? {} : { duration: node.duration }),
+		...(node.resolution === undefined ? {} : { resolution: node.resolution }),
+	};
+}
+
+/**
  * 节点右键菜单。
  * @param props - 目标节点、选择集、位置与关闭回调。
  * @returns 浮层菜单。
@@ -77,6 +115,20 @@ export function NodeMenu({ node, selection, at, onClose }: NodeMenuProps): React
 	const canRegenerate = prompt !== '' && hasRegenerateTarget();
 	/** 这个节点能不能当参考图（能就把地址写进 `--ref`；见 regenerate.ts）。 */
 	const reference = referenceOf(node);
+	/**
+	 * 「重新生成」用的种类与比例。
+	 *
+	 * 生成节点读**它自己的参数**（P19 的参数面板）；媒体节点仍旧由节点形状反推
+	 * （`nodeRatio`）—— 两者来源不同，因为生成节点的形状是「卡片多大」，
+	 * 而它画出来的比例是用户选的。
+	 */
+	const regenKind = node.kind === 'gen' ? genKindOf(node) : node.kind;
+	const regenRatio = node.kind === 'gen' ? genRatioOf(node) : nodeRatio(node);
+	/** 视频参数只对生成节点有意义（媒体节点没有这两个字段）。 */
+	const regenDuration = node.kind === 'gen' ? genDurationOf(node) : undefined;
+	const regenResolution = node.kind === 'gen' ? genResolutionOf(node) : undefined;
+	/** 能不能「复制为新节点」：媒体节点的副本没有意义（再拖一张更快）。 */
+	const duplicable = node.kind === 'text' || node.kind === 'gen';
 
 	/** 复制一段文字并给出反馈（剪贴板权限可能被拒）。 */
 	const copy = useCallback((id: string, text: string) => {
@@ -119,6 +171,77 @@ export function NodeMenu({ node, selection, at, onClose }: NodeMenuProps): React
 			},
 		},
 		{
+			// 导出的是**整块画布**的工作流（理由见 exportImage.ts）：
+			// 用户要的是「把现在这一屏存下来，回头能原样恢复」。
+			id: 'export-png',
+			label: '导出带工作流的 PNG',
+			disabled: !single || node.src === undefined || node.src === '',
+			disabledReason: !single ? '多选时不可用' : '这个节点还没有图像',
+			run: async () => {
+				try {
+					pushNotice(await exportWorkflowPng(node));
+				} catch (error) {
+					// 取不到字节 / 转码失败都必须说出来（静默失败最难查）
+					pushNotice(error instanceof Error ? error.message : String(error));
+				}
+			},
+		},
+		{
+			// 还原到这张图的右边（不与它自己重叠），id 全部重映射
+			id: 'restore',
+			label: '还原工作流',
+			disabled: node.workflow === undefined || node.workflow === '',
+			disabledReason: '这张图里没有本插件的工作流数据',
+			run: () => {
+				const doc = node.workflow === undefined ? null : parseWorkflow(node.workflow);
+				const plan =
+					doc === null
+						? null
+						: planRestore(
+								doc,
+								{ x: node.x + node.w + PLACEMENT_SPACING, y: node.y },
+								getBoard().nodes.filter((item) => item.id !== node.id),
+							);
+				if (plan === null) {
+					pushNotice('这张图里的工作流读不出来');
+					return;
+				}
+				addNodes(plan.nodes);
+				addLinks(plan.links);
+				pushNotice(`已还原 ${String(plan.nodes.length)} 个节点、${String(plan.links.length)} 条连线`);
+			},
+		},
+		{
+			// 只跑这一个（不重跑上游）：改完参数想「换一张」时用，别把整条链再烧一遍
+			id: 'run-node',
+			label: '运行此节点',
+			doneLabel: '已发送给会话',
+			disabled: !single || node.kind !== 'gen' || !hasRegenerateTarget(),
+			disabledReason: !single
+				? '多选时不可用'
+				: node.kind !== 'gen'
+					? '只有生成节点可以运行'
+					: '当前没有会话',
+			run: async () => {
+				const report = await runSingleNode(node.id);
+				if (report.started > 0) {
+					setDone('run-node');
+					return;
+				}
+				// 跳过必须说出来（「点不动又不说为什么」是最难查的一类反馈）
+				pushNotice(report.skipped[0]?.reason ?? '没能运行这个节点');
+			},
+		},
+		{
+			id: 'duplicate',
+			label: '复制为新节点',
+			disabled: !single || !duplicable,
+			disabledReason: !single ? '多选时不可用' : '图片 / 视频节点直接再拖一张更快',
+			run: () => {
+				addNodes([copyOf(node)]);
+			},
+		},
+		{
 			id: 'regenerate',
 			label: '重新生成',
 			doneLabel: '已发送给会话',
@@ -130,7 +253,12 @@ export function NodeMenu({ node, selection, at, onClose }: NodeMenuProps): React
 					: '当前没有会话',
 			run: async () => {
 				// 优先走 /generate 直达命令（零 token），不可用时退回提示词
-				const via = await regenerate(prompt, node.kind, nodeRatio(node));
+				const via = await regenerate(prompt, {
+					kind: regenKind,
+					ratio: regenRatio,
+					duration: regenDuration,
+					resolution: regenResolution,
+				});
 				if (via !== null) setDone('regenerate');
 				else setCopyFailed(true);
 			},
@@ -150,12 +278,13 @@ export function NodeMenu({ node, selection, at, onClose }: NodeMenuProps): React
 						: '这张图不是可复用的地址（内联或本地数据），无法当参考图'
 					: '当前没有会话',
 			run: async () => {
-				const via = await regenerate(
-					prompt === '' ? REFERENCE_FALLBACK_PROMPT : prompt,
-					node.kind,
-					nodeRatio(node),
-					reference ?? undefined,
-				);
+				const via = await regenerate(prompt === '' ? REFERENCE_FALLBACK_PROMPT : prompt, {
+					kind: regenKind,
+					ratio: regenRatio,
+					reference: reference ?? undefined,
+					duration: regenDuration,
+					resolution: regenResolution,
+				});
 				if (via !== null) setDone('reference');
 				else setCopyFailed(true);
 			},
@@ -208,6 +337,9 @@ export function NodeMenu({ node, selection, at, onClose }: NodeMenuProps): React
 		<div
 			ref={menuRef}
 			className="ffc-menu ffc-node-menu"
+			// 画布视口靠这个属性认「这是菜单自己」（P21：否则 pointerdown 会把菜单
+			// 卸载掉，菜单项永远收不到 click）。新菜单记得一起带上。
+			data-ffc-menu="true"
 			role="menu"
 			aria-label="节点操作"
 			tabIndex={-1}

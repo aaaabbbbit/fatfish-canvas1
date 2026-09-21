@@ -553,6 +553,21 @@ interface DshObservableSnapshot<T> {
 interface DshSessionListState {
 	/** 当前选中的会话 id（无会话时为 undefined）。 */
 	current: string | undefined;
+	/**
+	 * 宿主**可见的全部**会话 id（P25 的画布回收靠它判「这个会话还在不在」）。
+	 *
+	 * 平台契约（`dsh-api-session-controller` 的 `client/sessions/service.d.ts`）：
+	 * `ids` 是 Host-list 顺序，**不含**「只有面包屑的分支行」（子代理地址行）；
+	 * `list()` 读的是 `sessionQuery.listSessions()` —— 它列的是**持久化里的全部可见
+	 * 会话**，不按工作区过滤（这是敢按它删东西的前提：换个工作区启动 dsh web
+	 * 不会把别的工作区的画布当成孤儿）。缺席时按「不知道」办 —— 什么都不删。
+	 */
+	ids?: readonly string[] | undefined;
+	/**
+	 * 列表生命期：`pending` = 还在拉，`ready` = 已就位（`ready` + 空表 = 真的没有会话）。
+	 * 只有 `ready` 才允许回收 —— 这是平台自己给的「这份表是全的」信号。
+	 */
+	phase?: 'pending' | 'ready' | undefined;
 }
 
 /**

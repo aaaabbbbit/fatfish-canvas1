@@ -130,10 +130,32 @@ globalThis.window = {
 		getItem: (k) => storage.get(k) ?? null,
 		setItem: (k, v) => storage.set(k, String(v)),
 		removeItem: (k) => storage.delete(k),
+		// 枚举面（P25 的画布回收要按前缀扫键）：真实的 Storage 就是 length + key(i)。
+		get length() {
+			return storage.size;
+		},
+		key: (i) => [...storage.keys()][i] ?? null,
 	},
 };
 
 /** 裸 specifier 的桩见文件顶部（必须在 loadTsModule 之前）。 */
+
+/**
+ * 等所有**去抖写盘定时器**烧完。
+ *
+ * 本文件的每一小节都用**新的模块实例**（`loadTsModule`），每个实例各自带一个
+ * 400ms 去抖写盘定时器；被丢下的实例并不会因此安静 —— 它的定时器会在**后面的
+ * `await` 里**照样触发，把那一节留下的旧画布写回全局键。于是下一节 load 出来的
+ * 画布会莫名其妙多出几个陌生节点（P18 加连线时又出现过一次：section 7 的
+ * 「先落一个 pending 节点」看到 2 个节点，多出来的正是 section 2 的 `n_…`）。
+ * 这不是被测代码的 bug（真实运行中同一时刻只有一个 store 实例，且切换作用域会
+ * 先 flush），是**测试要自己把时间轴清干净**：先等定时器烧完，再 clear，再 load。
+ *
+ * 更省事的做法是让每一节的 store 在结束时 `flushPersist()`（立刻写盘并取消定时器），
+ * 但那只对「还握着 store 引用」的小节成立；这个等待是兜底。
+ * @returns 定时器排空后的 promise。
+ */
+const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 
 // ─────────────────── 载入被测模块 ───────────────────
 
@@ -298,6 +320,10 @@ async function freshStore() {
 	check('setSelection 生效', store.getBoard().selection.length === 1);
 	store.clearSelection();
 	check('clearSelection 清空', store.getBoard().selection.length === 0);
+
+	// 收尾立刻写盘：不然这个实例的 400ms 去抖定时器会在**后面某一节的 await 里**
+	// 触发，把这里的两个节点写回全局键，污染下一节 load 出来的画布（见 drainPersistTimers）。
+	store.flushPersist();
 }
 
 {
@@ -973,10 +999,15 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 		JSON.stringify(reloaded.getBoard().ingested),
 	);
 	check(
-		'v2 持久化形态回读正确（nodes/viewport/ingested 都在）',
+		'持久化形态回读正确（nodes/links/viewport/ingested 都在）',
 		(() => {
 			const raw = JSON.parse(storage.get('fatfish-canvas:board'));
-			return raw.version === 2 && Array.isArray(raw.nodes) && Array.isArray(raw.ingested);
+			return (
+				raw.version === 3 &&
+				Array.isArray(raw.nodes) &&
+				Array.isArray(raw.links) &&
+				Array.isArray(raw.ingested)
+			);
 		})(),
 		String(storage.get('fatfish-canvas:board')).slice(0, 120),
 	);
@@ -1389,7 +1420,7 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 	check('注入目标后可用', regen.hasRegenerateTarget() === true);
 	check(
 		'目标没有命令面时退回提示词（并要求调用工具、带上画幅）',
-		(await regen.regenerate('一只肥鱼', 'image', '16:9')) === 'prompt' &&
+		(await regen.regenerate('一只肥鱼', { kind: 'image', ratio: '16:9' })) === 'prompt' &&
 			sent.length === 1 &&
 			String(sent[0].text).includes('media_generate') &&
 			String(sent[0].text).includes('一只肥鱼') &&
@@ -1417,10 +1448,19 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 	{
 		check(
 			'regenerateCommandLine：图像不带 --video，视频带；比例可选',
-			regen.regenerateCommandLine('猫', 'image', '16:9') === '/generate --ratio 16:9 猫 ' &&
-				regen.regenerateCommandLine('海浪', 'video') === '/generate --video 海浪 ' &&
+			regen.regenerateCommandLine('猫', { kind: 'image', ratio: '16:9' }) ===
+				'/generate --ratio 16:9 猫 ' &&
+				regen.regenerateCommandLine('海浪', { kind: 'video' }) === '/generate --video 海浪 ' &&
 				regen.regenerateCommandLine('猫') === '/generate 猫 ',
-			`${regen.regenerateCommandLine('猫', 'image', '16:9')} | ${regen.regenerateCommandLine('海浪', 'video')}`,
+			`${regen.regenerateCommandLine('猫', { kind: 'image', ratio: '16:9' })} | ${regen.regenerateCommandLine('海浪', { kind: 'video' })}`,
+		);
+		check(
+			'regenerateCommandLine：视频参数只对视频生效（图像带上只会让命令行变长）',
+			regen.regenerateCommandLine('海浪', { kind: 'video', duration: 5, resolution: '1080p' }) ===
+				'/generate --video --duration 5 --resolution 1080p 海浪 ' &&
+				regen.regenerateCommandLine('猫', { kind: 'image', duration: 5, resolution: '1080p' }) ===
+					'/generate 猫 ',
+			regen.regenerateCommandLine('海浪', { kind: 'video', duration: 5, resolution: '1080p' }),
 		);
 
 		const lines = [];
@@ -1437,7 +1477,7 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 		});
 		check(
 			'命令可用时走命令（零 token），完全不惊动模型',
-			(await regen.regenerate('一只肥鱼', 'image', '1:1')) === 'command' &&
+			(await regen.regenerate('一只肥鱼', { kind: 'image', ratio: '1:1' })) === 'command' &&
 				lines.length === 1 &&
 				prompts.length === 0,
 			JSON.stringify(lines),
@@ -1466,6 +1506,7 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 console.log('\n7) P6：/generate 命令 → 画布节点');
 
 {
+	await drainPersistTimers();
 	storage.clear();
 	const shared = new Map();
 	const storePath = resolve(root, 'src/client/canvas/store.ts');
@@ -1655,19 +1696,6 @@ console.log('\n7) P6：/generate 命令 → 画布节点');
 // ─────────────────── 8. P7：画布按会话隔离（作用域） ───────────────────
 
 console.log('\n8) P7：画布按会话隔离');
-
-/**
- * 让「已经废弃的 store 实例」的待写盘定时器全部烧完。
- *
- * 本文件的每一小节都用**新的模块实例**（`loadTsModule`），每个实例各自带一个
- * 400ms 去抖写盘定时器；被丢下的实例并不会因此安静 —— 它的定时器会在**后面的
- * `await` 里**照样触发，把那一节留下的旧画布写回全局键。于是下一节 load 出来的
- * 画布会莫名其妙多出几个陌生节点（本轮就出现过：3 个节点里混进两个 `n_…`）。
- * 这不是被测代码的 bug（真实运行中同一时刻只有一个 store 实例，且切换作用域会
- * 先 flush），是**测试要自己把时间轴清干净**：先等定时器烧完，再 clear，再 load。
- * @returns 定时器排空后的 promise。
- */
-const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 
 {
 	await drainPersistTimers();
@@ -1938,6 +1966,124 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		scope2.getScopeSnapshot().scope === null && scope2.applyBoardScope() === false,
 		JSON.stringify(scope2.getScopeSnapshot()),
 	);
+	storage.clear();
+}
+
+// ─────────── 8b. P25：会话画布的回收（删会话不删画布 → 键会堆到配额满） ───────────
+
+console.log('\n8b) P25：会话画布回收');
+
+{
+	storage.clear();
+	// 预置：共用画布、作用域偏好（**绝不能被当成一块画布**）、活着的与已删的会话各一块
+	const board = JSON.stringify({ version: 3, nodes: [], links: [], viewport: { x: 0, y: 0, zoom: 1 }, ingested: [] });
+	storage.set('fatfish-canvas:board', board);
+	storage.set('fatfish-canvas:board-scope', 'session');
+	storage.set('fatfish-canvas:board:session-alive', board);
+	storage.set('fatfish-canvas:board:session-dead', board);
+
+	const shared = new Map();
+	const storePath = resolve(root, 'src/client/canvas/store.ts');
+	const statePath = resolve(root, 'src/client/state.ts');
+	const scopePath = resolve(root, 'src/client/canvas/scope.ts');
+	const store = await loadTsModule(storePath, shared);
+	const stateBase = await loadTsModule(statePath, shared);
+	const scope = await loadTsModule(scopePath, shared);
+
+	/** 会话列表替身（真实形状：`{ current, ids?, phase? }`，见 ambient 的声明）。 */
+	const makeList = (snapshot) => {
+		let current = snapshot;
+		const listeners = new Set();
+		return {
+			getSnapshot: () => current,
+			subscribe: (fn) => {
+				listeners.add(fn);
+				return () => listeners.delete(fn);
+			},
+			push: (next) => {
+				current = next;
+				for (const fn of listeners) fn();
+			},
+		};
+	};
+
+	/** 用最小 ctx 把回收装起来（`inject` → 作用域 ctx，`effect` → 跑一次并留着清理）。 */
+	const install = (list) => {
+		scope.installBoardGc({
+			inject: (deps, callback) => {
+				callback({
+					sessions: { list },
+					effect: (fn) => {
+						void fn();
+					},
+				});
+			},
+		});
+	};
+
+	// ── 纯判定：什么时候**允许**删 ──
+	check(
+		'列表还没就绪（phase=pending）→ 不允许回收（宁可不删）',
+		scope.prunableSessions({ current: undefined, ids: ['a'], phase: 'pending' }) === null,
+	);
+	check(
+		'就绪但没有 id 全表（老宿主）→ 不允许回收',
+		scope.prunableSessions({ current: 'a', phase: 'ready' }) === null,
+	);
+	const alive = scope.prunableSessions({ current: 'c', ids: [], phase: 'ready' });
+	check(
+		'就绪 + 空表 = 真的没有会话；但当前选中的那个仍然算活着',
+		alive instanceof Set && alive.size === 1 && alive.has('c'),
+		JSON.stringify([...(alive ?? [])]),
+	);
+	check('就绪时拿到的是完整存活表', [...(scope.prunableSessions({ current: undefined, ids: ['a', 'b'], phase: 'ready' }) ?? [])].join(',') === 'a,b');
+
+	// ── 键的筛选：§8.17 那个坑（前缀是另一个键的前缀） ──
+	const keep = new Set(['fatfish-canvas:board']);
+	const picked = scope.orphanBoardKeys(
+		['fatfish-canvas:board', 'fatfish-canvas:board-scope', 'fatfish-canvas:board:a', 'fatfish-canvas:board:', '别的键'],
+		new Set(['a']),
+		keep,
+	);
+	check(
+		'共用画布、作用域偏好、活着的会话、空 id、别人的键 —— 一个都不挑',
+		picked.length === 0,
+		JSON.stringify(picked),
+	);
+	const picked2 = scope.orphanBoardKeys(['fatfish-canvas:board:b'], new Set(['a']), keep);
+	check('已死会话那块被挑出来', JSON.stringify(picked2) === '["fatfish-canvas:board:b"]', JSON.stringify(picked2));
+
+	// ── 装上去跑：pending 不删、ready 才删 ──
+	const list = makeList({ current: undefined, ids: ['session-alive'], phase: 'pending' });
+	install(list);
+	check('装上时列表还在 pending：一个键都不删', storage.has('fatfish-canvas:board:session-dead'));
+	list.push({ current: undefined, ids: ['session-alive'], phase: 'ready' });
+	check('列表就绪 → 删掉宿主已经不认识的会话那块画布', !storage.has('fatfish-canvas:board:session-dead'));
+	check('还活着的会话的画布留着', storage.has('fatfish-canvas:board:session-alive'));
+	check('共用那块画布留着', storage.has('fatfish-canvas:board'));
+	check(
+		'作用域偏好键（fatfish-canvas:board-scope）绝不能被当成一块画布删掉',
+		storage.get('fatfish-canvas:board-scope') === 'session',
+		String(storage.get('fatfish-canvas:board-scope')),
+	);
+
+	// ── 当前正在看的那块画布：即使列表里还没有它，也必须留着 ──
+	storage.set('fatfish-canvas:board:session-current', board);
+	store.setBoardScope('session-current');
+	scope.setScopeSession('session-current');
+	list.push({ current: undefined, ids: ['session-alive'], phase: 'ready' });
+	check(
+		'当前生效的那块画布绝不删（列表刷新的一瞬间它可能还没列出来）',
+		storage.has('fatfish-canvas:board:session-current'),
+	);
+	check('它不在 ids 里也照样留着（靠 getBoardKey + 桥告知的会话）', storage.has('fatfish-canvas:board:session-current'));
+
+	// ── ids 缺席：什么都不删 ──
+	storage.set('fatfish-canvas:board:session-orphan', board);
+	const list2 = makeList({ current: 'session-x', phase: 'ready' });
+	install(list2);
+	check('宿主没给全表时什么都不删（宁可留着键，也不赌）', storage.has('fatfish-canvas:board:session-orphan'));
+
 	storage.clear();
 }
 
@@ -2243,6 +2389,1224 @@ console.log('\n10) P16：store 订阅（useState + useEffect 路径）');
 		stateWithHooks.getModeFromDom() === 'chat',
 		stateWithHooks.getModeFromDom(),
 	);
+	storage.clear();
+}
+
+// ─────────── 11. P18：连接点几何 / 图规则 / 连线的持久化 ───────────
+
+console.log('\n11) 连接点与连线（P18）');
+
+{
+	const ports = await loadTsModule(resolve(root, 'src/client/canvas/ports.ts'));
+	const rect = { x: 100, y: 200, w: 300, h: 100 };
+
+	check(
+		'四条边的中点',
+		JSON.stringify([
+			ports.portPoint(rect, 'n'),
+			ports.portPoint(rect, 's'),
+			ports.portPoint(rect, 'w'),
+			ports.portPoint(rect, 'e'),
+		]) ===
+			JSON.stringify([
+				{ x: 250, y: 200 },
+				{ x: 250, y: 300 },
+				{ x: 100, y: 250 },
+				{ x: 400, y: 250 },
+			]),
+	);
+	check(
+		'外法线朝外',
+		ports.portNormal('n').y === -1 &&
+			ports.portNormal('s').y === 1 &&
+			ports.portNormal('w').x === -1 &&
+			ports.portNormal('e').x === 1,
+	);
+	check('nearestPort 取最近的边', ports.nearestPort(rect, { x: 395, y: 245 }) === 'e');
+	check('nearestPort 贴近上边中点时取 n', ports.nearestPort(rect, { x: 250, y: 203 }) === 'n');
+	check(
+		'nearestPort 在左上角附近取的是左（不是上）—— 按距离，不按象限',
+		ports.nearestPort(rect, { x: 101, y: 201 }) === 'w',
+	);
+
+	const path = ports.linkPath({ x: 0, y: 0 }, 'e', { x: 200, y: 0 }, 'w');
+	check('linkPath 起点终点就是两个连接点', path.startsWith('M 0 0 C ') && path.endsWith('200 0'), path);
+	check('linkPath 可重复（同输入同输出）', ports.linkPath({ x: 0, y: 0 }, 'e', { x: 200, y: 0 }, 'w') === path);
+	{
+		// 控制点必须落在**各自那条边的外法线**上：e 边 → y 不变且向右；w 边 → y 不变且向左。
+		// 这是「线从面上长出去、不斜穿自己卡片」的全部保证。
+		const d = ports.linkPath({ x: 0, y: 0 }, 'e', { x: 200, y: 100 }, 'w');
+		const numbers = d.match(/-?\d+(?:\.\d+)?/g).map(Number);
+		const [, , c1x, c1y, c2x, c2y] = numbers;
+		check(
+			'控制点沿外法线外推（e 向右、w 向左）',
+			c1y === 0 && c1x > 0 && c2y === 100 && c2x < 200,
+			d,
+		);
+	}
+	check(
+		'linkMidpoint 取直线中点',
+		JSON.stringify(ports.linkMidpoint({ x: 0, y: 0 }, { x: 10, y: 20 })) ===
+			JSON.stringify({ x: 5, y: 10 }),
+	);
+}
+
+{
+	const graph = await loadTsModule(resolve(root, 'src/client/canvas/graph.ts'));
+	const node = (id, kind, extra = {}) => ({
+		id,
+		kind,
+		x: 0,
+		y: 0,
+		w: 100,
+		h: 100,
+		z: 0,
+		status: 'ready',
+		createdAt: 0,
+		...extra,
+	});
+	const nodes = [
+		node('t1', 'text', { prompt: '一只柴犬' }),
+		node('t2', 'text', { prompt: '油画风格' }),
+		node('t0', 'text', { prompt: '   ' }),
+		node('img', 'image', { src: 'https://x/a.png' }),
+		node('img2', 'image', { src: 'https://x/b.png' }),
+		node('blob', 'image', { src: 'blob:http://x/y' }),
+		node('pending', 'image', { status: 'pending' }),
+		node('failed', 'image', { status: 'failed' }),
+		node('gen', 'gen'),
+		node('gen2', 'gen'),
+	];
+	const reason = (from, to, links = []) => {
+		const result = graph.canLink(nodes, links, from, to);
+		return result.ok ? 'OK' : result.reason;
+	};
+
+	check('连到自己被拒', reason('gen', 'gen') === '不能连到自己');
+	check('只有生成节点接受输入', reason('t1', 'img').includes('生成节点'));
+	check('没出过图的生成节点不能当上游', reason('gen', 'gen2').includes('还没有图'), reason('gen', 'gen2'));
+	check('文字 → 生成 合法', reason('t1', 'gen') === 'OK');
+	check('空文字节点被拒', reason('t0', 'gen').includes('空的'));
+	check('图片 → 生成 合法', reason('img', 'gen') === 'OK');
+	check('blob 地址不能当参考图', reason('blob', 'gen').includes('地址不能当参考图'));
+	check('生成中的图不能当参考图', reason('pending', 'gen').includes('还在生成中'));
+	check('失败的图不能当参考图', reason('failed', 'gen').includes('失败'));
+	check(
+		'重复连线被拒',
+		reason('t1', 'gen', [{ id: 'l1', from: 't1', to: 'gen', fromSide: 'e', toSide: 'w' }]).includes(
+			'已经连过',
+		),
+	);
+	check(
+		'只允许一张参考图',
+		reason('img2', 'gen', [
+			{ id: 'l1', from: 'img', to: 'gen', fromSide: 'e', toSide: 'w' },
+		]).includes('只支持一张参考图'),
+	);
+	check(
+		'多段文字可以都连上',
+		reason('t2', 'gen', [{ id: 'l1', from: 't1', to: 'gen', fromSide: 'e', toSide: 'w' }]) === 'OK',
+	);
+
+	const links = [
+		{ id: 'l1', from: 't1', to: 'gen', fromSide: 'e', toSide: 'w' },
+		{ id: 'l2', from: 'img', to: 'gen', fromSide: 'e', toSide: 'w' },
+		{ id: 'l3', from: 't2', to: 'gen', fromSide: 'e', toSide: 'w' },
+	];
+	const inputs = graph.inputsOf('gen', nodes, links);
+	check('inputsOf 取到参考图', inputs.reference !== null && inputs.reference.id === 'img');
+	check(
+		'inputsOf 的提示词按连线顺序',
+		JSON.stringify(inputs.prompts) === JSON.stringify(['一只柴犬', '油画风格']),
+		JSON.stringify(inputs.prompts),
+	);
+	check(
+		'promptOf 拼接连线提示词',
+		graph.promptOf(inputs) === '一只柴犬\n油画风格',
+		graph.promptOf(inputs),
+	);
+	check('promptOf 不会重复自己带的提示词', graph.promptOf(inputs, '一只柴犬') === '一只柴犬\n油画风格');
+	check('没有输入时 promptOf 是空串', graph.promptOf({ reference: null, prompts: [] }) === '');
+}
+
+{
+	// 连线进 store：增删 / 级联 / 持久化 / 悬空剔除 / 旧数据兼容
+	const store = await freshStore();
+	const a = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '一只柴犬' });
+	const b = store.addNode({ kind: 'gen', x: 200, y: 0, w: 100, h: 100, status: 'ready' });
+	const link = store.addLinks([{ from: a.id, to: b.id, fromSide: 'e', toSide: 'w' }]);
+	check('addLinks 入列', store.getBoard().links.length === 1 && typeof link[0].id === 'string');
+	check('addLinks 不改动节点', store.getBoard().nodes.length === 2);
+	check('useLinks 读到的是同一份', store.getBoard().links[0].from === a.id);
+
+	store.removeLinks([link[0].id]);
+	check('removeLinks 删除', store.getBoard().links.length === 0);
+	store.removeLinks(['不存在']);
+	check('removeLinks 无匹配时不提交', store.getBoard().links.length === 0);
+
+	store.addLinks([{ from: a.id, to: b.id, fromSide: 'e', toSide: 'w' }]);
+	store.removeNodes([a.id]);
+	check('删节点级联删连线', store.getBoard().links.length === 0, String(store.getBoard().links.length));
+
+	// 持久化往返（含 gen 节点 —— KINDS 白名单漏了它就会被静默降级成 image）
+	const c = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '油画' });
+	store.addLinks([{ from: c.id, to: b.id, fromSide: 'e', toSide: 'w' }]);
+	store.flushPersist();
+	const raw = store.readPersistedRaw();
+	const parsed = JSON.parse(raw);
+	check('持久化格式版本升到 3', parsed.version === 3, String(parsed.version));
+	check('持久化里有 links', Array.isArray(parsed.links) && parsed.links.length === 1);
+
+	storage.clear();
+	storage.set('fatfish-canvas:board', raw);
+	const reloaded = await loadTsModule(resolve(root, 'src/client/canvas/store.ts'));
+	check('重载后连线复原', reloaded.getBoard().links.length === 1);
+	check(
+		'重载后 gen 节点没有降级成 image',
+		reloaded.getBoard().nodes.find((n) => n.id === b.id).kind === 'gen',
+		reloaded.getBoard().nodes.find((n) => n.id === b.id).kind,
+	);
+	check(
+		'重载后连接点方位复原',
+		reloaded.getBoard().links[0].fromSide === 'e' && reloaded.getBoard().links[0].toSide === 'w',
+	);
+
+	// 悬空连线（端点被删/被手工改坏）必须在读取时剔除
+	const broken = JSON.parse(raw);
+	broken.links.push({ id: 'l_ghost', from: c.id, to: '不存在', fromSide: 'e', toSide: 'w' });
+	broken.links.push({ id: 'l_bad', from: c.id, to: b.id, fromSide: 'x', toSide: 'w' });
+	broken.links.push({ id: '', from: c.id, to: b.id, fromSide: 'e', toSide: 'w' });
+	storage.clear();
+	storage.set('fatfish-canvas:board', JSON.stringify(broken));
+	const cleaned = await loadTsModule(resolve(root, 'src/client/canvas/store.ts'));
+	check(
+		'悬空 / 坏方位的连线被剔除',
+		cleaned.getBoard().links.length === 1,
+		JSON.stringify(cleaned.getBoard().links),
+	);
+
+	// v2 的旧数据（没有 links 字段）必须照旧能载入
+	const legacy = JSON.parse(raw);
+	delete legacy.links;
+	legacy.version = 2;
+	storage.clear();
+	storage.set('fatfish-canvas:board', JSON.stringify(legacy));
+	const fromV2 = await loadTsModule(resolve(root, 'src/client/canvas/store.ts'));
+	check('v2 旧数据载入后 links 为空表', fromV2.getBoard().links.length === 0);
+	check('v2 旧数据的节点仍在', fromV2.getBoard().nodes.length === 2);
+	storage.clear();
+}
+
+// ─────────── 12. P18：工作流（命令行标记 / 运行 / 结果回填） ───────────
+
+console.log('\n12) 工作流：运行与结果回填');
+
+{
+	await drainPersistTimers();
+	storage.clear();
+	const shared = new Map();
+	const storePath = resolve(root, 'src/client/canvas/store.ts');
+	const store = await loadTsModule(storePath, shared);
+	const ingest = await loadTsModule(resolve(root, 'src/client/canvas/ingest.ts'), shared);
+	const media = await loadTsModule(resolve(root, 'src/client/shared/media.ts'), shared);
+	const regen = await loadTsModule(resolve(root, 'src/client/canvas/regenerate.ts'), shared);
+	const run = await loadTsModule(resolve(root, 'src/client/canvas/run.ts'), shared);
+	const graph = await loadTsModule(resolve(root, 'src/client/canvas/graph.ts'), shared);
+
+	// ── 12.1 命令行里的 --wf ──
+	const parsed = media.parseGenerateLine('--ratio 1:1 --wf n_abc 一只柴犬');
+	check('--wf 被解析出来', parsed.ok && parsed.args.wf === 'n_abc', JSON.stringify(parsed));
+	check(
+		'--wf 不写进用法说明（它是画布内部参数）',
+		!media.GENERATE_USAGE.includes('--wf'),
+	);
+	check(
+		'不带 --wf 时 wf 是 undefined',
+		media.parseGenerateLine('一只柴犬').args.wf === undefined,
+	);
+
+	// ── 12.2 运行计划 ──
+	const text = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '一只柴犬' });
+	const img = store.addNode({ kind: 'image', x: 0, y: 200, w: 100, h: 100, status: 'ready', src: 'https://x/ref.png' });
+	const gen = store.addNode({ kind: 'gen', x: 300, y: 0, w: 280, h: 280, status: 'ready', title: '生成节点' });
+	store.addLinks([
+		{ from: text.id, to: gen.id, fromSide: 'e', toSide: 'w' },
+		{ from: img.id, to: gen.id, fromSide: 'e', toSide: 'w' },
+	]);
+
+	let board = store.getBoard();
+	check(
+		'topoOrder 只取生成节点',
+		graph.topoOrder(board.nodes, board.links)
+			.map((n) => n.id)
+			.join() === gen.id,
+	);
+
+	const plan = run.planOf(gen, board.nodes, board.links);
+	check(
+		'运行计划带上提示词、参考图与 --wf',
+		plan.ok &&
+			plan.line.includes('一只柴犬') &&
+			plan.line.includes('--ref https://x/ref.png') &&
+			plan.line.includes(`--wf ${gen.id}`),
+		plan.ok ? plan.line : plan.reason,
+	);
+	check(
+		'没有提示词时给得出原因（而不是发一次注定失败的生成）',
+		(() => {
+			const bare = run.planOf(
+				{ id: 'g2', kind: 'gen', x: 0, y: 0, w: 10, h: 10, z: 0, status: 'ready', createdAt: 0 },
+				board.nodes,
+				board.links,
+			);
+			return !bare.ok && bare.reason.includes('提示词');
+		})(),
+	);
+
+	// ── 12.3 运行：命令真的发出去，节点先变 pending ──
+	const lines = [];
+	const off = regen.setRegenerateTarget({
+		prompt: async () => ({}),
+		command: async (line) => {
+			lines.push(line);
+			return { ok: true, value: { matched: true } };
+		},
+	});
+	const report = await run.runWorkflow(board.nodes, board.links);
+	check(
+		'runWorkflow 发出了命令并带上 --wf',
+		report.started === 1 && lines.length === 1 && lines[0].includes(`--wf ${gen.id}`),
+		JSON.stringify({ report, lines }),
+	);
+	check(
+		'发出去之前节点先变 pending（等待期间看得见在画什么）',
+		store.getBoard().nodes.find((n) => n.id === gen.id).status === 'pending',
+	);
+	check('runWorkflow 的报告能说成人话', run.describeRun(report) === '已运行 1 个生成节点', run.describeRun(report));
+	off();
+
+	// ── 12.4 结果回填到生成节点（而不是另落一张散图） ──
+	const commandNode = (over) => ({
+		kind: 'command',
+		seq: 10,
+		time: Date.now(),
+		commandId: 'wf-1',
+		name: 'generate',
+		args: `--wf ${gen.id} 一只柴犬`,
+		outcome: null,
+		...over,
+	});
+	const snap = (nodes) => ({ runningCalls: [], nodes });
+
+	ingest.syncConversation(snap([commandNode({})]), 'sess-1', { baselineSeq: 0, now: Date.now() });
+	board = store.getBoard();
+	check('工作流运行中：生成节点是 pending', board.nodes.find((n) => n.id === gen.id)?.status === 'pending');
+	check('工作流运行中：没有多落 gencmd 节点', board.nodes.length === 3, String(board.nodes.length));
+
+	ingest.syncConversation(
+		snap([commandNode({ outcome: { kind: 'success', text: 'https://cdn.example.com/wf.png\n图像' } })]),
+		'sess-1',
+		{ baselineSeq: 0, now: Date.now() },
+	);
+	board = store.getBoard();
+	const filled = board.nodes.find((n) => n.id === gen.id);
+	check(
+		'结果回填到生成节点自己身上',
+		filled?.status === 'ready' && filled?.src === 'https://cdn.example.com/wf.png',
+		`${String(filled?.status)} / ${String(filled?.src)}`,
+	);
+	check('回填后仍然没有 gencmd 节点', board.nodes.length === 3, String(board.nodes.length));
+	check(
+		'提示词也一起回填（工作流重载后还知道当时画的是什么）',
+		filled?.prompt === '一只柴犬',
+		String(filled?.prompt),
+	);
+	check(
+		'回填是幂等的（同一条结果重放不再改动）',
+		(() => {
+			const again = ingest.syncConversation(
+				snap([commandNode({ outcome: { kind: 'success', text: 'https://cdn.example.com/wf.png' } })]),
+				'sess-1',
+				{ baselineSeq: 0, now: Date.now() },
+			);
+			return again.created === 0 && again.resolved === 0;
+		})(),
+	);
+
+	// ── 12.5 目标节点被删掉 → 退回普通落图（结果不丢） ──
+	store.removeNodes([gen.id]);
+	ingest.syncConversation(
+		snap([
+			{
+				...commandNode({ commandId: 'wf-2', args: `--wf ${gen.id} 另一张` }),
+				outcome: { kind: 'success', text: 'https://cdn.example.com/orphan.png' },
+			},
+		]),
+		'sess-1',
+		{ baselineSeq: 0, now: Date.now() },
+	);
+	check(
+		'目标节点不存在时退回普通落图（结果不丢）',
+		store.getBoard().nodes.some((n) => n.id === 'gencmd_wf-2'),
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
+	);
+	storage.clear();
+}
+
+// ─────────── 13. P18：PNG 元数据 + 工作流文档（导出/还原的往返） ───────────
+
+console.log('\n13) PNG 元数据与工作流文档');
+
+{
+	const png = await loadTsModule(resolve(root, 'src/client/canvas/pngmeta.ts'));
+	const wf = await loadTsModule(resolve(root, 'src/client/canvas/workflow.ts'));
+
+	// ── 13.1 造一个合成 PNG 当夹具 ──
+	//
+	// 只有块结构，IDAT 是空的 —— 被测的是「块的读写」，不是解码器。
+	// 这里的 crc32 刻意**逐位**实现（被测模块用查表法），两条实现互相印证。
+	const crc32 = (bytes) => {
+		let c = 0xffffffff;
+		for (const byte of bytes) {
+			c ^= byte;
+			for (let k = 0; k < 8; k += 1) c = (c & 1) !== 0 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
+		}
+		return (c ^ 0xffffffff) >>> 0;
+	};
+	const ascii = (text) => [...text].map((ch) => ch.charCodeAt(0));
+	// 自查：CRC-32 的标准校验向量（"123456789" → 0xCBF43926）
+	check('测试自带的 crc32 是标准 CRC-32', crc32(ascii('123456789')) === 0xcbf43926);
+	const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+	const chunkOf = (type, data) => {
+		const body = [...ascii(type), ...data];
+		return [...u32(data.length), ...body, ...u32(crc32(body))];
+	};
+	const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+	// 1×1、8 位灰度、无隔行
+	const ihdr = chunkOf('IHDR', [0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]);
+	const iend = chunkOf('IEND', []);
+	const fixture = new Uint8Array([...signature, ...ihdr, ...iend]);
+	/** 列出 PNG 里的块类型（测试自己走一遍，不复用被测函数）。 */
+	const chunkTypes = (bytes) => {
+		const out = [];
+		let at = 8;
+		while (at + 8 <= bytes.length) {
+			const len = (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3];
+			const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+			out.push(type);
+			at += 12 + len;
+			if (type === 'IEND') break;
+		}
+		return out;
+	};
+
+	check('夹具本身是合法 PNG 结构', chunkTypes(fixture).join() === 'IHDR,IEND');
+	check('isPng 认得 PNG', png.isPng(fixture));
+	check('isPng 不认别的格式', !png.isPng(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9])));
+	check('没有 tEXt 时读到空表', Object.keys(png.readPngText(fixture)).length === 0);
+
+	// ── 13.2 写 / 读往返 ──
+	const written = png.writePngText(fixture, { workflow: '{"a":1}' });
+	check('tEXt 插在 IHDR 之后', chunkTypes(written).join() === 'IHDR,tEXt,IEND', chunkTypes(written).join());
+	check('IHDR 一个字节都没动', (() => {
+		const a = fixture.subarray(0, 8 + ihdr.length);
+		return a.every((value, i) => written[i] === value);
+	})());
+	check('读回来的就是写进去的', png.readPngText(written).workflow === '{"a":1}');
+	check(
+		'写出来的块 CRC 正确（与测试自己的逐位实现一致）',
+		(() => {
+			const len = (written[8] << 24) | (written[9] << 16) | (written[10] << 8) | written[11];
+			const body = written.subarray(12, 16 + len);
+			const stored =
+				((written[16 + len] << 24) |
+					(written[17 + len] << 16) |
+					(written[18 + len] << 8) |
+					written[19 + len]) >>>
+				0;
+			return stored === crc32(body);
+		})(),
+	);
+
+	// ── 13.3 非 ASCII 转义（tEXt 是 Latin-1，中文必须转义） ──
+	const chinese = '{"t":"柴犬 · 油画"}';
+	const escaped = png.writePngText(fixture, { workflow: chinese });
+	/** 取第一个 tEXt 块的数据字节（只看它是不是纯 ASCII —— 文件头里本来就有 0x89）。 */
+	const textBytesOf = (bytes) => {
+		let at = 8;
+		while (at + 8 <= bytes.length) {
+			const len = (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3];
+			const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+			if (type === 'tEXt') return bytes.subarray(at + 8, at + 8 + len);
+			at += 12 + len;
+		}
+		return null;
+	};
+	check(
+		'tEXt 块里是纯 ASCII（别的解码器也读得回来）',
+		(() => {
+			const data = textBytesOf(escaped);
+			return data !== null && data.every((byte) => byte < 0x80);
+		})(),
+	);
+	const rawText = png.readPngText(escaped).workflow;
+	// 读出来仍是 `\u67f4` 这种转义形态 —— 这与 ComfyUI 的 json.dumps 完全一致：
+	// 那一层解码是 JSON 的事，字节层不该擅自猜内容是什么格式。
+	check('读回来的文本保持转义形态（与 ComfyUI 的 json.dumps 一致）', rawText.includes('\\u67f4'), rawText);
+	check(
+		'JSON.parse 之后与原文完全一致（中文无损）',
+		JSON.stringify(JSON.parse(rawText)) === JSON.stringify(JSON.parse(chinese)),
+	);
+
+	// ── 13.4 同名键先删后写（否则改了工作流还原出来还是老的） ──
+	const twice = png.writePngText(png.writePngText(fixture, { workflow: 'old' }), { workflow: 'new' });
+	check('同名块只留一个', chunkTypes(twice).filter((t) => t === 'tEXt').length === 1);
+	check('读到的是最后一次写的', png.readPngText(twice).workflow === 'new');
+	check(
+		'不是 PNG 时写元数据抛错（而不是写出一堆坏字节）',
+		(() => {
+			try {
+				png.writePngText(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { workflow: 'x' });
+				return false;
+			} catch {
+				return true;
+			}
+		})(),
+	);
+
+	// ── 13.5 工作流文档 ──
+	const boardNodes = [
+		{ id: 't1', kind: 'text', x: 0, y: 0, w: 260, h: 120, z: 1, status: 'ready', createdAt: 1, prompt: '一只柴犬' },
+		{ id: 'i1', kind: 'image', x: 0, y: 200, w: 200, h: 200, z: 2, status: 'ready', createdAt: 2, src: 'https://x/ref.png' },
+		{ id: 'l1', kind: 'image', x: 300, y: 200, w: 200, h: 200, z: 3, status: 'ready', createdAt: 3, src: 'data:image/png;base64,AAAA' },
+		{ id: 'g1', kind: 'gen', x: 320, y: 0, w: 280, h: 280, z: 4, status: 'ready', createdAt: 4, title: '生成节点' },
+	];
+	const boardLinks = [
+		{ id: 'k1', from: 't1', to: 'g1', fromSide: 'e', toSide: 'w' },
+		{ id: 'k2', from: 'i1', to: 'g1', fromSide: 'e', toSide: 'w' },
+	];
+	const text = wf.serializeWorkflow(boardNodes, boardLinks);
+	const doc = wf.parseWorkflow(text);
+	check('序列化 → 解析往返成功', doc !== null && doc.nodes.length === 4 && doc.links.length === 2);
+	check(
+		'http 地址进文档，data: 大图不进（否则文档会到兆级）',
+		doc.nodes.find((n) => n.id === 'i1').src === 'https://x/ref.png' &&
+			doc.nodes.find((n) => n.id === 'l1').src === undefined,
+	);
+	check('提示词进文档', doc.nodes.find((n) => n.id === 't1').prompt === '一只柴犬');
+	check(
+		'真 ComfyUI 的工作流认不出来（宁可明说，也不要猜着还原）',
+		wf.parseWorkflow(JSON.stringify({ last_node_id: 3, nodes: [{ id: 1, type: 'KSampler' }] })) === null,
+	);
+	check('坏 JSON 返回 null', wf.parseWorkflow('{不是 json') === null);
+
+	// ── 13.6 还原计划 ──
+	const plan = wf.planRestore(doc, { x: 1000, y: 500 }, []);
+	check('id 全部重映射（不与原 id 撞车）', plan.nodes.every((n) => !['t1', 'i1', 'g1'].includes(n.id)));
+	check(
+		'整体锚到落点（左上角对齐 1000,500）',
+		Math.min(...plan.nodes.map((n) => n.x)) === 1000 && Math.min(...plan.nodes.map((n) => n.y)) === 500,
+		JSON.stringify(plan.nodes.map((n) => [n.x, n.y])),
+	);
+	check('连线跟着重映射（端点都在新节点里）', (() => {
+		const ids = new Set(plan.nodes.map((n) => n.id));
+		return plan.links.length === 2 && plan.links.every((l) => ids.has(l.from) && ids.has(l.to));
+	})());
+	check(
+		'还原出来一律 ready（上一次的失败状态不该跟着回来）',
+		plan.nodes.every((n) => n.status === 'ready'),
+	);
+
+	const occupied = [{ id: 'x', kind: 'image', x: 1000, y: 500, w: 300, h: 300, z: 1, status: 'ready', createdAt: 1 }];
+	const shifted = wf.planRestore(doc, { x: 1000, y: 500 }, occupied);
+	check(
+		'落点被占时整体让开（不与现有节点重叠）',
+		Math.min(...shifted.nodes.map((n) => n.x)) > 1300,
+		String(Math.min(...shifted.nodes.map((n) => n.x))),
+	);
+
+	// ── 13.7 端到端：画布 → PNG 字节 → 拖回来 → 还原 ──
+	const exported = png.writePngText(fixture, { workflow: wf.serializeWorkflow(boardNodes, boardLinks) });
+	const back = wf.parseWorkflow(png.readPngText(exported).workflow);
+	const restored = wf.planRestore(back, { x: 0, y: 0 }, []);
+	check(
+		'端到端往返：节点种类与提示词都在',
+		restored.nodes.length === 4 &&
+			restored.nodes.some((n) => n.kind === 'gen') &&
+			restored.nodes.some((n) => n.prompt === '一只柴犬'),
+	);
+	check('端到端往返：连线数量一致', restored.links.length === 2);
+	check(
+		'端到端往返：可复用的图片地址还在',
+		restored.nodes.some((n) => n.src === 'https://x/ref.png'),
+	);
+}
+
+// ─────────── 14. P19：生成节点串联（拓扑序 / 环 / 等上游） ───────────
+
+console.log('\n14) 生成节点串联');
+
+{
+	await drainPersistTimers();
+	storage.clear();
+	const shared = new Map();
+	const storePath = resolve(root, 'src/client/canvas/store.ts');
+	const store = await loadTsModule(storePath, shared);
+	const run = await loadTsModule(resolve(root, 'src/client/canvas/run.ts'), shared);
+	const graph = await loadTsModule(resolve(root, 'src/client/canvas/graph.ts'), shared);
+	const regen = await loadTsModule(resolve(root, 'src/client/canvas/regenerate.ts'), shared);
+
+	// ── 14.1 连线规则：生成节点之间可以连，但不能成环 ──
+	const ready = { id: 'a', kind: 'gen', x: 0, y: 0, w: 10, h: 10, z: 1, status: 'ready', createdAt: 0, src: 'https://x/a.png' };
+	const pending = { id: 'b', kind: 'gen', x: 0, y: 0, w: 10, h: 10, z: 2, status: 'pending', createdAt: 0 };
+	const empty = { id: 'c', kind: 'gen', x: 0, y: 0, w: 10, h: 10, z: 3, status: 'ready', createdAt: 0 };
+	const nodes = [ready, pending, empty];
+	const reason = (from, to, links = []) => {
+		const result = graph.canLink(nodes, links, from, to);
+		return result.ok ? 'OK' : result.reason;
+	};
+	check('出过图的生成节点可以当上游', reason('a', 'c') === 'OK');
+	check('还在生成中的上游被拒', reason('b', 'c').includes('还在生成中'));
+	check('没出过图的上游被拒', reason('c', 'a').includes('还没有图'));
+	check(
+		'会成环的连线被拒',
+		reason('c', 'a', [{ id: 'l1', from: 'a', to: 'c', fromSide: 'e', toSide: 'w' }]).includes('环'),
+	);
+	check('自环也被拒（不能连到自己）', reason('a', 'a').includes('自己'));
+	check('wouldCycle 认得出间接环', graph.wouldCycle(
+		[
+			{ id: 'l1', from: 'a', to: 'b', fromSide: 'e', toSide: 'w' },
+			{ id: 'l2', from: 'b', to: 'c', fromSide: 'e', toSide: 'w' },
+		],
+		'c',
+		'a',
+	));
+	check('wouldCycle 对无关节点返回 false', !graph.wouldCycle([], 'a', 'b'));
+
+	// ── 14.2 拓扑序：上游在前，同层按视觉顺序 ──
+	const chainNodes = [
+		{ id: 'g3', kind: 'gen', x: 0, y: 400, w: 10, h: 10, z: 3, status: 'ready', createdAt: 0 },
+		{ id: 'g1', kind: 'gen', x: 0, y: 0, w: 10, h: 10, z: 1, status: 'ready', createdAt: 0 },
+		{ id: 'g2', kind: 'gen', x: 0, y: 200, w: 10, h: 10, z: 2, status: 'ready', createdAt: 0 },
+		{ id: 't1', kind: 'text', x: 0, y: 0, w: 10, h: 10, z: 0, status: 'ready', createdAt: 0, prompt: 'x' },
+	];
+	const chainLinks = [
+		{ id: 'k1', from: 'g1', to: 'g3', fromSide: 'e', toSide: 'w' },
+		{ id: 'k2', from: 'g2', to: 'g3', fromSide: 'e', toSide: 'w' },
+		{ id: 'k3', from: 't1', to: 'g1', fromSide: 'e', toSide: 'w' },
+	];
+	check(
+		'topoOrder：上游在前，同层按视觉顺序',
+		graph.topoOrder(chainNodes, chainLinks)
+			.map((n) => n.id)
+			.join() === 'g1,g2,g3',
+		graph.topoOrder(chainNodes, chainLinks)
+			.map((n) => n.id)
+			.join(),
+	);
+	check(
+		'topoOrder 遇到坏数据里的环也不卡死（剩下的按视觉顺序收尾）',
+		graph.topoOrder(
+			chainNodes,
+			[
+				{ id: 'k1', from: 'g1', to: 'g2', fromSide: 'e', toSide: 'w' },
+				{ id: 'k2', from: 'g2', to: 'g1', fromSide: 'e', toSide: 'w' },
+			],
+		).length === 3,
+	);
+
+	// ── 14.3 等上游：订阅 store，不轮询 ──
+	{
+		const node = store.addNode({ kind: 'gen', x: 0, y: 0, w: 10, h: 10, status: 'pending' });
+		const late = setTimeout(() => {
+			store.updateNodes([node.id], { status: 'ready', src: 'https://x/late.png' });
+		}, 20);
+		const settled = await run.waitForSettled(node.id, 2000);
+		clearTimeout(late);
+		check(
+			'waitForSettled 等到状态变化（订阅生效，不是等满超时）',
+			settled !== null && settled.status === 'ready' && settled.src === 'https://x/late.png',
+			JSON.stringify(settled),
+		);
+	}
+	{
+		const node = store.addNode({ kind: 'gen', x: 0, y: 0, w: 10, h: 10, status: 'pending' });
+		const settled = await run.waitForSettled(node.id, 30);
+		check('waitForSettled 超时返回 null（不无限挂住）', settled === null);
+	}
+	{
+		const node = store.addNode({ kind: 'gen', x: 0, y: 0, w: 10, h: 10, status: 'ready' });
+		const settled = await run.waitForSettled(node.id, 1000);
+		check('已经稳定的节点立刻返回', settled !== null && settled.id === node.id);
+	}
+
+	// ── 14.4 串联执行：B 的命令行里出现 A 出的图 ──
+	store.clearBoard();
+	const textA = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '一只柴犬' });
+	const genA = store.addNode({ kind: 'gen', x: 300, y: 0, w: 280, h: 280, status: 'ready' });
+	const textB = store.addNode({ kind: 'text', x: 0, y: 400, w: 100, h: 60, status: 'ready', prompt: '改成油画' });
+	const genB = store.addNode({ kind: 'gen', x: 300, y: 400, w: 280, h: 280, status: 'ready' });
+	store.addLinks([
+		{ from: textA.id, to: genA.id, fromSide: 'e', toSide: 'w' },
+		{ from: genA.id, to: genB.id, fromSide: 'e', toSide: 'w' },
+		{ from: textB.id, to: genB.id, fromSide: 'e', toSide: 'w' },
+	]);
+
+	const lines = [];
+	const off = regen.setRegenerateTarget({
+		prompt: async () => ({}),
+		// 模拟宿主：命令结算时 ingest 会把结果回填到那个生成节点上
+		command: async (line) => {
+			lines.push(line);
+			const id = /--wf (\S+)/.exec(line)?.[1] ?? '';
+			store.updateNodes([id], { status: 'ready', src: `https://cdn.example.com/${id}.png` });
+			return { ok: true, value: { matched: true } };
+		},
+	});
+	const report = await run.runWorkflow(store.getBoard().nodes, store.getBoard().links);
+	off();
+
+	check('串联：两个生成节点都跑了', report.started === 2, JSON.stringify(report));
+	check(
+		'串联：顺序是上游在前',
+		lines.length === 2 && lines[0].includes(`--wf ${genA.id}`),
+		JSON.stringify(lines),
+	);
+	check(
+		'串联：下游的参考图就是上游出的那张图',
+		lines[1].includes(`--ref https://cdn.example.com/${genA.id}.png`),
+		lines[1],
+	);
+	check(
+		'串联：下游的提示词来自它自己连的文字节点',
+		lines[1].includes('改成油画'),
+		lines[1],
+	);
+	check(
+		'串联：结果都回填到了各自的节点上',
+		(() => {
+			const board = store.getBoard();
+			const a = board.nodes.find((n) => n.id === genA.id);
+			const b = board.nodes.find((n) => n.id === genB.id);
+			return a?.src === `https://cdn.example.com/${genA.id}.png` && b?.src === `https://cdn.example.com/${genB.id}.png`;
+		})(),
+	);
+
+	// ── 14.5 上游失败 → 下游立刻判失败，不浪费一次生成 ──
+	//
+	// 注意：`failed` 的节点下一轮**会被重跑**（这是对的，用户可以修好配置再点一次），
+	// 因此这里让替身把上游再次跑失败，而不是指望它停在原地。
+	store.updateNodes([genB.id], { status: 'ready' });
+	const lines2 = [];
+	const off2 = regen.setRegenerateTarget({
+		prompt: async () => ({}),
+		command: async (line) => {
+			lines2.push(line);
+			const id = /--wf (\S+)/.exec(line)?.[1] ?? '';
+			store.updateNodes([id], { status: 'failed', error: '供应商不可用' });
+			return { ok: true, value: { matched: true } };
+		},
+	});
+	const report2 = await run.runWorkflow(store.getBoard().nodes, store.getBoard().links);
+	off2();
+	const downstream = store.getBoard().nodes.find((n) => n.id === genB.id);
+	check(
+		'上游失败 → 下游判失败并写明原因',
+		downstream?.status === 'failed' && String(downstream?.error).includes('上游节点没有出图'),
+		`${String(downstream?.status)} / ${String(downstream?.error)}`,
+	);
+	check(
+		'上游失败时下游一次生成都不发',
+		lines2.length === 1 && lines2[0].includes(`--wf ${genA.id}`),
+		JSON.stringify(lines2),
+	);
+	check('报告里记下了跳过的原因', report2.skipped.some((s) => s.id === genB.id), JSON.stringify(report2));
+
+	storage.clear();
+}
+
+// ─────────── 15. P19：生成节点的参数（种类 / 画幅） ───────────
+
+console.log('\n15) 生成节点参数');
+
+{
+	await drainPersistTimers();
+	storage.clear();
+	const shared = new Map();
+	const storePath = resolve(root, 'src/client/canvas/store.ts');
+	const store = await loadTsModule(storePath, shared);
+	const run = await loadTsModule(resolve(root, 'src/client/canvas/run.ts'), shared);
+	const model = await loadTsModule(resolve(root, 'src/client/canvas/model.ts'), shared);
+	const wf = await loadTsModule(resolve(root, 'src/client/canvas/workflow.ts'), shared);
+	const media = await loadTsModule(resolve(root, 'src/client/shared/media.ts'), shared);
+	const regen = await loadTsModule(resolve(root, 'src/client/canvas/regenerate.ts'), shared);
+
+	// ── 15.1 缺省与坏值 ──
+	check('缺省是图像 · 1:1', model.genKindOf({}) === 'image' && model.genRatioOf({}) === '1:1');
+	check('空白比例退回 1:1', model.genRatioOf({ ratio: '   ' }) === '1:1');
+	check('未知种类退回图像', model.genKindOf({ genKind: 'hologram' }) === 'image');
+	check(
+		'视频参数没设时是 undefined（= 用管线默认值，与「0 秒」不是一回事）',
+		model.genDurationOf({}) === undefined &&
+			model.genDurationOf({ duration: 0 }) === undefined &&
+			model.genDurationOf({ duration: -3 }) === undefined &&
+			model.genResolutionOf({ resolution: '  ' }) === undefined,
+	);
+	check(
+		'比例 / 清晰度清单只有一份（参数面板与命令行共用）',
+		media.ASPECT_RATIOS.join() === '1:1,16:9,4:3,3:4,9:16' &&
+			media.VIDEO_RESOLUTIONS.join() === '480p,1080p' &&
+			media.VIDEO_DURATIONS.join() === '4,5,8,10',
+	);
+
+	// ── 15.2 参数真的进了命令行 ──
+	const text = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '一只柴犬' });
+	const gen = store.addNode({
+		kind: 'gen',
+		x: 300,
+		y: 0,
+		w: 320,
+		h: 180,
+		status: 'ready',
+		genKind: 'video',
+		ratio: '16:9',
+	});
+	store.addLinks([{ from: text.id, to: gen.id, fromSide: 'e', toSide: 'w' }]);
+	// 视频时长 / 清晰度也一起设上（改完要**重新读**节点：`gen` 是改之前那份快照）
+	store.updateNodes([gen.id], { duration: 5, resolution: '1080p' });
+	const genNow = store.getBoard().nodes.find((n) => n.id === gen.id);
+
+	const plan = run.planOf(genNow, store.getBoard().nodes, store.getBoard().links);
+	check(
+		'视频 + 16:9 + 时长 + 清晰度都进了命令行',
+		plan.ok &&
+			plan.line.includes('--video') &&
+			plan.line.includes('--ratio 16:9') &&
+			plan.line.includes('--duration 5') &&
+			plan.line.includes('--resolution 1080p'),
+		plan.ok ? plan.line : plan.reason,
+	);
+	check(
+		'缺省参数的节点发的是图像命令（不带 --video / --duration）',
+		(() => {
+			const plain = store.addNode({ kind: 'gen', x: 0, y: 300, w: 280, h: 280, status: 'ready' });
+			store.addLinks([{ from: text.id, to: plain.id, fromSide: 'e', toSide: 'w' }]);
+			const p = run.planOf(plain, store.getBoard().nodes, store.getBoard().links);
+			return (
+				p.ok &&
+				!p.line.includes('--video') &&
+				!p.line.includes('--duration') &&
+				p.line.includes('--ratio 1:1')
+			);
+		})(),
+	);
+	check(
+		'图像节点即使带着 duration 也不发它（参数面板根本不给图像显示这两个）',
+		(() => {
+			const mixed = store.addNode({
+				kind: 'gen',
+				x: 0,
+				y: 600,
+				w: 280,
+				h: 280,
+				status: 'ready',
+				genKind: 'image',
+				duration: 8,
+				resolution: '480p',
+			});
+			store.addLinks([{ from: text.id, to: mixed.id, fromSide: 'e', toSide: 'w' }]);
+			const p = run.planOf(mixed, store.getBoard().nodes, store.getBoard().links);
+			return p.ok && !p.line.includes('--duration') && !p.line.includes('--resolution');
+		})(),
+	);
+
+	// ── 15.3 参数进持久化 ──
+	store.flushPersist();
+	const raw = JSON.parse(store.readPersistedRaw());
+	const stored = raw.nodes.find((n) => n.id === gen.id);
+	check(
+		'genKind / ratio / duration / resolution 都写进了持久化',
+		stored.genKind === 'video' &&
+			stored.ratio === '16:9' &&
+			stored.duration === 5 &&
+			stored.resolution === '1080p',
+		JSON.stringify([stored.genKind, stored.ratio, stored.duration, stored.resolution]),
+	);
+
+	// ── 15.4 参数进工作流文档（还原之后还是那个参数） ──
+	const doc = wf.parseWorkflow(wf.serializeWorkflow(store.getBoard().nodes, store.getBoard().links));
+	const docGen = doc.nodes.find((n) => n.id === gen.id);
+	check(
+		'工作流文档带上生成节点参数',
+		docGen.genKind === 'video' &&
+			docGen.ratio === '16:9' &&
+			docGen.duration === 5 &&
+			docGen.resolution === '1080p',
+		JSON.stringify([docGen.genKind, docGen.ratio, docGen.duration, docGen.resolution]),
+	);
+	const restored = wf.planRestore(doc, { x: 0, y: 0 }, []);
+	const restoredGen = restored.nodes.find((n) => n.kind === 'gen' && n.genKind === 'video');
+	check(
+		'还原计划保留参数',
+		restoredGen !== undefined &&
+			restoredGen.ratio === '16:9' &&
+			restoredGen.duration === 5 &&
+			restoredGen.resolution === '1080p',
+		JSON.stringify(restored.nodes.filter((n) => n.kind === 'gen')),
+	);
+
+	// ── 15.5 「运行此节点」：只跑这一个，不重跑上游 ──
+	{
+		const lines = [];
+		const off = regen.setRegenerateTarget({
+			prompt: async () => ({}),
+			command: async (line) => {
+				lines.push(line);
+				const id = /--wf (\S+)/.exec(line)?.[1] ?? '';
+				store.updateNodes([id], { status: 'ready', src: `https://cdn.example.com/${id}.png` });
+				return { ok: true, value: { matched: true } };
+			},
+		});
+		const report = await run.runSingleNode(gen.id);
+		off();
+		check(
+			'运行此节点：只发一次命令，且是这一个节点',
+			report.started === 1 && lines.length === 1 && lines[0].includes(`--wf ${gen.id}`),
+			JSON.stringify({ report, lines }),
+		);
+
+		// 下游的上游「就绪但没图」（例如刚还原出来的工作流）→ 明确说清楚，不发命令
+		const down = store.addNode({ kind: 'gen', x: 900, y: 0, w: 280, h: 280, status: 'ready' });
+		const empty = store.addNode({ kind: 'gen', x: 600, y: 0, w: 280, h: 280, status: 'ready' });
+		store.addLinks([
+			{ from: text.id, to: down.id, fromSide: 'e', toSide: 'w' },
+			{ from: empty.id, to: down.id, fromSide: 'e', toSide: 'w' },
+		]);
+		const lines2 = [];
+		const off2 = regen.setRegenerateTarget({
+			prompt: async () => ({}),
+			command: async (line) => {
+				lines2.push(line);
+				return { ok: true, value: { matched: true } };
+			},
+		});
+		const report2 = await run.runSingleNode(down.id);
+		off2();
+		check(
+			'上游没出图时明确拒绝（而不是发一次注定失败的生成）',
+			report2.started === 0 &&
+				lines2.length === 0 &&
+				String(store.getBoard().nodes.find((n) => n.id === down.id)?.error).includes(
+					'上游节点还没有出图',
+				),
+			JSON.stringify({ report2, lines2 }),
+		);
+
+		const missing = await run.runSingleNode('不存在');
+		check(
+			'节点不存在时给得出原因',
+			missing.started === 0 && missing.skipped[0]?.reason === '节点不存在',
+			JSON.stringify(missing),
+		);
+	}
+
+	// ── 15.6 坏参数在读取时被丢掉（不让荒唐值进命令行） ──
+	const broken = JSON.parse(store.readPersistedRaw());
+	const target = broken.nodes.find((n) => n.id === gen.id);
+	target.genKind = 'hologram';
+	target.ratio = '42:1';
+	target.duration = -5;
+	target.resolution = '8k';
+	storage.clear();
+	storage.set('fatfish-canvas:board', JSON.stringify(broken));
+	const reloaded = await loadTsModule(storePath);
+	const back = reloaded.getBoard().nodes.find((n) => n.id === gen.id);
+	check(
+		'坏参数读取时被丢掉（退回缺省）',
+		back.genKind === undefined &&
+			back.ratio === undefined &&
+			back.duration === undefined &&
+			back.resolution === undefined,
+		JSON.stringify([back.genKind, back.ratio, back.duration, back.resolution]),
+	);
+	storage.clear();
+}
+
+// ─────────── 16. P22：本地图当参考图（宿主句柄 ref） ───────────
+
+console.log('\n16) 本地图当参考图（ref 句柄）');
+
+{
+	await drainPersistTimers();
+	storage.clear();
+	const shared = new Map();
+	const storePath = resolve(root, 'src/client/canvas/store.ts');
+	const store = await loadTsModule(storePath, shared);
+	const graph = await loadTsModule(resolve(root, 'src/client/canvas/graph.ts'), shared);
+	const run = await loadTsModule(resolve(root, 'src/client/canvas/run.ts'), shared);
+	const wf = await loadTsModule(resolve(root, 'src/client/canvas/workflow.ts'), shared);
+	const media = await loadTsModule(resolve(root, 'src/client/shared/media.ts'), shared);
+
+	// 一张「本地拖进来」的图：整张图的 data URL（远超命令行能带的 8192 字符）
+	const bigDataUrl = `data:image/png;base64,${'A'.repeat(20000)}`;
+	const node = (id, extra = {}) => ({
+		id,
+		kind: 'image',
+		x: 0,
+		y: 0,
+		w: 100,
+		h: 100,
+		z: 1,
+		status: 'ready',
+		createdAt: 0,
+		...extra,
+	});
+	const gen = node('gen', { kind: 'gen' });
+	const local = node('local', { src: bigDataUrl });
+	const hosted = node('hosted', { src: bigDataUrl, ref: 'C:\\tmp\\attachments\\abc.png' });
+	const remote = node('remote', { src: 'https://cdn.example/a.png' });
+	const reason = (from) => {
+		const result = graph.canLink([from, gen], [], from.id, gen.id);
+		return result.ok ? 'OK' : result.reason;
+	};
+
+	check('没有句柄的内联大图连不上（命令行塞不下）', reason(local).includes('没能存成参考图'), reason(local));
+	check(
+		'提示里说清下一步（另存成文件再拖 / 改用 http 地址），不是只报「地址不行」',
+		reason(local).includes('拖进画布') && reason(local).includes('http'),
+		reason(local),
+	);
+	check('拿到宿主句柄之后就能连了', reason(hosted) === 'OK', reason(hosted));
+	check('http 地址的图一直都能连', reason(remote) === 'OK');
+
+	// 连线被拒时客户端要当场补存句柄（CanvasStage），判据必须与提示那条分支同源：
+	// 写歪了就是「说着要补存、实际不补」，或反过来「能连的图被拖去存一遍」。
+	check(
+		'needsReferenceHandle 只对「内联大图且没句柄」成立',
+		graph.needsReferenceHandle(local) === true &&
+			graph.needsReferenceHandle(hosted) === false &&
+			graph.needsReferenceHandle(remote) === false &&
+			graph.needsReferenceHandle(node('small', { src: 'data:image/png;base64,AAAA' })) === false &&
+			graph.needsReferenceHandle(node('empty')) === false,
+		JSON.stringify([local, hosted, remote].map((n) => graph.needsReferenceHandle(n))),
+	);
+	check('拿到宿主句柄之后就能连了', reason(hosted) === 'OK', reason(hosted));
+	check('http 地址的图一直都能连', reason(remote) === 'OK');
+
+	check(
+		'referenceHandleOf 优先用 ref',
+		run.referenceHandleOf(hosted) === 'C:\\tmp\\attachments\\abc.png',
+		String(run.referenceHandleOf(hosted)),
+	);
+	check('没有 ref 时退回 src', run.referenceHandleOf(remote) === 'https://cdn.example/a.png');
+	check('没有参考图时是 undefined', run.referenceHandleOf(null) === undefined);
+	check(
+		'ref 是空串时也退回 src',
+		run.referenceHandleOf({ src: 'https://x/a.png', ref: '' }) === 'https://x/a.png',
+	);
+
+	// ── 命令行里真的带的是句柄 ──
+	{
+		const text = store.addNode({ kind: 'text', x: 0, y: 0, w: 100, h: 60, status: 'ready', prompt: '一只柴犬' });
+		const refNode = store.addNode({
+			kind: 'image',
+			x: 0,
+			y: 200,
+			w: 100,
+			h: 100,
+			status: 'ready',
+			src: bigDataUrl,
+			ref: 'C:\\tmp\\attachments\\abc.png',
+		});
+		const target = store.addNode({ kind: 'gen', x: 300, y: 0, w: 280, h: 280, status: 'ready' });
+		store.addLinks([
+			{ from: text.id, to: target.id, fromSide: 'e', toSide: 'w' },
+			{ from: refNode.id, to: target.id, fromSide: 'e', toSide: 'w' },
+		]);
+		const plan = run.planOf(target, store.getBoard().nodes, store.getBoard().links);
+		check(
+			'命令行里的 --ref 是宿主句柄（不是那张几万字符的 data URL）',
+			plan.ok && plan.line.includes('--ref C:\\tmp\\attachments\\abc.png') && !plan.line.includes('AAAA'),
+			plan.ok ? plan.line : plan.reason,
+		);
+		check('命令行长度是可控的（这才是整件事的目的）', plan.ok && plan.line.length < 300, String(plan.ok ? plan.line.length : -1));
+
+		// ── 持久化与工作流文档都要带上它 ──
+		store.flushPersist();
+		const raw = JSON.parse(store.readPersistedRaw());
+		check(
+			'ref 写进了持久化（刷新后不用重存）',
+			raw.nodes.some((n) => n.ref === 'C:\\tmp\\attachments\\abc.png'),
+			JSON.stringify(raw.nodes.map((n) => n.ref)),
+		);
+
+		const doc = wf.parseWorkflow(wf.serializeWorkflow(store.getBoard().nodes, store.getBoard().links));
+		check(
+			'ref 进工作流文档（还原出来的工作流能复用同一张本地图）',
+			doc.nodes.some((n) => n.ref === 'C:\\tmp\\attachments\\abc.png'),
+			JSON.stringify(doc.nodes.map((n) => n.ref)),
+		);
+		const restored = wf.planRestore(doc, { x: 0, y: 0 }, []);
+		check('还原计划保留 ref', restored.nodes.some((n) => n.ref === 'C:\\tmp\\attachments\\abc.png'));
+		check(
+			'文档里没有把那张 data URL 也存进去（src 仍然只留 http）',
+			doc.nodes.every((n) => n.src === undefined || !n.src.startsWith('data:')),
+			JSON.stringify(doc.nodes.map((n) => n.src)),
+		);
+
+		// 空串 / 非字符串的 ref 在读取时被丢掉
+		const broken = JSON.parse(store.readPersistedRaw());
+		broken.nodes[0].ref = '';
+		broken.nodes[1].ref = 42;
+		storage.clear();
+		storage.set('fatfish-canvas:board', JSON.stringify(broken));
+		const reloaded = await loadTsModule(storePath);
+		check(
+			'坏 ref 在读取时被丢掉（不让空句柄进命令行）',
+			reloaded.getBoard().nodes.every((n) => n.ref === undefined || n.ref !== ''),
+			JSON.stringify(reloaded.getBoard().nodes.map((n) => n.ref)),
+		);
+	}
+
+	check(
+		'REFERENCE_MAX_INLINE 仍然卡在 8192（句柄机制是绕开它，不是放开它）',
+		media.REFERENCE_MAX_INLINE === 8192,
+		String(media.REFERENCE_MAX_INLINE),
+	);
+
+	// ── 16.2 落图之后请宿主存句柄（dropfiles 的接线） ──
+	{
+		const drop = await loadTsModule(resolve(root, 'src/client/canvas/dropfiles.ts'), shared);
+		const notice = await loadTsModule(resolve(root, 'src/client/canvas/notice.ts'), shared);
+		store.clearBoard();
+		const local = store.addNode({ kind: 'image', x: 0, y: 0, w: 10, h: 10, status: 'ready', src: bigDataUrl });
+		const remote = store.addNode({
+			kind: 'image',
+			x: 0,
+			y: 0,
+			w: 10,
+			h: 10,
+			status: 'ready',
+			src: 'https://cdn.example/a.png',
+		});
+		const seen = [];
+		// ⚠️ 这个替身站的是**远程面**，所以回包必须是信封 `{ok,value}` ——
+		// 网关（dsh-api-gateway 的 invoke）就是这么包的。替身要是直接回宿主的结果对象，
+		// 「忘了拆信封」这个真 bug 就永远测不出来（实测栽过一次）。
+		const off = drop.setReferenceStore(() => ({
+			storeReference: async (dataUrl) => {
+				seen.push(dataUrl);
+				return {
+					ok: true,
+					value: { ok: true, message: '已存为参考图（12 KB）', ref: 'C:\\tmp\\attachments\\abc.png' },
+				};
+			},
+		}));
+		await drop.attachReferenceHandles([local.id, remote.id]);
+		off();
+		check(
+			'内联图会请宿主存句柄，http 地址不会（本来就够短）',
+			seen.length === 1 && seen[0] === bigDataUrl,
+			JSON.stringify(seen.map((s) => s.slice(0, 20))),
+		);
+		check(
+			'存好了要回一句「没报错」（连线那边据此决定要不要再补一句判定理由）',
+			(await drop.attachReferenceHandles([local.id])) === false,
+		);
+		check(
+			'探测面还没就绪时不报错也不记账（连线那一刻会再试一次）',
+			(await (async () => {
+				const off0 = drop.setReferenceStore(() => undefined);
+				const wrote = await drop.attachReferenceHandles([local.id]);
+				off0();
+				return wrote;
+			})()) === false,
+		);
+		check(
+			'存好之后句柄写回节点',
+			store.getBoard().nodes.find((n) => n.id === local.id)?.ref === 'C:\\tmp\\attachments\\abc.png',
+			String(store.getBoard().nodes.find((n) => n.id === local.id)?.ref),
+		);
+		// 连线那边存完句柄要**立刻**能连上：判据只能读 store，不能读渲染快照
+		// （boardRef 要等下一次渲染才更新，拿它判就是「存成功了却报没存成」，实测踩到）。
+		{
+			const target = store.addNode({ kind: 'gen', x: 0, y: 0, w: 10, h: 10, status: 'ready' });
+			check(
+				'存好句柄之后立刻能连上（读 store 而不是渲染快照）',
+				graph.canLink(store.getBoard().nodes, store.getBoard().links, local.id, target.id).ok === true,
+			);
+		}
+
+		// 已经有句柄的不再重复存（拖两次同一张图不该发两次请求）
+		const seen2 = [];
+		const off2 = drop.setReferenceStore(() => ({
+			storeReference: async (dataUrl) => {
+				seen2.push(dataUrl);
+				return { ok: true, value: { ok: true, message: 'ok', ref: 'C:\\tmp\\other.png' } };
+			},
+		}));
+		await drop.attachReferenceHandles([local.id]);
+		off2();
+		check('已经有句柄的节点不再重复存', seen2.length === 0, JSON.stringify(seen2));
+
+		// 失败要说一声（否则用户会在连线时撞上一句「重新拖一次」，而真因在这里）
+		const failed = store.addNode({ kind: 'image', x: 0, y: 0, w: 10, h: 10, status: 'ready', src: bigDataUrl });
+		const off3 = drop.setReferenceStore(() => ({
+			storeReference: async () => ({
+				ok: true,
+				value: { ok: false, message: '这张图太大，存不成参考图' },
+			}),
+		}));
+		notice.pushNotice('');
+		const reported = await drop.attachReferenceHandles([failed.id]);
+		off3();
+		check(
+			'存不成时返回「已经说过具体原因」（连线那边不要再用泛泛理由盖掉它）',
+			reported === true,
+			String(reported),
+		);
+
+		check(
+			'存不成时立刻说出来（不是静默留个空节点）',
+			notice.getNotice().includes('太大'),
+			notice.getNotice(),
+		);
+		check(
+			'失败时节点上没有留下半截句柄',
+			store.getBoard().nodes.find((n) => n.id === failed.id)?.ref === undefined,
+		);
+
+		// 网关层的失败信封（宿主方法压根没跑到 / 调用被拒）：也要把 error.message 说出来
+		const refused = store.addNode({ kind: 'image', x: 0, y: 0, w: 10, h: 10, status: 'ready', src: bigDataUrl });
+		const off5 = drop.setReferenceStore(() => ({
+			storeReference: async () => ({
+				ok: false,
+				error: { code: 'gateway/not-mounted', message: '这个宿主没有装配 mediaProbe' },
+			}),
+		}));
+		notice.pushNotice('');
+		const refusedReported = await drop.attachReferenceHandles([refused.id]);
+		off5();
+		check(
+			'网关失败信封里的原因要转述给用户（不是「没能存成参考图」一句谜语）',
+			refusedReported === true && notice.getNotice().includes('没有装配'),
+			notice.getNotice(),
+		);
+
+		// 远程面回话既不是成功也不是一句原因（解析不出来）：绝不能沉默
+		const mute = store.addNode({ kind: 'image', x: 0, y: 0, w: 10, h: 10, status: 'ready', src: bigDataUrl });
+		const off4 = drop.setReferenceStore(() => ({ storeReference: async () => undefined }));
+		notice.pushNotice('');
+		const muteReported = await drop.attachReferenceHandles([mute.id]);
+		off4();
+		check(
+			'宿主没回话时也要说一句（否则用户只看到「没能存成参考图」而不知道原因）',
+			muteReported === true && notice.getNotice().includes('没有回话'),
+			notice.getNotice(),
+		);
+		notice.pushNotice('');
+	}
+
 	storage.clear();
 }
 

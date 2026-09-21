@@ -26,11 +26,13 @@
  * @module fatfish-canvas/client/CanvasPanel
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { ExpandIcon, FitIcon, RiceBowlIcon, SelectAllIcon, TargetIcon, TrashIcon } from './icons';
 import { CanvasStage } from './canvas/CanvasStage';
 import { fitAll } from './canvas/actions';
+import { hasRegenerateTarget } from './canvas/regenerate';
+import { describeRun, runWorkflow } from './canvas/run';
 import { useBoardScope } from './canvas/scope';
 import { clearBoard, removeNodes, setSelection, useBoard } from './canvas/store';
 import {
@@ -60,8 +62,42 @@ export function CanvasPanel(): ReactNode {
 	const board = useBoard();
 	const scope = useBoardScope();
 	const [dragging, setDragging] = useState(false);
+	/** 「运行工作流」进行中（串行跑完才解锁）。 */
+	const [running, setRunning] = useState(false);
+	/** 上一次运行的结果读数（几秒后自己消失）。 */
+	const [runNote, setRunNote] = useState('');
 	const widthRef = useRef(width);
 	widthRef.current = width;
+
+	useEffect(() => {
+		if (runNote === '') return undefined;
+		const timer = setTimeout(() => {
+			setRunNote((current) => (current === runNote ? '' : current));
+		}, 4000);
+		return () => {
+			clearTimeout(timer);
+		};
+	}, [runNote]);
+
+	/** 画布上的生成节点数（决定「运行」能不能点）。 */
+	const genCount = board.nodes.filter((node) => node.kind === 'gen').length;
+	const canRun = genCount > 0 && !running && hasRegenerateTarget();
+
+	const onRun = useCallback(() => {
+		if (running) return;
+		setRunning(true);
+		setRunNote('正在运行…');
+		void runWorkflow(board.nodes, board.links)
+			.then((report) => {
+				setRunNote(describeRun(report));
+			})
+			.catch((error: unknown) => {
+				setRunNote(`运行失败：${error instanceof Error ? error.message : String(error)}`);
+			})
+			.finally(() => {
+				setRunning(false);
+			});
+	}, [board.links, board.nodes, running]);
 
 	/** 纯画布模式下右缘拖拽没有意义（画布已经铺满），因此禁用。 */
 	const resizable = mode === 'canvas';
@@ -128,6 +164,34 @@ export function CanvasPanel(): ReactNode {
 				    见 index.tsx 的 conversation.input.right 注册与 settings/ModelPicker.tsx。 */}
 
 				<span className="ffc-spacer" />
+
+				{/* ── 运行工作流（P18） ──
+				    放在最右一组的最前面：它是画布上唯一「会真的花掉一次生成」的动作，
+				    混在视图开关里会让人误点。禁用时把原因写进 title。 */}
+				<button
+					type="button"
+					className="ffc-tbtn ffc-tbtn-primary"
+					data-running={running ? 'true' : undefined}
+					title={
+						genCount === 0
+							? '画布上还没有生成节点（空白处点右键可以新建）'
+							: !hasRegenerateTarget()
+								? '当前没有会话，命令发不出去'
+								: `运行画布上的 ${String(genCount)} 个生成节点`
+					}
+					aria-label="运行工作流"
+					disabled={!canRun}
+					onClick={onRun}
+				>
+					{running ? '运行中…' : '运行'}
+				</button>
+				{runNote !== '' ? (
+					<span className="ffc-badge" role="status" aria-live="polite">
+						{runNote}
+					</span>
+				) : null}
+
+				<span className="ffc-toolbar-sep" aria-hidden="true" />
 
 				{/* ── 选择 ── */}
 				<button
