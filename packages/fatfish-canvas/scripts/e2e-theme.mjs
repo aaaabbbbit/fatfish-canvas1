@@ -35,7 +35,12 @@ const check = (label, ok, detail = '') => {
 const TARGETS = [
 	{ sel: '.ffc-title', min: 4.5, what: '面板标题' },
 	{ sel: '.ffc-badge', min: 3, what: '徽标' },
-	{ sel: '.ffc-toolbar .ffc-tbtn', min: 3, what: '工具条按钮' },
+	// ⚠️ 只查**可用**的工具条按钮：`.ffc-tbtn` 禁用时自身 `opacity: 0.4`（刻意的视觉降级），
+	// 半透明文字算出来的对比度必然不达标。P26 实测就是这么假红的：P18 把「运行」这个
+	// `.ffc-tbtn` 插到了这一组的最前面，而种子里没有生成节点 → 它一直是禁用态 →
+	// `querySelector` 每次都挑中它，两个主题都报 2.39 / 1.57（< 3），而真正要守的是
+	// **可用控件**的可读性（WCAG 也把禁用控件排除在对比度要求之外）。
+	{ sel: '.ffc-toolbar .ffc-tbtn:not([disabled])', min: 3, what: '工具条按钮（可用态）' },
 	{ sel: '.ffc-node[data-status="ready"] .ffc-node-title', min: 3, what: '节点标题（悬浮条）' },
 	{ sel: '.ffc-node[data-status="pending"] .ffc-node-pending-text', min: 3, what: '生成中文案' },
 	{ sel: '.ffc-node[data-status="failed"] .ffc-node-failed-title', min: 4.5, what: '失败标题' },

@@ -1,12 +1,11 @@
 /**
- * P10 端到端：米饭碗回到右上角（不压 session log）· 一键往返 · 纯画布独立成顶栏一格。
+ * P10 端到端：米饭碗回到右上角（不压行内邻居）· 一键往返 · 纯画布独立成顶栏一格。
  *
  * 覆盖本轮改的三件事，每一条都只有真实浏览器能回答：
  *
- *   1. **位置**：入口注册进 session log 住的**同一个席位**
- *      （`conversation.session.header.utilities`），因此断言
- *        - 入口落在视口右上角那块区域里，且在 session log **右边**（order 10 > 0）
- *        - 入口与 session log **不相交**，且 session log 自己**仍然可命中**
+ *   1. **位置**：入口注册进会话头部那一行（`conversation.session.header.utilities`），因此断言
+ *        - 入口落在视口右上角那块区域里，且在**同行邻居**右边（order 10 > 0）
+ *        - 入口与同行邻居**不相交**，且邻居自己**仍然可命中**
  *          （「不压住别人」不是「挪开几像素」，而是两者都在布局里各占一格）
  *        - 进入画布模式后入口**位置不变**（并排模式下聊天列右缘就是视口右缘）
  *   2. **一键往返**：聊天里单击 = 进画布；画布里单击 = 回聊天；
@@ -14,6 +13,12 @@
  *   3. **顶栏**：「视图」菜单整块移除（不再有视图模式 / 画布宽度选择），
  *      纯画布独立成一个按钮；窄画布（40%）下顶栏不溢出、控件不被压扁；
  *      纯画布模式里它是唯一出口，必须还点得到。
+ *
+ * ⚠️ **锚点为什么从「session log」改成「同行邻居」**（P26）：那条断言原来锚在平台的
+ * `sessionLog` 控件上，而新版 dsh（0.1.5-rc.3）里那个控件**整个不存在了**（全文档搜
+ * `[class*="sessionLog"]` 为空）→ 5 条断言集体假红。改成「那一行里本插件之外的**最后一个**
+ * 控件」：要守的不变量（同一行、各占一格、都不被压）与**具体是哪个平台控件**无关，
+ * 平台下次再改名/换控件也不会连累这条 e2e（教训见 NOTES §8.37）。
  *
  * 用法（需放宽沙箱：无头 Chrome 要创建命名管道）：
  *   node scripts/e2e-entry.mjs
@@ -51,11 +56,20 @@ const PROBE = `(() => {
   // 会话头部**可见**的那一份 DOM（hero 里那份隐藏副本留在文档里，会骗过 querySelector）
   const visibles = (sel) => qa(sel).filter(visible);
   const entry = visibles('.ffc-entry')[0] ?? null;
-  const logBtn = visibles('[class*="sessionLog"], [class*="session-log"]')[0] ?? null;
   const utilities = q('[class*="headerUtilities"]');
+  // 同行邻居 = 那一行里**本插件之外**的最后一个控件（入口现在排在这一行的末尾）。
+  // 不再锚平台的具体控件（session log 在新版 dsh 里已经不存在），见文件头的说明。
+  const neighbourOf = () => {
+    if (utilities === null) return null;
+    const others = Array.from(utilities.querySelectorAll('button, a, [role="button"]')).filter(
+      (el) => el.closest('.ffc-entry') === null && !/(^|\\s)ffc-/.test(cls(el)),
+    );
+    return others[others.length - 1] ?? null;
+  };
+  const neighbour = neighbourOf();
   const inUtilities = entry !== null && utilities !== null && utilities.contains(entry);
 
-  // 视口右上角那一块（session log 与入口共同所在的区域）。
+  // 视口右上角那一块（会话头部那一行与入口共同所在的区域）。
   // 只数**顶层**本插件元素：按钮内部的图标/文字 span 也带 ffc- 前缀，
   // 数进去只会把「一个按钮」误报成「两个东西」。
   const topLevelOwn = (el) => {
@@ -92,10 +106,11 @@ const PROBE = `(() => {
     entryInOverlay: entry ? entry.closest('[data-shell-overlay]') !== null : null,
     entryInUtilities: inUtilities,
     entryParent: entry && entry.parentElement ? entry.parentElement.tagName.toLowerCase() + '.' + cls(entry.parentElement).split(/\\s+/)[0] : null,
-    logButton: rect(logBtn),
-    logButtonText: text(logBtn),
-    logHit: hit(logBtn),
-    entryOverlapsLog: intersects(rect(entry), rect(logBtn)),
+    /** 行内邻居（入口的锚点）：位置、文案、能不能被点到。 */
+    neighbour: rect(neighbour),
+    neighbourLabel: neighbour ? neighbour.getAttribute('aria-label') : null,
+    neighbourHit: hit(neighbour),
+    entryOverlapsNeighbour: intersects(rect(entry), rect(neighbour)),
     hasViewBtn: qa('.ffc-view-btn').length > 0,
     hasWideMenu: qa('.ffc-menu-wide').length > 0,
     onlyBtn: rect(onlyBtn),
@@ -124,7 +139,7 @@ const read = async () => JSON.parse(await evaluate(browser.cdp, PROBE));
  * 打开一个**正常**的真实会话（入口与会话头部都在这类会话里存在）。
  *
  * 侧边栏里可能排着「等待审批」的会话：那种会话的 composer 被审批 UI 接管，
- * 而且它的头部也不带 session log，拿它会得到一堆假红。逐个试到合适的为止。
+ * 而且它的头部也不带那一行 utilities（找不到行内邻居），拿它会得到一堆假红。逐个试到合适的为止。
  * @returns 打开的会话文案；全都不可用时为 null。
  */
 async function openRealSession() {
@@ -136,7 +151,7 @@ async function openRealSession() {
 		await click(browser.cdp, row.center.x, row.center.y);
 		await sleep(3000);
 		const after = await read();
-		if (after.entryVisibleCount > 0 && after.logButton !== null) return row.text;
+		if (after.entryVisibleCount > 0 && after.neighbour !== null) return row.text;
 	}
 	return null;
 }
@@ -163,17 +178,21 @@ try {
 	await loaded;
 	await sleep(9000);
 
-	// ── 0. 打开真实会话：会话头部（入口与 session log）只有这时才存在 ──
+	// ── 0. 打开真实会话：会话头部那一行（入口与它的行内邻居）只有这时才存在 ──
 	console.log('0) 打开一个真实会话');
 	const opened = await openRealSession();
 	check('打开了一个正常会话（入口与会话头部都在）', opened !== null, String(opened));
 	let s = await read();
 	check('聊天模式已生效', s.mode === 'chat', String(s.mode));
 	check('入口按钮渲染且可见', s.entry !== null && s.entry.w > 0, JSON.stringify(s.entry));
-	check('session log 按钮渲染出来了（说明会话头部真的挂上了）', s.logButton !== null && s.logButton.w > 0, `${JSON.stringify(s.logButton)} / ${String(s.logButtonText)}`);
+	check(
+		'会话头部那一行渲染出来了（找到入口的行内邻居，说明头部真的挂上了）',
+		s.neighbour !== null && s.neighbour.w > 0,
+		`邻居=${String(s.neighbourLabel)} ${JSON.stringify(s.neighbour)}`,
+	);
 
-	// ── 1. 位置：右上角，且与 session log 各占一格 ──
-	console.log('\n1) 入口在右上角（与 session log 同一席位，各占一格）');
+	// ── 1. 位置：右上角，且与行内邻居各占一格 ──
+	console.log('\n1) 入口在右上角（与行内邻居同一行，各占一格）');
 	s = await read();
 	const chatEntry = s.entry;
 	check(
@@ -182,14 +201,22 @@ try {
 		`entry=${JSON.stringify(chatEntry)} viewport=${JSON.stringify(s.viewport)}`,
 	);
 	check(
-		'入口在 session log **右边**（order 10 > session log 的 0）',
-		chatEntry !== null && s.logButton !== null && chatEntry.x >= s.logButton.x + s.logButton.w,
-		`entry.x=${String(chatEntry?.x)} log.right=${String(s.logButton?.x + s.logButton?.w)}`,
+		`入口在行内邻居（${String(s.neighbourLabel)}）**右边**（order 10 > 它们的 0）`,
+		chatEntry !== null && s.neighbour !== null && chatEntry.x >= s.neighbour.x + s.neighbour.w,
+		`entry.x=${String(chatEntry?.x)} neighbour.right=${String(s.neighbour?.x + s.neighbour?.w)}`,
 	);
-	check('入口与 session log 不相交', s.entryOverlapsLog === false, `entry=${JSON.stringify(chatEntry)} log=${JSON.stringify(s.logButton)}`);
-	check('session log 自己仍然可命中（入口没有压在它上面）', s.logHit === true, String(s.logHit));
 	check(
-		'入口就在 Session utilities 那一行里（与 session log 同一父容器）',
+		'入口与行内邻居不相交',
+		s.entryOverlapsNeighbour === false,
+		`entry=${JSON.stringify(chatEntry)} neighbour=${JSON.stringify(s.neighbour)}`,
+	);
+	check(
+		`行内邻居（${String(s.neighbourLabel)}）自己仍然可命中（入口没有压在它上面）`,
+		s.neighbourHit === true,
+		String(s.neighbourHit),
+	);
+	check(
+		'入口就在会话头部那一行里（与行内邻居同一父容器）',
 		s.entryInUtilities === true,
 		`父链：${String(s.entryParent)}`,
 	);
@@ -234,8 +261,12 @@ try {
 		s.entryLabel === '返回聊天界面' && String(s.entryTitle).includes('返回聊天') && s.entryText === '',
 		`${String(s.entryLabel)} / ${JSON.stringify(s.entryText)}`,
 	);
-	check('画布模式下入口仍与 session log 不相交', s.entryOverlapsLog === false, `entry=${JSON.stringify(canvasEntry)} log=${JSON.stringify(s.logButton)}`);
-	check('画布模式下 session log 仍可命中', s.logHit === true, String(s.logHit));
+	check(
+		'画布模式下入口仍与行内邻居不相交',
+		s.entryOverlapsNeighbour === false,
+		`entry=${JSON.stringify(canvasEntry)} neighbour=${JSON.stringify(s.neighbour)}`,
+	);
+	check('画布模式下行内邻居仍可命中', s.neighbourHit === true, String(s.neighbourHit));
 
 	// ── 3. 顶栏：视图菜单没了，纯画布独立成按钮 ──
 	console.log('\n3) 画布顶栏：没有「视图」菜单，多了一个「纯画布」');

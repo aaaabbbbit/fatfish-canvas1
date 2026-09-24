@@ -527,13 +527,22 @@ interface DshSlots {
 
 // ─────────────────────── ui-layout 的面板动作面 ───────────────────────
 
+/**
+ * ⚠️ **这些成员都声明成可选的**：平台的同名 API 随版本改过名（老版本是
+ * `openDetails` / `closeDetails`，0.1.5-rc 起是 `openRightbar` / `closeRightbar`），
+ * 而声明成必选会让调用点「看起来一定存在」——P26 就是这么炸的：一个
+ * `TypeError: closeDetails is not a function` 抛在偏好订阅链里，把后面所有订阅者全带走了
+ * （症状与这一格毫无关系：工具条上的跟焦开关点了不变）。**可选 = 调用点必须自己兜底。**
+ */
 interface DshLayout {
 	/** 切换侧边栏（关闭 ⟷ 契约默认宽度）。 */
-	toggleSidebar(): void;
-	/** 打开详情栏（已打开时为 no-op）。 */
-	openDetails(): void;
-	/** 关闭详情栏。 */
-	closeDetails(): void;
+	toggleSidebar?(): void;
+	/** 打开/关闭右侧详情栏（老版 API 名）。 */
+	openDetails?(): void;
+	closeDetails?(): void;
+	/** 打开/关闭右侧详情栏（0.1.5-rc 起的 API 名）。 */
+	openRightbar?(track: boolean, fullscreen: boolean): void;
+	closeRightbar?(): void;
 }
 
 // ────────── 会话服务（dsh-client-runtime 提供，P3 落图用） ──────────

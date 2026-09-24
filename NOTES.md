@@ -487,6 +487,13 @@ export function useViewMode(): ViewMode {
 N 张完全重叠。现在 `onDrop` 把整批交给 `dropImages()`：全部读进内存 → `dropLayout(anchor, sizes)` 算网格
 （一行 4 个、行内按前一个的**宽度**推进、行高取该行**最高者**）→ **一次** `addNodes`。第一张仍以拖放点为
 中心。为什么不复用 `nextPlacement`：那个算法的坐标以画布原点为基准，而拖进来的图必须落在**用户松手的地方**。
+- ⚠️ **落图之后会跟焦**（P26 实测，与旧注释相反）：`addNodes` 会通知画布的跟焦监听（`CanvasStage` 的
+  `subscribeNodeAdditions` → `focusNodes` → `planFocus`），一屏放不下时用 `fitRect` **缩小**把这一批
+  全带进视野 —— 实测一次拖 5 张：zoom 1 → **0.766**（视口 1032×860、包围盒 1180×660、padding 64，
+  算式 `min((1032-128)/1180, (860-128)/660)` 对得上）；单张已经可见时 `planFocus` 判 `visible`，一动不动。
+  **这是刻意保留的行为**（P26 与用户确认：一次拖十几张时「全都看得见」比「视野不动」有用），
+  `dropfiles.ts` 里那句「不带过去」的注释已改掉。**写 e2e 的人注意**：节点 `style.left/top` 是世界坐标，
+  而 `getBoundingClientRect` 是屏幕像素 —— 落图后两者差一个 zoom，直接比会假红。
 
 **③ 对齐虚线 + 自动吸附**（`snapMove` + `CanvasStage`）
 - `snapMove(moving, others, tolerance)`：六条参考线（左/中/右）两两比对，取容差内**偏移最小**的那一对；
@@ -712,6 +719,20 @@ localStorage 没有生命周期钩子，宿主也不通知客户端。后果不�
   签名是**位置参数**（`mutate(ns, ops, revision)`、`set(ref, value)`）。
 - 旧代码写的冲突码 **`settings-conflict` 永远匹配不上**，真名是 `settings/conflict`。
 
+### 3.38 前端的 `layout` 面也改过名（P26 实测，别再用老名字调）
+- 插件 `ctx.inject(['layout'])` 拿到的那个面上，**详情栏的两个方法在新版改了名**：
+  老版 `openDetails()` / `closeDetails()`（`ambient.d.ts` 里当初就是照它声明的），
+  **0.1.5-rc.3 起是 `openRightbar(track, fullscreen)` / `closeRightbar()`**
+  （在 `dsh-client-ui-layout/lib/types/client/service.d.ts` 里能看到当前签名；
+  全仓搜 `closeDetails` 已经**一个都没有**）。同一个面上还有 `selectPanel` / `beginNavigation` /
+  `toggleSidebar` / `dispose`。
+- 教训不在「改名」本身，而在**调用点怎么失败**：写死老名字 → 每次 `emit()` 抛 `TypeError`
+  → 见 §8.36（一个订阅者抛错冻住后面所有 UI，症状跟这一格毫无关系）。
+  **凡是 `ctx.inject` 进来的平台面，调用一律用可选链 + 新老名字都试**，并且
+  `ambient.d.ts` 里把成员**声明成可选**（声明成必选 = 让调用点以为它一定存在）。
+- 顺带：这类功能（进画布时收起右侧详情栏）在抛错期间是**静默失效**的 —— 用户不会看到任何报错。
+  所以「平台面调用」是新版本升级后最值得怀疑的一类代码。
+
 ---
 
 ## 4. 关键决策与理由（只列理由不显然的）
@@ -851,3 +872,59 @@ localStorage 没有生命周期钩子，宿主也不通知客户端。后果不�
 34. **无头浏览器 e2e 的令牌只在 `dsh web` 启动那一行里**（P23 解开的死结，见 STATE §0）：令牌是进程内存里的，
     落不了盘 → 「预置 localStorage → 刷新」那种玩法永远拿不到页面。**会话里也不能重启宿主**
     （`taskkill /T` 会连自己的进程树一起杀掉），要重启得由用户在终端跑。
+    **补一条 2026-09-24 才发现的**：浏览器 cookie 的**签名密钥是持久的**（`dsh-client-connection` 把它存在
+    凭据库 `~/.dsh/.credentials.yaml` 的 `client-connection:browser-session` 记录里，`initializeSecret` 只在
+    缺失时生成）—— 所以**宿主重启后用户那个已打开的页面照样能用**（旧 cookie 仍然有效），
+    别把「页面没断」当成「宿主没重启」的证据；反过来，无头浏览器没有 cookie，**必须**要那一行令牌。
+35. **`detached: true` + `windowsHide: true` 下，`cmd.exe /c <外部命令>` 的输出会凭空消失**（P26 实测，
+    Node 24.12 / Windows）：`post-restart.mjs` 用 `spawn('cmd.exe', ['/c','dsh','web'], { detached:true,
+    windowsHide:true, stdio:[ignore, logFd, logFd] })` 拉起宿主，结果 `lib/dsh-web.log` **0 字节** ——
+    带令牌的地址解析不出来，所有浏览器 e2e 都跑不动（症状：`⚠️ 没能从 lib/dsh-web.log 里解析出带令牌的地址`）。
+    实测矩阵（每条都是同一套 stdio 重定向）：
+
+    | 命令 | detached + windowsHide | 抓到的输出 |
+    |---|---|---|
+    | `cmd /c dsh --version` | 是 | **空** |
+    | `cmd /c node --version` | 是 | **空** |
+    | `cmd /c echo hello` | 是 | `hello`（cmd **内建**命令反而没事） |
+    | `cmd /c dsh --version` | 否 | `0.1.5-rc.3` |
+    | `node <dsh 入口> --version` | 是 | `0.1.5-rc.3` ✅ |
+    | `node -e "console.log(1)"` | 是 | `direct` ✅ |
+
+    结论：**别让 cmd.exe 当中间人**。`post-restart.mjs` 现在用 `process.execPath` 直接跑
+    `%APPDATA%\npm\node_modules\@deepseek-ai\dsh\lib\bin.js`（`dshEntry()`，带两处候选 + 老写法兜底）。
+    排查这类「子进程没输出」时，先按这张表**二分**：换掉 cmd、换掉 detached、换掉外部命令，一眼就定位。
+36. **一个订阅者抛错会静默冻住「排在它后面」的所有 UI**（P26 抓到的真 bug，症状离根因十万八千里）：
+    `state.ts` 的 `emit()` 原来是裸的 `for (const fn of listeners) fn();`。平台把 `layout.closeDetails`
+    改名成 **`closeRightbar`**（老名字在 0.1.5-rc.3 里已经不存在），插件在 `index.tsx` 里注册的
+    布局协同订阅者因此每次 `emit()` 都抛 `TypeError` —— 而它**注册得最早**，于是：
+    - 排在它后面的订阅者一个都收不到通知 → 工具条上的**跟焦开关点了没反应**（`aria-pressed` /
+      `data-active` / `title` 全停在初值），**而偏好其实已经写盘、刷新页面就正常**；
+    - 异常还顺着 `setXxx` 冒到点击处理器里（没人看得见）；
+    - `setMode` 的两条腿没事，因为 mode 的 DOM 事件是在 `emit()` **之前**派发的 —— 所以
+      「模式切换一直好好的、只有偏好卡住」这个组合把人往「React 订阅腿又坏了」上带偏了好几轮。
+
+    两条修法**都要**（只修一条都还会再踩）：
+    1. **调用点对平台 API 改名免疫**：`(layout.closeRightbar ?? layout.closeDetails)?.()`；
+       `ambient.d.ts` 里那几个成员**声明成可选** —— 声明成必选会让调用点「看起来一定存在」。
+    2. **`emit()` 逐个订阅者 try/catch + `console.warn`**：谁抛错谁担着，别连坐；且**不要静默**。
+
+    排查这类问题的顺序（这一轮实际走通的路径，省下几小时）：
+    ① 先确认**值本身对不对**（localStorage / 刷新后是否正常）→ 排除状态源；
+    ② 确认**面板有没有重渲染**（点「清空画布」看徽标与「全选」的 disabled：它们来自另一个 store，
+       变了就说明 React 这条链是活的）→ 排除渲染；
+    ③ 这时才怀疑订阅链，直接在 `emit()` 里给每个订阅者套 try/catch 并把 `String(error)`
+       写进 `document.body.dataset.*`，再读一次就知道**是谁抛的**（比读 bundle / 猜 React 语义快得多）。
+37. **e2e 的断言目标会随「平台版本」和「自家 UI 迭代」同时老化**（P26 一次实跑抓出 10 条假红，
+    全是这种）：`p5` 七条（菜单项数 6→10、禁用项 4→8、`nodeMenuItems[5]` 当末项、空白处右键「不出菜单」、
+    缩放 End 选中 200%→1000%）、`theme` 两条（`.ffc-toolbar .ffc-tbtn` 现在**第一个**匹配到 P18 插在
+    最前面的「运行」按钮，而它常年禁用、自身 `opacity: 0.4` → 半透明文字算出的对比度必然 < 3）、
+    `entry` 五条（`[class*="sessionLog"]` 在新版 dsh 里**整个控件都没了**）。三类写法上的教训：
+    - **数量与索引不要写死**：菜单项从一张表（`NODE_MENU`）取，末项按 `id` 找（`remove`），
+      缩放档位取**菜单里实际的末项**；
+    - **要量的元素要写清「哪一份」**：可见的那一份（`rect.w > 0`，§8.20）、**可用的**那一份
+      （`:not([disabled])` —— 禁用控件的对比度是刻意降级，WCAG 也把它排除在外）；
+    - **别把「平台自己的控件」当成插件的不变量**：`entry` 那组断言锚在 session log 上，而那个控件
+      是平台的、会随版本消失。**要锚就锚插件自己的东西**（顶栏那格、入口自身的位置/可命中/唯一性）。
+      P26 的改法：锚到「`[class*="headerUtilities"]` 里本插件之外的**最后一个**控件」—— 不变量
+      （同一行、各占一格、都不被压）与**具体是哪个平台控件**无关，平台再换也不会连累这条 e2e。

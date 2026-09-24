@@ -170,7 +170,16 @@ export function apply(ctx: Context): void {
 			// 侧边栏交给 AppFrame 自己的窄屏自动塌缩（frame 收窄后 < 1024px），
 			// 此处刻意不 toggleSidebar —— 窄屏下 toggle 会翻 narrowExpanded，
 			// 反而把侧边栏展开到被挤压的中间列上。
-			scoped.layout.closeDetails();
+			//
+			// ⚠️ **API 名随平台版本变过**（老版 `closeDetails`，0.1.5-rc 起 `closeRightbar`）：
+			// 这里必须**两个名字都试、都没有就什么都不做**。P26 实测过写死老名字的后果 ——
+			// 抛出的 TypeError 落在 `emit()` 的订阅链里，把**后面所有订阅者**全带走，
+			// 症状完全不相干：工具条上的跟焦开关点了不变（而偏好其实已经写盘）。
+			const layout = scoped.layout as {
+				closeRightbar?: () => void;
+				closeDetails?: () => void;
+			};
+			(layout.closeRightbar ?? layout.closeDetails)?.();
 		});
 		scoped.effect(() => off, 'fatfish-canvas: layout coordination');
 	});

@@ -132,8 +132,25 @@ export function subscribe(fn: () => void): () => void {
 	};
 }
 
+/**
+ * 通知所有订阅者。
+ *
+ * ⚠️ **一个订阅者抛错不能影响其余的**（P26 抓到的真 bug）：原来是裸的
+ * `for (const fn of listeners) fn();` —— 只要有一个抛错，**排在它后面的订阅者一个都收不到
+ * 通知**，异常还会冒到调用点（`setXxx` → 点击处理器）。实测症状完全不相干：平台把
+ * `layout.closeDetails` 改名成 `closeRightbar` 之后，插件里那个布局协同订阅者每次都抛
+ * `TypeError`，于是工具条上的跟焦开关点了毫无变化（偏好其实已经写盘、刷新就正常）。
+ * 这类「一个坏订阅者冻住别的 UI」极难从表象反推，所以就地隔离：谁抛错谁担着，
+ * 但**留一条 warn**（不静默 —— 否则下次更难查）。
+ */
 function emit(): void {
-	for (const fn of listeners) fn();
+	for (const fn of listeners) {
+		try {
+			fn();
+		} catch (error) {
+			console.warn('[fatfish-canvas] 一个偏好订阅者抛错了（其余订阅者不受影响）', error);
+		}
+	}
 }
 
 /** 当前模式。 */

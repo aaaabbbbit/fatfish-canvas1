@@ -25,6 +25,35 @@ import { PACKAGE_ROOT, RESET_BOARD_PREFS, seedBoardExpression, click, evaluate, 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 const SHOT = resolve(PACKAGE_ROOT, 'lib/e2e-p5.png');
 
+/**
+ * 节点右键菜单的完整动作表（**就是渲染顺序**，见 `NodeMenu.tsx` 的 `entries`）。
+ *
+ * 为什么要有这张表：加菜单项会打断写死数量/索引的键盘用例 —— P7 加隔离开关时打断过一次
+ * （NOTES §8.18），P18 加「导出 / 还原」、P20 加「运行此节点 / 复制为新节点」又打断了一次
+ * （P26 实跑时 7 条红）。数量与顺序都从这一处取，以后加项只改这里。
+ */
+const NODE_MENU = [
+	'带到视野',
+	'复制提示词',
+	'复制地址',
+	'导出带工作流的 PNG',
+	'还原工作流',
+	'运行此节点',
+	'复制为新节点',
+	'重新生成',
+	'以此为参考图生成',
+	'删除',
+];
+
+/**
+ * 拿一个「什么都没有」的生成中节点（种子里那个 `bare`）时必须禁用的动作 id。
+ *
+ * 全是**由数据决定**的：没有提示词 / 没有地址 / 没有工作流 / 不是生成节点 / 不可复制 /
+ * 不能重新生成 / 不能当参考图。刻意不写「一共几个」——数量会随加项变化，而**哪些该禁用**
+ * 才是语义（NOTES §8.18 的教训）。
+ */
+const DISABLED_ON_BARE = ['copy-prompt', 'copy-src', 'export-png', 'restore', 'run-node', 'duplicate', 'regenerate', 'reference'];
+
 let failures = 0;
 const results = [];
 const check = (label, ok, detail = '') => {
@@ -62,6 +91,8 @@ const PROBE = `(() => {
       };
     }),
     hasNodeMenu: menu !== null,
+    /** 是哪一个菜单：节点操作（aria-label 为「节点操作」）还是空白处右键那个（「新建节点」）。 */
+    menuAria: menu ? menu.getAttribute('aria-label') : null,
     nodeMenuRect: rect(menu),
     nodeMenuItems: qa('.ffc-node-menu .ffc-menu-item').map((b) => ({
       id: b.id,
@@ -98,6 +129,12 @@ const PROBE = `(() => {
     })(),
     hasZoomMenu: q('.ffc-zoom-menu') !== null,
     zoomPercent: q('.ffc-zoom-pct') ? (q('.ffc-zoom-pct').textContent || '').trim() : null,
+    /** 缩放档位菜单里的档位（按渲染顺序）——「End 跳末项」那条断言按**末项实际值**验，不写死 200%。 */
+    zoomMenuItems: qa('.ffc-zoom-menu .ffc-menu-item').map((b) => ({
+      label: (b.textContent || '').trim(),
+      navActive: b.getAttribute('data-nav-active') === 'true',
+      checked: b.getAttribute('aria-checked') === 'true',
+    })),
     follow: (() => {
       const b = qa('.ffc-toolbar button').find((x) => x.getAttribute('aria-label') === '新节点自动带进视野');
       return b ? b.getAttribute('aria-pressed') === 'true' : null;
@@ -206,12 +243,14 @@ try {
 	);
 	check('菜单可以被命中（没有被别的层挡住）', s.menuHit === true, String(s.menuHit));
 	const labels = s.nodeMenuItems.map((i) => i.label).join(' / ');
-	check('菜单有 6 个动作', s.nodeMenuItems.length === 6, labels);
 	check(
-		'动作齐全：带到视野 / 复制提示词 / 复制地址 / 重新生成 / 以此为参考图生成 / 删除',
-		['带到视野', '复制提示词', '复制地址', '重新生成', '以此为参考图生成', '删除'].every((want) =>
-			s.nodeMenuItems.some((item) => item.label.includes(want)),
-		),
+		`菜单有 ${String(NODE_MENU.length)} 个动作（数量取自 NODE_MENU，不是写死的数字）`,
+		s.nodeMenuItems.length === NODE_MENU.length,
+		labels,
+	);
+	check(
+		`动作齐全且顺序一致：${NODE_MENU.join(' / ')}`,
+		NODE_MENU.every((want, index) => (s.nodeMenuItems[index]?.label ?? '').includes(want)),
 		labels,
 	);
 	check(
@@ -231,9 +270,10 @@ try {
 	await rightClick(bare.center.x, bare.center.y);
 	s = await read();
 	check(
-		'生成中的节点：四个依赖内容的动作都禁用',
-		s.nodeMenuItems.filter((i) => i.disabled === true).length === 4,
-		JSON.stringify(s.nodeMenuItems.map((i) => `${i.label}:${String(i.disabled)}`)),
+		'生成中的节点：依赖内容/种类的动作全部禁用（只有「带到视野」与「删除」还可用）',
+		s.nodeMenuItems.filter((i) => i.disabled === true).map((i) => i.id).join(',') === DISABLED_ON_BARE.join(',') &&
+			s.nodeMenuItems.filter((i) => i.disabled !== true).map((i) => i.id).join(',') === 'focus,remove',
+		JSON.stringify(s.nodeMenuItems.map((i) => `${i.id}:${String(i.disabled)}`)),
 	);
 	check(
 		'禁用项写明了原因（不是一句「当前不可用」）',
@@ -245,7 +285,11 @@ try {
 
 	await press('ArrowDown', 'ArrowDown', 40);
 	s = await read();
-	check('按 ↓ 高亮第一项', s.nodeMenuItems[0]?.navActive === true, JSON.stringify(s.nodeMenuItems.map((i) => i.navActive)));
+	check(
+		'按 ↓ 高亮第一项',
+		s.nodeMenuItems.find((i) => i.id === 'focus')?.navActive === true,
+		JSON.stringify(s.nodeMenuItems.map((i) => i.navActive)),
+	);
 	check(
 		'容器暴露 aria-activedescendant（无障碍与激活态都靠它）',
 		typeof s.activeId === 'string' && s.activeId !== '',
@@ -254,16 +298,24 @@ try {
 	await press('ArrowDown', 'ArrowDown', 40);
 	s = await read();
 	check(
-		'按 ↓ 一次跳过四个禁用项，直接落到「删除」',
-		s.nodeMenuItems[5]?.navActive === true,
+		'按 ↓ 一次跳过全部禁用项，直接落到唯一还可用的大动作「删除」',
+		s.nodeMenuItems.find((i) => i.id === 'remove')?.navActive === true && s.activeLabel === '删除',
 		`高亮=${String(s.activeLabel)}`,
 	);
 	await press('ArrowDown', 'ArrowDown', 40);
 	s = await read();
-	check('按 ↓ 到末尾后回到第一项（循环）', s.nodeMenuItems[0]?.navActive === true, String(s.activeLabel));
+	check(
+		'按 ↓ 到末尾后回到第一项（循环）',
+		s.nodeMenuItems.find((i) => i.id === 'focus')?.navActive === true,
+		String(s.activeLabel),
+	);
 	await press('ArrowUp', 'ArrowUp', 38);
 	s = await read();
-	check('按 ↑ 从第一项回到最后一项', s.nodeMenuItems[5]?.navActive === true, String(s.activeLabel));
+	check(
+		'按 ↑ 从第一项回到最后一项',
+		s.nodeMenuItems.find((i) => i.id === 'remove')?.navActive === true,
+		String(s.activeLabel),
+	);
 	await press('Escape', 'Escape', 27);
 	s = await read();
 	check('Esc 关闭菜单', s.hasNodeMenu === false);
@@ -276,20 +328,28 @@ try {
 	check('右键「有内容」的节点后菜单出现', s.hasNodeMenu === true);
 	check(
 		'有提示词与地址的节点：复制提示词 / 复制地址都可用',
-		s.nodeMenuItems[1]?.disabled === false && s.nodeMenuItems[2]?.disabled === false,
-		JSON.stringify(s.nodeMenuItems.map((i) => `${i.label}:${String(i.disabled)}`)),
+		s.nodeMenuItems.find((i) => i.id === 'copy-prompt')?.disabled === false &&
+			s.nodeMenuItems.find((i) => i.id === 'copy-src')?.disabled === false,
+		JSON.stringify(s.nodeMenuItems.map((i) => `${i.id}:${String(i.disabled)}`)),
 	);
 	check(
 		'「重新生成」在会话可用时是启用的（可用性由提示词与会话共同决定）',
-		s.nodeMenuItems[3]?.disabled === false,
-		JSON.stringify(s.nodeMenuItems[3]),
+		s.nodeMenuItems.find((i) => i.id === 'regenerate')?.disabled === false,
+		JSON.stringify(s.nodeMenuItems.find((i) => i.id === 'regenerate')),
 	);
 	await press('Escape', 'Escape', 27);
 
 	// ── 3. 空白处右键 ──
+	// ⚠️ P18 起这里**会**出菜单（空白处右键 = 新建节点），所以断言从「不出菜单」改成
+	// 「出的是**画布菜单**、不是节点操作菜单」。两个菜单复用了同一个类名 `.ffc-node-menu`，
+	// 靠 `aria-label` 区分（节点操作 / 新建节点）。
 	await rightClick(Math.round(s.viewport.x + s.viewport.w - 60), Math.round(s.viewport.y + s.viewport.h - 60));
 	s = await read();
-	check('空白处右键不出菜单（只吞掉浏览器默认菜单）', s.hasNodeMenu === false);
+	check(
+		'空白处右键弹出的是**画布菜单**（新建节点），不是节点操作菜单',
+		s.hasNodeMenu === true && s.menuAria === '新建节点',
+		`aria-label=${String(s.menuAria)} 项=${JSON.stringify(s.nodeMenuItems.map((i) => i.label))}`,
+	);
 
 	// ── 4. 带到视野 ──
 	// ⚠️ 每次动作之后都要**重新读坐标**：动作本身会移动视口（甚至是带 240ms 动画的），
@@ -326,7 +386,11 @@ try {
 	await press('ArrowDown', 'ArrowDown', 40);
 	await press('ArrowDown', 'ArrowDown', 40);
 	s = await read();
-	check('高亮停在「复制提示词」', s.nodeMenuItems[1]?.navActive === true, String(s.activeLabel));
+	check(
+		'高亮停在「复制提示词」',
+		s.nodeMenuItems.find((i) => i.id === 'copy-prompt')?.navActive === true,
+		String(s.activeLabel),
+	);
 	await press('Enter', 'Enter', 13);
 	await sleep(400);
 	s = await read();
@@ -353,7 +417,11 @@ try {
 	await rightClick(doomed.center.x, doomed.center.y);
 	await press('End', 'End', 35);
 	s = await read();
-	check('按 End 直接跳到最后一个动作（删除）', s.nodeMenuItems[5]?.navActive === true, String(s.activeLabel));
+	check(
+		'按 End 直接跳到最后一个动作（删除）',
+		s.nodeMenuItems.find((i) => i.id === 'remove')?.navActive === true,
+		String(s.activeLabel),
+	);
 	await press('Enter', 'Enter', 13);
 	await sleep(400);
 	s = await read();
@@ -419,14 +487,17 @@ try {
 	s = await read();
 	const before = s.zoomPercent;
 	check('缩放档位菜单已打开', s.hasZoomMenu === true);
+	// 「End 跳末项」按**菜单里实际的末项**验（档位表是 `ZoomControls.PRESETS`，P26 实跑时
+	// 末项是 1000%，而老断言写死 200% —— 档位表一变就假红）。
+	const lastPreset = s.zoomMenuItems.at(-1)?.label ?? null;
 	await press('End', 'End', 35);
 	await press('Enter', 'Enter', 13);
 	await sleep(450);
 	s = await read();
 	check(
-		'方向键 + Enter 改缩放（End 选中 200%）',
-		s.zoomPercent === '200%' && before !== '200%',
-		`${String(before)} -> ${String(s.zoomPercent)}`,
+		`方向键 + Enter 改缩放（End 选中末项 ${String(lastPreset)}）`,
+		lastPreset !== null && s.zoomPercent === lastPreset && before !== lastPreset,
+		`${String(before)} -> ${String(s.zoomPercent)}（菜单末项=${String(lastPreset)}，全部档位=${JSON.stringify(s.zoomMenuItems.map((i) => i.label))}）`,
 	);
 
 	const shot = await browser.cdp.send('Page.captureScreenshot', { format: 'png' });

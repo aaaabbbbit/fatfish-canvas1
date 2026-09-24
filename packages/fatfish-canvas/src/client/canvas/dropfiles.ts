@@ -227,8 +227,11 @@ async function dropImages(files: readonly File[], at: { x: number; y: number }):
 	const foreign = items.filter((item) => item.workflow?.kind === 'foreign').length;
 	if (ours > 0) pushNotice('检测到工作流：右键这张图 →「还原工作流」');
 	else if (foreign > 0) pushNotice('这张图带的是 ComfyUI 的工作流，本版本还不能还原');
-	// 拖进来的东西落点由用户决定，跟焦只会把视野抢走 —— `addNodes` 只选中它们，
-	// 不带过去（这正是想要的行为）。
+	// 落点由用户决定（第一张就落在松手那一点），但**跟焦照常生效**：`addNodes` 会通知
+	// 画布的跟焦监听，`planFocus` 在一屏放不下时用 `fitRect` 缩小、把这一批全带进视野
+	// （P26 实测：一次拖 5 张，zoom 1 → 0.766），单张已经可见时则一动不动。
+	// ⚠️ 这是**刻意保留**的行为（P26 与用户确认过）：一次拖十几张时「全都看得见」比
+	// 「视野一动不动」有用。旧注释写的「不带过去」与实现不符，已改掉。
 
 	// P22：顺手请宿主把这些内联图存成**参考图句柄**。不这么做的话，本地拖进来的图
 	// 连不上生成节点 —— 几兆的 data: URL 塞不进 `/generate --ref` 那一行。

@@ -1,7 +1,7 @@
 # 肥鱼画布 · 状态交接
 
 > **跨上下文压缩的唯一记忆。新会话只读这一份，不要依赖对话历史。**
-> 最后更新：**P25**（会话画布的回收）。
+> 最后更新：**P26**（P17 三件事的浏览器 e2e 脚本 + 宿主重启标记核对）。
 >
 > **配套文件**：平台事实（§3）· 关键决策理由（§4）· 坑与教训（§8）已拆到 **`NOTES.md`** ——
 > 那是「动手时按需查」的参考资料，**接手时不用读**。本文件里写的 `NOTES §x.y` 就是指向它。
@@ -24,10 +24,18 @@
    `git diff checkpoint-p25` 是「检查点之后做了什么」的进度视图。
    ⚠️ **`git checkout .` / `reset --hard` / `git clean` 仍然危险**：抹掉的是检查点之后的全部改动
    （可能已是好几轮的工作）；要丢之前先 `git stash -u` 或提交一次。它**未经真机验证，不是完工标志**。
+   （2026-09-22 核对：工作树**干净**，`checkpoint-p25` == `786d3e3`，即检查点已覆盖 P25 之前的全部实现。
+   **P26 的改动随后已另行提交入库**，从那之后工作树再次干净 —— 所以现在 `git status` 干净 ≠ 可以随便
+   `reset`，地板仍是 `checkpoint-p25`。）
 2. **动手前先跑** `cd packages/fatfish-canvas && npm run check`（构建 + typecheck + 430 画布逻辑 +
    221 宿主 + 客户端冒烟，无需额外权限），确认拿到的是绿色的工作区。数字随每轮增长，别当契约。
-3. **下一步**：① 在**用户自己的终端**跑 `node scripts/post-restart.mjs --delay 20000 --e2e e2e-canvas.mjs`，
-   把 P23 改过的 3 条陈旧断言验掉（§7.2）；② §7.13（P17 三件事的浏览器 e2e，照 `e2e-graph.mjs` 写）。
+3. **下一步**：① ② **都已验完**（P26 实跑：`e2e-canvas` 26/26、`e2e-p17` 41/41），下面两条命令留着备查 ——
+   以后要重跑它们，**会话里自己跑就行**（`lib/web-url.txt` 里有令牌，见硬事实 5），不必再麻烦用户：
+   ① `node scripts/post-restart.mjs --delay 20000 --e2e e2e-canvas.mjs`（验 P23 改过的 3 条陈旧断言，§7.2）；
+   ② `node scripts/post-restart.mjs --delay 20000 --e2e e2e-p17.mjs`（P17 三件事，§7.13）。
+   ⚠️ **P26 之前 ① 是坏的**（cmd 中介吃掉了 `dsh web` 的输出 → 那句「没能解析出带令牌的地址」）；已修，见硬事实 4。
+   真正还剩的下一步在 §7：P17–P22 的**手测**（脚本量不到「质感」与真拖放那一路）、`p4 / p5` 的陈旧断言、
+   接真 ComfyUI（§7.3）。
    （§7.1 的 i18n 仍然是**有意不做**。）
 
 **怎么跑**（从便宜到贵）：
@@ -41,20 +49,34 @@ npm run e2e            # 26 项画布交互（**3 条断言待重跑**，见 §7
 npm run e2e:p4 / e2e:p5 / e2e:theme / e2e:scope / e2e:entry / e2e:settings
 npm run e2e:command / e2e:ingest
 npm run e2e:graph      # P18 连线 / 连接点 / 鼠标点菜单 / 双击编辑（61 项，需带令牌的 DSH_WEB_URL）
+npm run e2e:p17        # P17 三件事：生成模型格 / 一次拖 5 张 / 对齐吸附（**新写的，还没跑过**，同上要令牌）
 npm run restart:verify # 重启 dsh web + 自动跑 e2e:settings / e2e:command / e2e:graph（§6.1）
 node scripts/post-restart.mjs --delay 20000 --e2e <脚本>   # 只跑一条（会先重启宿主）
 ```
 
-**当前状态**：P0–P23、P25 完成（P24「输入框旁生成按钮」做过一版被用户否掉、已整套回退，见 §7.6）。
-浏览器证据：`e2e-graph` **61/61 实跑全绿**，并当场修掉两个真 bug（NOTES §3.35）。**P17–P22 仍然只有离线证据**。
+**当前状态**：P0–P23、P25、P26 完成（P24「输入框旁生成按钮」做过一版被用户否掉、已整套回退，见 §7.6）。
+P26 四件事：① 修掉 `post-restart.mjs` 拉不起令牌的真 bug（NOTES §8.35）② P17 三件事的浏览器 e2e
+（`scripts/e2e-p17.mjs` / `npm run e2e:p17`）**写完并实跑全绿** ③ **修掉一个真 bug**：跟焦开关点了
+显示不变（根因是平台把 `layout.closeDetails` 改名成 `closeRightbar`，插件里那个订阅者每次抛
+`TypeError`，把 `emit()` 后面**所有**订阅者一起带走 —— 详见 NOTES §8.36）④ 顺手把 `p5` / `theme`
+的老化断言按新语义改对。
+浏览器证据（P26 实跑，全部用会话里的令牌，不必重启宿主）：
+`e2e-canvas` **26/26**（§7.2 那 3 条陈旧断言验掉了）、`e2e-p4` **56/56**（跟焦那条真 bug 已修）、
+`e2e-p5` **47/47**（7 条陈旧断言已按新菜单语义重写）、`e2e-theme` **15/15**（目标从「第一个
+`.ffc-tbtn`」改成「第一个**可用**的」，那条一直在量禁用按钮的 0.4 透明文字）、`e2e-entry` **39/39**
+（锚点从平台那个已经消失的 session log 换成「同行邻居」，见 NOTES §8.37）、`e2e-scope` **26/26**、
+`e2e-p17` **41/41**（1 条 SKIP：宿主没配视频模型）、`e2e-graph` **61/61**（P23）。
+**P18–P22 仍然只有离线证据**（宿主那半边已生效，但没在真机上走一遍）。
 离线：430 画布 + 221 宿主 + 客户端全套（`npm run check` 全绿）。
-浏览器：canvas 26（**待重跑**）/ p4 56 / p5 45（P12 起 48）/ theme 15 / scope 26 / entry 38 /
-settings 19 / command 13 / **graph 61（P23 实跑）**。
-⚠️ `p4 / p5` 是 P10–P12 时代的数字，**P19/P20 往节点菜单加了四项**（NOTES §8.18），所以 `e2e-p5` 的
-「菜单有 6 个动作」这类断言**现在多半是红的**，重跑前先按新菜单项改。
-宿主最后一次重启是 **2026-09-20 09:29**（`lib/host-status.json` 里 `command` + `models` 都在）。
+宿主最后一次重启是 **2026-09-24 21:36**（`lib/host-status.json` 的 `at` = `2026-09-24T13:36:21Z`）——
+那是 P26 修好 `post-restart.mjs` 之后第一次**成功**抓到令牌的重启，`lib/web-url.txt` 里有带令牌的地址
+（宿主活着期间一直有效，会话里可以直接拿来跑 e2e，见下面的硬事实 5）。
+⚠️ **P26 改的是客户端半边**（`state.ts` / `index.tsx` / `ambient.d.ts`）：`node build.mjs` 之后
+**刷新页面即生效**，不需要重启宿主；用户那个已打开的页面**要刷新一次**才拿到这版修复。
 
-**⚠️ 等重启**：宿主半边有**五批**改动没生效（`lib/` 已重建，运行中的 dsh web 还是旧模块）：
+**⚠️ 等重启**：**空**（2026-09-22 07:10 那次重启把 P11 / P12 / P13 / P18 / P22 全部带上了）。
+下次改宿主仍然必须重启（NOTES §3.4），用 `npm run restart:verify` 一条命令完成「重启 + 验证」，见 §6.1。
+留着这份清单是为了记住**当时等的是什么**（下面这几条都已经在跑的宿主里了，别再重复排查）：
 
 - **P11**：供应商报错文案 + 视频端点换路径（`host/probe.ts` / `host/providers.ts`）。
 - **P12**：**参考图**（新模块 `host/reference.ts` + `host/session-images.ts`、`host/providers.ts`
@@ -64,13 +86,9 @@ settings 19 / command 13 / **graph 61（P23 实跑）**。
   `schema.ts` 的 `kind:'vision'` + `defaultVision`、`probe.ts` 的 `guessKind` 认视觉模型名）。
 - **P18**（只有一处，但很关键）：`src/client/shared/media.ts` 的 `parseGenerateLine` 多认一个
   `--wf <节点 id>`。**这个文件宿主也在用**（`host/command.ts` 反向引用它）→ 旧宿主会把 `--wf`
-  当成「未知参数」直接报错，症状是点「运行」之后生成节点立刻失败。重启之前，画布上的
-  连线 / 节点 / 导出 / 还原**都能用**，只有「运行工作流」走不通。
+  当成「未知参数」直接报错，症状是点「运行」之后生成节点立刻失败。
 - **P22**：`mediaProbe` 多一个 `storeReference` 方法（`host/probe.ts` + `index.ts` 的附件写入面接线 +
-  `shared/probe.ts` 的共享描述符）。不重启则本地拖进来的图仍然连不上生成节点，其余功能不受影响
-  （客户端已能优雅降级：调用失败只留一句提示，不会崩）。
-
-下次改宿主仍然必须重启（NOTES §3.4），用 `npm run restart:verify` 一条命令完成「重启 + 验证」，见 §6.1。
+  `shared/probe.ts` 的共享描述符）。旧宿主下本地拖进来的图连不上生成节点。
 
 **P17–P22 待真机验证**（刷新页面后走一遍；P23 已把它自己那两条验掉）：
 
@@ -96,6 +114,10 @@ settings 19 / command 13 / **graph 61（P23 实跑）**。
 - **P17 主界面三件事**：本体模型名**左边**那格「✦ 图像 acme-large」（朝上弹的菜单、两页签、选中带勾）
   → 选一个会写进设置（设置页下拉同步变）；一次拖 5 张图 → 一行 4 个 + 第二行 1 个，互不重叠；
   拖节点靠近另一个 → 出现虚线并「啪」地贴上去，按住 **Alt** 拖 = 不吸附。
+  ⚠️ P26 起这三件事有**脚本**了（`npm run e2e:p17`，`scripts/e2e-p17.mjs`）：它验的是
+  「菜单挂 body / 在触发器上方 / 不出视口 / 页签换清单 / 选中写进宿主设置 / 5 张的坐标网格 /
+  辅助线读数 + 精确吸附 + Alt 关掉」。**手测仍然值得做**，因为脚本量不到「看着像不像官方那一格」
+  （字体、间距、阴影的质感），也量不到真从资源管理器拖进来的那一路。
 
 **三条硬约束**（违反会浪费大量时间）：
 - **无头 Chrome 需要命名管道**：所有 `e2e` / `probe` 必须在 `danger-full-access` 下运行，否则以
@@ -104,7 +126,7 @@ settings 19 / command 13 / **graph 61（P23 实跑）**。
   `>` 重定向写成 UTF-16 → 全文变乱码（NOTES §8.1）。PowerShell 只用来跑命令。
 - **宿主改动必须写进本文件的「等重启」清单**，否则下个会话会以为它已生效。
 
-**⚠️ 浏览器 e2e 现在怎么跑**（四条硬事实，别再踩）：
+**⚠️ 浏览器 e2e 现在怎么跑**（五条硬事实，别再踩）：
 1. **不能在会话里重启宿主**：`taskkill /PID <dsh web> /T /F` 会把**我自己的进程树**一起杀掉
    （实测 `post-restart.mjs` 就死在 taskkill 那一行，宿主 PID 反而活着）→「重启 + 验证」必须由
    **用户在自己的终端**跑。
@@ -116,6 +138,15 @@ settings 19 / command 13 / **graph 61（P23 实跑）**。
 4. **令牌只在 `dsh web` 启动那一行里**（进程内存、落不了盘）→ `post-restart.mjs` 把宿主输出写
    `lib/dsh-web.log`、解析出**带令牌的地址**写 `lib/web-url.txt`、经 `DSH_WEB_URL` 回灌给 e2e 子进程
    （`--e2e <脚本>` 可只跑一条）。「无头浏览器一律 401」这个结了五轮的死结就是这里解开的。
+   ⚠️ **P26 修了这条链路的一个真 bug**：`cmd.exe /c dsh web` + `detached` + `windowsHide` 会让
+   `dsh-web.log` **永远是 0 字节**（cmd 起的**外部进程**的输出进不了那个句柄，cmd 内建命令反而没事）→
+   令牌解析不出来、e2e 直接跳过。现在改用 `process.execPath` 直接跑 dsh 入口（`dshEntry()`），
+   实测矩阵与排查办法见 **NOTES §8.35**。
+5. **一旦 `lib/web-url.txt` 存在，会话里就能自己跑 e2e**（不必再重启）：那个令牌在宿主**活着**期间一直有效，
+   所以 `$env:DSH_WEB_URL = (Get-Content lib/web-url.txt); node scripts/e2e-xxx.mjs`（danger-full-access）
+   就能跑任意一条。**代价：只在这一个宿主进程的生命周期内有效** —— 宿主一重启（或用户跑一次
+   `post-restart.mjs`）就换新令牌，得重新读那个文件。**这条让「写一条 e2e」和「验一条 e2e」不再需要
+   用户来回切终端。**
 
 ---
 
@@ -206,7 +237,7 @@ packages\fatfish-canvas\
 │                        CanvasStage / NodeCard / NodeMenu / ZoomControls
 └── scripts\             lib/cdp.mjs（CDP 基建 + RESET_BOARD_PREFS）· test-model / test-host /
                          verify-client · e2e-canvas / e2e-p4 / e2e-p5 / e2e-theme / e2e-scope /
-                         e2e-entry / e2e-settings / e2e-command / e2e-ingest / e2e-graph ·
+                         e2e-entry / e2e-settings / e2e-command / e2e-ingest / e2e-graph / e2e-p17 ·
                          fake-media-server（含 /models）· probe-gui + probe-*.js ·
                          post-restart.mjs（重启宿主 + 自动验证，见 §6）
 ```
@@ -252,6 +283,7 @@ node scripts/probe-gui.mjs --expr-file scripts/probe-composer.js --json lib/prob
 | `verify-client.mjs` | 惰性契约、factory 物化、apply 不抛错、深度渲染（工具行三态 + 参考图徽标与描述行 / 工具条 / 纯画布 / 快捷键与 Esc / 刷新自救 / composer 生成模型格）、作用域 × 桥 × 工具条读数、设置页三个模型下拉 |
 | `e2e-canvas.mjs` | 只有真实浏览器能暴露的：事件派发、指针捕获、锚点几何（**P23 起 3 条断言按 P15 语义重写，待重跑**） |
 | `e2e-graph.mjs` | 连接点纯 CSS 悬停淡入 / 拖出连线（端点落在**用户拉的那个点**上）/ 10% 缩放下连接点仍 28px / 非法连线逐条理由 / **鼠标点菜单项**（P21 回归）/ 双击文字节点内联编辑 |
+| `e2e-p17.mjs` | **P26 写完并实跑 41/41**：composer 生成模型格（菜单挂 `document.body`、在触发器**上方**、不出视口、右缘对齐、两页签是两份清单、鼠标选中 → **宿主设置真的变了**再恢复）/ 合成 5 个文件的 drop（一行 4 个 + 第二行 1 个、间距按各自宽度、任意两张不重叠、第一张以拖放点为中心）/ 对齐吸附（`data-guide-count` 读数、松手后精确对齐、Alt = 不吸附） |
 | `e2e-p4.mjs` | 按钮真的可点、纯画布下 overlay 仍可命中、布局真的重排与恢复、作用域读数真的点得动、模式切换走真实控件 |
 | `e2e-p5.mjs` | `contextmenu` 与光标坐标、菜单命中测试、按键真的到达菜单、`aria-activedescendant`、剪贴板、作用域读数开关、「以此为参考图生成」的可用性与禁用原因 |
 | `e2e-theme.mjs` | 设计 token 在两套主题下的真实取值与对比度（CSS 变量解析、alpha 合成、渐变盲区） |
@@ -275,6 +307,19 @@ node scripts/probe-gui.mjs --expr-file scripts/probe-composer.js --json lib/prob
   （那是**组件草稿**），宿主读到的却是空值。正解：`el.focus()` + `Input.insertText` + 点别处造成**真实失焦**。
 - `e2e-ingest` / `e2e-command` 每次运行会**在宿主里新建一个会话**（真实链路的代价）；
   `e2e-scope` 会在探针 profile 里留下一个会话画布键（无害）。
+- `e2e-p17` 会**往宿主的参考图库里塞 5 个几 KB 的小 PNG**（它合成的那批图走的正是「本地图落画布」
+  那条路，P22 会顺手存句柄），并覆盖探针 profile 里的画布；它在 ① 里会**临时改一次默认图像模型再改回来**
+  （原来的值从菜单里那条带勾的选项读出来，改不回去就是 FAIL）。
+- `e2e-p17` 的 ① 依赖**宿主里至少有一个图像模型**（没有就只验空态与页签，那条「写进设置」记 ⏭）。
+- `e2e-p17` 的 ② 会在落图后**跟焦**（一屏放不下就缩小把这一批带进视野，实测 zoom 1 → 0.766）——
+  所以它比几何时**必须换算世界坐标**（`box.w / zoom` + `stage/vx/vy`），拿屏幕像素直接跟
+  `style.left`（世界坐标）比会假红。第一版就是这么红的。
+- **`e2e-p5` 的菜单断言从一张表取**：`NODE_MENU`（`scripts/e2e-p5.mjs` 顶部）写着动作表与顺序，
+  数量/齐全/末项都从它算；**以后往节点菜单加一项，只改这张表 + `DISABLED_ON_BARE`**，
+  别再出现「写死 6 项」那种假红（NOTES §8.18 / §8.37 就是这个教训）。
+- **`e2e-theme` 只查「可用」的工具条按钮**（`:not([disabled])`）：`.ffc-tbtn` 禁用时自身
+  `opacity: 0.4`，半透明文字算出来的对比度必然不达标；P18 把「运行」插到这一组最前面之后，
+  这个目标一直在量那个常年禁用的按钮（NOTES §8.37）。
 
 ---
 
@@ -316,8 +361,10 @@ npm run restart:verify      # = node scripts/post-restart.mjs --delay 5000 --ver
 **未做但有价值（按价值排序）**
 1. **i18n**：文案目前内联中文。落地需接 DSH 的 locale 面（`slots.installLocale` / 组件 `t` 座位）
    并集中到 `shared/strings.ts`。**有意不做**（只面向中文用户）。
-2. **`e2e-canvas.mjs` 的 3 条陈旧断言**（P15 的输入框聚焦语义 + 框选起点落在种子节点里）：已按诊断改好，
-   但**改完这一版还没跑过** —— 在用户终端跑 `node scripts/post-restart.mjs --delay 20000 --e2e e2e-canvas.mjs`。
+2. ~~**`e2e-canvas.mjs` 的 3 条陈旧断言**~~ ✅ **P26 实跑 26/26 全绿**（那 3 条是 P15 的输入框聚焦语义 +
+   框选起点落在种子节点里）。留着的两条事实：无头浏览器直接开 `http://127.0.0.1:3080` 一律 401
+   （实测：页面全空、7 项全红），令牌只在 `dsh web` 启动那一行里 → 走 `post-restart.mjs` 拿，
+   拿到的地址在 `lib/web-url.txt`（硬事实 4/5）。
 3. **接真 ComfyUI 后端**（用户最初问的另一条路）：节点类型从 `GET /object_info` 动态渲染 + `POST /prompt` +
    轮询 `/history`。元数据那半边（`pngmeta.ts`）已就绪、`workflow` 键名与结构就是照它做的；缺的是通用节点
    渲染与「一个连接点怎么选多个插槽」。
@@ -340,21 +387,34 @@ npm run restart:verify      # = node scripts/post-restart.mjs --delay 5000 --ver
 11. **`/generate` 补充语法**：`--n 4`（配合第 7 项）、`--from <节点 id>`（以节点为参考图）。
 12. **模型级密钥的「测试连接」**：现在探测按**供应商**做，模型级密钥只在生成时生效。
     要做「用这个模型的密钥测一次」得让探测接受可选的 `modelId`。
-13. **P17 的三件事还没有浏览器 e2e**（只有离线证据）：① composer 那格点开 → 菜单真的挂在 `document.body`
-    上、位置在触发器**上方**且不出视口 → 页签切换 → 选中 → **宿主设置里真的变了**（照 `e2e-settings.mjs`
-    自起假服务、自己清理的路子）；② 造一个多文件的合成 `drop`（`DataTransfer` 里塞 3–5 个 `File`）
-    断言落点各不相同；③ 拖一个节点靠近另一个，读 `data-guide-count` 与吸附后的坐标。
-    ⚠️ 量这一格时必须按「可见的那一份」挑（`rect.w > 0`，NOTES §8.20）。三条都需要带令牌的 `DSH_WEB_URL` +
-    danger-full-access —— P23 起有现成办法：`node scripts/post-restart.mjs --delay 20000 --e2e <脚本>`。
+13. ~~**P17 的三件事还没有浏览器 e2e**~~ ✅ **P26 已写完并实跑 41/41 全绿**（`scripts/e2e-p17.mjs` /
+    `npm run e2e:p17`；1 条 SKIP：宿主里没配视频模型）。三条覆盖：① 菜单挂 `document.body`、位置在触发器
+    **上方**且不出视口 → 页签切换 → 选中 → **宿主设置里真的变了**（读完再恢复原值）；② 合成一个 5 文件的
+    `drop`（`DataTransfer` 里塞真 PNG）断言落点各不相同；③ 拖一个节点靠近另一个，读 `data-guide-count`
+    与吸附后的坐标（含 Alt 关掉吸附）。踩过的两个坑都写进 §5 了（「可见的那一份」+ 落图后的跟焦缩放换算）。
 14. **对齐吸附的下一步**（只有真有人抱怨才做）：等间距 / 分布对齐、逐个元素对齐（现在是整组包围盒）、
     把吸附做成可关的偏好（现在只有 Alt 临时关）。
 15. **一个独立的 `describe_image` 工具**：现在「看图」只在生成流程里顺带产出（NOTES §3.25），
     让模型能单独看图是同一套机械的下一个出口。
+16. ~~**`e2e-entry` 那 5 条要重写**~~ ✅ **P26 已按用户选择换锚点**（39/39 全绿）：原来的锚是平台的
+    `sessionLog` 控件，而新版 dsh 里那个控件**整个不存在了**（全文档搜不到它的类名；头部那一行现在
+    是 工作目录 / 选择打开方式 / 更多操作 / 入口）。现在锚在「`[class*="headerUtilities"]` 里本插件之外的
+    最后一个控件」——**要守的不变量（同一行、各占一格、都不被压）与具体是哪个平台控件无关**，
+    平台再换控件也不会连累这条 e2e。教训见 NOTES §8.37。
 
 **已知小瑕疵**
 - 纯画布下按 Esc 会同时关菜单并退出纯画布（逃生梯的代价，可接受）。
+- ~~跟焦开关点了之后自己不变~~ ✅ **P26 已修**（`e2e-p4` 56/56 复验）。根因不在这个开关本身：
+  平台把 `layout.closeDetails` 改名成 `closeRightbar`，插件里那个布局协同订阅者每次 `emit()` 都抛
+  `TypeError`，而 `emit()` 当时是裸循环 —— **一个订阅者抛错，排在它后面的订阅者全部收不到通知**，
+  于是工具条上的跟焦/宽度读数永远停在初值（偏好其实已写盘）。修法：调用点两个名字都试
+  （`(layout.closeRightbar ?? layout.closeDetails)?.()`）+ `emit()` 逐个订阅者 try/catch。
+  完整教训见 **NOTES §8.36**。**顺带激活了一个静默失效的功能**：进画布模式时收起右侧详情栏
+  （原来每次都抛错，等于没做）。
 - 命令触发的节点没有 `model` 字段（结果文本第二行没被解析）—— 右键菜单标题少一段模型名。
 - 两个 e2e 会往宿主里塞测试会话（§5）。
+- **拖进来的图会触发跟焦**：一屏放不下就缩小把这一批全带进视野（实测 5 张 → zoom 0.766），单张已可见则不动。
+  **刻意保留**（P26 与用户确认，NOTES §3.29②）；旧代码注释写的「不带过去」与实现不符，已改。
 - 等待审批的会话里 composer 被审批 UI 接管 → 那一行的控件一起消失（有意行为，那时只剩快捷键可进画布）。
 - 纯画布模式下右上角那枚米饭碗**不可见** —— 出口是顶栏那格「纯画布」与 Esc。
 - 生成模型那格显示的**始终是图像模型**（菜单里两个页签都能改）；title 里同时写着图像与视频两个当前值。

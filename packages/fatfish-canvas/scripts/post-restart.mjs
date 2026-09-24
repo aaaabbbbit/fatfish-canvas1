@@ -29,8 +29,8 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -210,17 +210,55 @@ for (let i = 0; i < 40; i += 1) {
 }
 log('端口已释放（或从未占用）');
 
+/**
+ * `dsh` 的入口脚本（就是 `dsh.cmd` 里硬编码的那一条）。
+ *
+ * ⚠️ **不能再经 `cmd.exe /c dsh` 拉起**（2026-09-24 实测，见下）：`detached: true` +
+ * `windowsHide: true` 下，cmd.exe 起的**外部进程**（node.exe 这种）的输出**进不了
+ * 我们传进去的文件句柄** —— `lib/dsh-web.log` 是 0 字节，于是带令牌的地址永远解析
+ * 不出来，所有浏览器 e2e 都跑不动（症状是那句「没能从 lib/dsh-web.log 里解析出带令牌的地址」）。
+ * 实测矩阵（Node 24.12 / Windows）：
+ *   cmd /c dsh --version        detached+hide → **空**
+ *   cmd /c node --version       detached+hide → **空**
+ *   cmd /c echo hello           detached+hide → "hello"（cmd 内建命令反而没事）
+ *   node bin.js --version       detached+hide → "0.1.5-rc.3" ✅
+ * 所以这里绕开 cmd，直接用 `process.execPath` 跑入口 —— 输出照样抓得到，detached 也保住了。
+ * @returns 入口的绝对路径；两处候选都不在时为 null（退回老写法，至少把宿主拉起来）。
+ */
+function dshEntry() {
+	const candidates = [
+		// npm 全局前缀（Windows 上就是 `%APPDATA%\npm`，`dsh.cmd` 也在那儿）
+		join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+		// node 自己的安装目录旁边（有人把 dsh 装在局部）
+		join(dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+	];
+	for (const candidate of candidates) {
+		if (candidate !== '' && existsSync(candidate)) return candidate;
+	}
+	return null;
+}
+
 // ── 2. 拉起新宿主（detached：父进程死了它也活着） ──
 // 输出**不能丢**：带令牌的地址就在那一行里（见 `webUrl()`）。日志每次重启重写
 // （不是追加）：留着上一次的地址会让 e2e 拿一个已经作废的令牌，症状是 401 空页面。
 log('启动 dsh web（detached，输出写进 lib/dsh-web.log）');
 const logFd = openSync(WEB_LOG, 'w');
-const child = spawn('cmd.exe', ['/c', 'dsh', 'web'], {
-	cwd: PROJECT_ROOT,
-	detached: true,
-	stdio: ['ignore', logFd, logFd],
-	windowsHide: true,
-});
+const entry = dshEntry();
+if (entry === null) log('⚠️ 没找到 dsh 的入口脚本 —— 退回 `cmd.exe /c dsh web`（这条路的输出抓不到，令牌多半解析不出来）');
+const child =
+	entry === null
+		? spawn('cmd.exe', ['/c', 'dsh', 'web'], {
+				cwd: PROJECT_ROOT,
+				detached: true,
+				stdio: ['ignore', logFd, logFd],
+				windowsHide: true,
+			})
+		: spawn(process.execPath, [entry, 'web'], {
+				cwd: PROJECT_ROOT,
+				detached: true,
+				stdio: ['ignore', logFd, logFd],
+				windowsHide: true,
+			});
 child.unref();
 closeSync(logFd);
 
