@@ -580,9 +580,17 @@ export function syncCommands(
 		const shape = shapeOf(command.args);
 
 		// 工作流发起的生成：回填到它自己的生成节点上。
-		// 记账照写（`gencmd_<commandId>`），否则同一条结果重放会再回填一次。
 		const wfTarget = wfTargetOf(shape.wf);
 		if (wfTarget !== undefined) {
+			// 已经回填过的旧命令**不再回填**：否则它在 10 分钟新鲜期内会在**每一次
+			// 同步**里把 ready + 旧产物重新盖回目标节点上 —— 用户刚点的「运行」被顶
+			// 掉，界面弹回旧图与旧提示词，旧失败也被重新贴回来。真机实测症状：目标
+			// 节点上「pending 一次都没出现过」，看着像按钮没反应。
+			//
+			// ⚠️ 这一道只能放在**这个分支**里：非工作流那条路的账本项是在「命令执行
+			// 中」那一步就写进去的（loop 1），拿它挡会让命令永远停在 pending。
+			const ledgerId = mediaCommandNodeId(command.commandId);
+			if (ingested.has(ledgerId)) continue;
 			const patch: Partial<Omit<CanvasNode, 'id'>> = command.ok
 				? {
 						status: 'ready',
@@ -591,7 +599,7 @@ export function syncCommands(
 					}
 				: { status: 'failed', error: command.error };
 			if (!command.ok) failed += 1;
-			ingested.add(mediaCommandNodeId(command.commandId));
+			ingested.add(ledgerId);
 			if (sameFields(wfTarget, patch)) continue;
 			patches.set(wfTarget.id, { ...(patches.get(wfTarget.id) ?? {}), ...patch });
 			mergePlaced(wfTarget.id, patch);

@@ -31,6 +31,7 @@
     "e2e:settings": "node scripts/e2e-settings.mjs",
     "e2e:graph": "node scripts/e2e-graph.mjs",
     "e2e:p17": "node scripts/e2e-p17.mjs",
+    "e2e:realgen": "node scripts/e2e-realgen.mjs",
     "restart:verify": "node scripts/post-restart.mjs --delay 5000 --verify",
     "e2e:ingest": "node scripts/e2e-ingest.mjs",
     "fake-media": "node scripts/fake-media-server.mjs --port 8791 --delay 2500",

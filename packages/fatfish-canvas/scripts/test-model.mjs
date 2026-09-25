@@ -2733,6 +2733,28 @@ console.log('\n12) 工作流：运行与结果回填');
 		})(),
 	);
 
+	// 12.4b 旧命令重放不得把「刚点的运行」顶掉（真机手测抓到的真 bug）
+	//
+	// 为什么单独立一条：上面那条幂等断言在「节点字段与结果一致」时也成立（走的是
+	// `sameFields` 短路），而 bug 只在用户**又点了一次运行**、节点已经 pending 时
+	// 露出来 —— 旧命令还在 10 分钟新鲜期内，于是每一次同步都把 ready + 旧产物重新
+	// 盖回去：pending 一次都看不见，界面弹回旧图与旧提示词。
+	store.updateNodes([gen.id], { status: 'pending', prompt: '再画一张' });
+	const beforeReplay = store.getBoard().nodes.find((n) => n.id === gen.id);
+	ingest.syncConversation(
+		snap([commandNode({ outcome: { kind: 'success', text: 'https://cdn.example.com/wf.png\n图像' } })]),
+		'sess-1',
+		{ baselineSeq: 0, now: Date.now() },
+	);
+	const afterReplay = store.getBoard().nodes.find((n) => n.id === gen.id);
+	check(
+		'旧命令重放不会把刚点的「运行」顶掉（仍 pending 且提示词是新的）',
+		beforeReplay?.status === 'pending' &&
+			afterReplay?.status === 'pending' &&
+			afterReplay?.prompt === '再画一张',
+		JSON.stringify({ 前: beforeReplay?.status, 后: afterReplay?.status, 提示词: afterReplay?.prompt }),
+	);
+
 	// ── 12.5 目标节点被删掉 → 退回普通落图（结果不丢） ──
 	store.removeNodes([gen.id]);
 	ingest.syncConversation(
