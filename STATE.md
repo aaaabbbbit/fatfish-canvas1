@@ -42,9 +42,14 @@
 | 分支 `节点功能` = `7ccd2a6` | 本地 + GitHub | **P18–P26**（画布节点化 / 工作流串联 / 参考图 / 会话画布回收 + 真机真生成 e2e + 一个 `ingest` 账本判据的真 bug 修复） |
 | `main` → 最新提交（2026-10-20） | 本地 + GitHub | **P27–P52** 已提交并推送（54 个已跟踪文件 `+12017 −2923` + 29 个新文件；`host/gate.ts`、`host/archive.ts`、`shared/modelPresets.ts`、`chat/`、`settings/CommonModels.tsx`、`client/generated/`、`scripts/e2e-picker.mjs` 等）。**注意**：它基于 P17 快照，**不含 P18–P26**，与 `节点功能` 是两条分叉线 |
 
-1. ⚠️ **`节点功能`（P18–P26）与 `main`（P17 + P27–P51）是两条分叉线**：两边 **20 个文件重叠**，
-   谁都不包含对方。别为了「接上那条线」直接切过去；要不要合、怎么合是用户的决定，
-   不确定就先问。（P27–P51 自 2026-10-20 起已在 `main` 上提交并推送，切分支不再被拒。）
+1. ⚠️ **`节点功能`（P18–P26）与 `main`（P17 + P27–P52）是两条分叉线**：分叉点就是 `fafb415`，
+   两边 **30 个文件都改过**（2026-10-20 用 `git merge-tree` 实测：**22 个硬冲突** +
+   8 个能自动合并但语义要人眼复核）。`节点功能` 独有 12 个文件（`graph.ts` / `workflow.ts` /
+   `run.ts` / `ports.ts` / `LinkLayer.tsx` / `CanvasMenu.tsx` / `pngmeta.ts` / `notice.ts` /
+   `exportImage.ts` + 3 个 e2e），`main` 独有 22 个（`gate.ts` / `archive.ts` / `exportImages.ts` /
+   `zip.ts` / `chat/` / `settings/` …）。谁都不包含对方 —— 要不要合、怎么合是用户的决定，
+   **动手前先问**；真合并的代价 = 22 个文件手工解冲突 + 语义复核 + 全量门禁重跑。
+   （P27–P52 自 2026-10-20 起已在 `main` 上提交并推送，切分支不再被拒。）
 2. ⚠️ **`git checkout .` / `reset --hard` / `git clean` 仍然危险**：它们会丢掉**提交之后**的
    未提交改动（M 状态的改动一律没了，未跟踪文件 `clean -fd` 也会删）。
    P27–P51 已在远端，丢的只是本轮新改动 —— 动手前先 `git stash -u` 或看 `git status`。
