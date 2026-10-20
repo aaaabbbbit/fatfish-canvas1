@@ -12,3 +12,10 @@ node_modules/
 .pnpm-store/
 .tmp-dbg-profile/
 .tmp-*.mjs
+
+# 一次性调试探针 / 本机会话杂物（不进仓库）
+/packages/fatfish-canvas/scripts/_probe-*.mjs
+/packages/fatfish-canvas/scripts/_recon-*.mjs
+/.dsh-write-probe.tmp
+/.dsh-md-annotate.json
+/.t8research/
