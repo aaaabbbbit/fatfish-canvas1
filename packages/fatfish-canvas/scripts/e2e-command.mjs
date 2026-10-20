@@ -18,7 +18,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PACKAGE_ROOT, RESET_BOARD_PREFS, evaluate, launch, seedBoardExpression, sleep } from './lib/cdp.mjs';
+import { PACKAGE_ROOT, PIN_SHARED_BOARD, evaluate, launch, seedBoardExpression, sleep } from './lib/cdp.mjs';
 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 const argv = process.argv.slice(2);
@@ -77,6 +77,24 @@ const PROBE = `(() => {
       text: (el.textContent || '').replace(/\\s+/g, ' ').slice(0, 160),
     })),
     bodyText: (document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 600),
+    // 「生成中」那一格就是图像生成的加载页：它的图标必须是**摇起来**的鲸鱼尾巴。
+    // 判据是动图那枚的 display：遮罩一直挂在它身上，比长度分不出状态。
+    pendingIcon: (() => {
+      const el = document.querySelector('.ffc-node-pending .ffc-whale');
+      if (el === null) return null;
+      const still = el.querySelector('.ffc-whale-still');
+      const anim = el.querySelector('.ffc-whale-anim');
+      const path = still ? still.querySelector('path') : null;
+      const r = el.getBoundingClientRect();
+      return {
+        generating: el.getAttribute('data-ffc-generating'),
+        stillDisplay: still ? getComputedStyle(still).display : null,
+        animDisplay: anim ? getComputedStyle(anim).display : null,
+        animMaskLen: anim ? (getComputedStyle(anim).maskImage || '').length : 0,
+        stroke: path ? getComputedStyle(path).stroke : null,
+        box: { w: Math.round(r.width), h: Math.round(r.height) },
+      };
+    })(),
     board: (() => { try { return JSON.parse(window.localStorage.getItem('fatfish-canvas:board') || 'null'); } catch (e) { return 'unparsable'; } })(),
   });
 })()`;
@@ -114,7 +132,7 @@ try {
 		`(() => {
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'canvas');
 			window.localStorage.setItem('fatfish-canvas:follow-new', 'on');
-			${RESET_BOARD_PREFS}
+			${PIN_SHARED_BOARD}
 			// 种空画布但**保住账本**（见 cdp.mjs）：否则最近生成的补落会混进来
 			${seedBoardExpression(
 				JSON.stringify({ version: 2, nodes: [], viewport: { x: 0, y: 0, zoom: 1 } }),
@@ -146,10 +164,12 @@ try {
 	console.log(`  · 起点已有 ${String(baseline)} 个节点（上一次运行的补落，属预期）`);
 
 	// 2) 在输入框里敲命令并发送（真实输入事件）
+	// composer 的元素随本体版本变过（textarea → contenteditable DIV，P44 实测）：
+	// 两种都收，向后兼容（老页面仍是 textarea 时打第一个）。
 	const focused = await evaluate(
 		browser.cdp,
 		`(() => {
-			const box = document.querySelector('textarea');
+			const box = document.querySelector('textarea, [contenteditable="true"]');
 			if (!box) return false;
 			box.focus();
 			return document.activeElement === box;
@@ -158,7 +178,10 @@ try {
 	check('输入框可达', focused === true);
 	await browser.cdp.send('Input.insertText', { text: LINE });
 	await sleep(300);
-	const typed = await evaluate(browser.cdp, "document.querySelector('textarea') ? document.querySelector('textarea').value : ''");
+	const typed = await evaluate(
+		browser.cdp,
+		"(() => { const el = document.querySelector('textarea, [contenteditable=\"true\"]'); return el ? (el.value ?? el.textContent) : ''; })()",
+	);
 	check('命令行已敲进输入框', String(typed).includes('/generate'), String(typed).slice(0, 60));
 	await browser.cdp.send('Input.dispatchKeyEvent', {
 		type: 'keyDown',
@@ -179,6 +202,7 @@ try {
 	const transitions = [];
 	const seen = new Map();
 	let sawPending = false;
+	let pendingIcon = null;
 	let last = s;
 	const deadline = Date.now() + WATCH_MS;
 	while (Date.now() < deadline) {
@@ -191,7 +215,11 @@ try {
 				transitions.push(`${previous ?? '(无)'} -> ${node.status}`);
 				console.log(`  · 节点「${node.title ?? ''}」${previous ?? '出现'} -> ${node.status}`);
 			}
-			if (node.status === 'pending') sawPending = true;
+			if (node.status === 'pending') {
+				sawPending = true;
+				// 第一次看到 pending 就把它那一格的图标事实记下来（落定后就查不到了）
+				if (pendingIcon === null) pendingIcon = snap.pendingIcon;
+			}
 		}
 		last = snap;
 		// 等到「出现了基线之外的新节点」且它不再是 pending —— 只等「没有 pending」
@@ -226,13 +254,18 @@ try {
 		}
 		if (node.status === 'ready') {
 			check('ready 节点带媒体地址', typeof node.src === 'string' && node.src !== '', String(node.src));
-			check(
-				'媒体真的加载成功',
-				(await evaluate(
-					browser.cdp,
-					`(() => { const i = document.querySelector('.ffc-node img'); return i ? i.complete && i.naturalWidth > 0 : null; })()`,
-				)) === true,
-			);
+			// 真机图能到 2 MB（P44 实测 webstatic 网关 200 / 2.1 MB）：节点一落定 img
+			// 还在传输，「落定即查」必然红的时序假故障。轮询等它加载完（≤15s）。
+			let mediaOk = false;
+			for (let waited = 0; waited <= 15000 && mediaOk !== true; waited += 300) {
+				mediaOk =
+					(await evaluate(
+						browser.cdp,
+						`(() => { const i = document.querySelector('.ffc-node img'); return i ? i.complete && i.naturalWidth > 0 : false; })()`,
+					)) === true;
+				if (mediaOk !== true) await sleep(300);
+			}
+			check('媒体真的加载成功（轮询等完大图）', mediaOk === true, String(mediaOk));
 		}
 		if (node.status === 'failed') {
 			check('failed 节点带失败原因', typeof node.error === 'string' && node.error.length > 4, String(node.error));
@@ -255,6 +288,33 @@ try {
 			? '  · 观察到了 pending 阶段（命令执行中就先落占位）'
 			: '  · 未观察到 pending 阶段（本地失败太快，属预期）',
 	);
+	// 「生成中」那一格就是图像生成的**加载页**：图标必须是摇起来的鲸鱼尾巴
+	// （静态 = 静帧遮罩，用户要的动效只在 hover 与生成中）。
+	if (sawPending) {
+		check(
+			'生成中占位里有鲸鱼尾巴图标',
+			pendingIcon !== null,
+			JSON.stringify(pendingIcon),
+		);
+		if (pendingIcon !== null) {
+			check('占位图标带 data-ffc-generating（这一格在用动态遮罩）', pendingIcon.generating === 'true', String(pendingIcon.generating));
+			check(
+				'占位图标真的摇尾巴（动图那枚 display:block，静止态让位）',
+				pendingIcon.animDisplay === 'block' && pendingIcon.stillDisplay === 'none' && pendingIcon.animMaskLen > 5000,
+				`anim ${String(pendingIcon.animDisplay)} / still ${String(pendingIcon.stillDisplay)}`,
+			);
+			check(
+				'占位图标颜色走 currentColor（不是写死白色）',
+				typeof pendingIcon.stroke === 'string' && pendingIcon.stroke.startsWith('rgb('),
+				String(pendingIcon.stroke),
+			);
+			check(
+				'占位图标是 28×28 的正方（老位图是 1152:976，会在这里露馅）',
+				pendingIcon.box.w === 28 && pendingIcon.box.h === 28,
+				JSON.stringify(pendingIcon.box),
+			);
+		}
+	}
 	// 记账是**去抖**写盘的（400ms），因此这里必须**轮询到落盘**再断言。
 	// 直接读一次会拿到空数组 —— 那是「读太早」的假故障（§8.6），不是记账坏了：
 	// 命令节点已经落到画布上（上面几条断言过了），只是还没写进 localStorage。

@@ -180,14 +180,17 @@ export async function launch(options = {}) {
 }
 
 /**
- * 种状态时的公共前置：清掉「决定读哪块画布」的偏好。
+ * 种状态时的公共前置：把画布作用域钉在**共用那块**上。
  *
- * 画布作用域（P7）一旦被留在 `session`，app 会去读 `fatfish-canvas:board:<会话>`
- * 而不是 e2e 刚种下的全局画布 —— 症状是「种下的节点一个都没渲染」，
- * 看着像组件坏了。复用的探针 profile 让这件事特别容易发生，因此每个自己种
- * 画布的脚本都要先把它清掉（与「每个 e2e 必须自己种状态」是同一条规矩）。
+ * 为什么必须钉：e2e 脚本统统往 `fatfish-canvas:board`（共用那块）里种节点，
+ * 而画布默认是**按工作区分**的（一个工作区一块）—— 页面一认出当前会话的工作区，
+ * 就去读 `fatfish-canvas:board:<工作区路径>`，种下的节点一个都不渲染，
+ * 看着像组件坏了。探针 profile 是复用的，这件事特别容易发生
+ * （P7 时代是同一个坑的另一半：残留的 `session` 偏好）。
+ * 因此凡自己种共用画布的脚本都要先钉成 `shared`。
+ * 作用域本身的行为由 `e2e-scope.mjs` 专门覆盖，不靠别人顺带测。
  */
-export const RESET_BOARD_PREFS = "window.localStorage.removeItem('fatfish-canvas:board-scope');";
+export const PIN_SHARED_BOARD = "window.localStorage.setItem('fatfish-canvas:board-scope','shared');";
 
 /**
  * 造一段「种画布但**保住原账本**」的表达式。
@@ -255,7 +258,7 @@ export async function goto(cdp, url, options = {}) {
 		await cdp.send('Runtime.evaluate', {
 			expression:
 				`window.localStorage.setItem('fatfish-canvas:view-mode','canvas');` +
-				RESET_BOARD_PREFS,
+				PIN_SHARED_BOARD,
 		});
 		loaded = cdp.once('Page.loadEventFired');
 		await cdp.send('Page.reload', { ignoreCache: false });

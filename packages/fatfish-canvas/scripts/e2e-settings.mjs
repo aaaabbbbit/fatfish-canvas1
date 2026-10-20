@@ -4,7 +4,7 @@
  * 这条链路只有在**真实 GUI + 真实宿主**上才能验证，因为它横跨四层：
  *
  *   设置页（浏览器）→ settings.mutate / credentials.set（RPC）
- *     → 宿主 settings namespace（providers 字典）与凭据库
+ *     → 宿主那一行的 config（providers 字典；键 = Loader entry id）与凭据库
  *       → mediaProbe 远程命名空间（Typert）→ 宿主 fetch 供应商
  *         → 本机假服务（scripts/fake-media-server.mjs）
  *
@@ -32,8 +32,18 @@ const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 const SHOT = resolve(PACKAGE_ROOT, 'lib/e2e-settings.png');
 const FAKE_PORT = Number(process.env.FFC_FAKE_PORT ?? 8791);
 const FAKE_KEY = 'sk-e2e-local';
-/** 测试供应商 id 的前缀（id 由页面生成，只能按前缀认）。 */
-const TEST_ID_RE = /^(custom|e2e-local)/;
+/**
+ * 测试供应商的**唯一可靠标记**：基址指向本机假服务 —— 只有这个脚本会这么写。
+ *
+ * ⚠️ **绝不能按 id 前缀认自己的东西**（2026-10-05 实测的教训，NOTES §8.66）：
+ * 用户真实的供应商 id 就叫 `custom` / `custom-2`（在界面里点「自定义供应商」建出来的
+ * 就是这两个名字，与我们生成的撞在一起）。按 `/^custom/` 清理会**删掉用户的供应商、
+ * 并顺手清掉他们存在里面的密钥**（本轮真删了两个）。凡是有破坏性的动作，
+ * 判据都要落在这个标记上：基址不是本机假服务的卡片，一根手指都不许碰。
+ */
+const FAKE_HOST = `127.0.0.1:${String(FAKE_PORT)}`;
+/** 页内判断「这张卡片是本脚本建的」的表达式（`c` = 卡片元素）。 */
+const IS_TEST_CARD = `(c) => { const u = c.querySelector('input[data-field="baseURL"]'); return u !== null && u.value.indexOf('${FAKE_HOST}') >= 0; }`;
 
 let failures = 0;
 const results = [];
@@ -49,7 +59,7 @@ const PROBE = `(() => {
   const rect = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
   const center = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }; };
   const text = (el) => (el ? (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200) : null);
-  const card = qa('.ffc-set-card[data-provider]').find((c) => /^(custom|e2e-local)/.test(c.getAttribute('data-provider'))) || null;
+  const card = (window.__ffcE2eId ? q('.ffc-set-card[data-provider="' + window.__ffcE2eId + '"]') : null) || qa('.ffc-set-card[data-provider]').find(${IS_TEST_CARD}) || null;
   const inCard = (sel) => card ? card.querySelector(sel) : null;
   const btn = (action) => card ? card.querySelector('[data-action="' + action + '"]') : null;
   const modelRow = (id) => card ? card.querySelector('[data-model="' + id + '"]') : null;
@@ -250,14 +260,24 @@ try {
 		String(s.probeWarning),
 	);
 
+	// 创建之前先把现有供应商 id 记下来：之后只认「新出现的那一个」。
+	// ⚠️ 按前缀找会抓到用户自己的 `custom`（NOTES §8.66）—— 本轮就是这么把用户的
+	// 供应商当成测试卡片、又在收尾时删掉的。
+	const beforeIds = await evaluate(
+		browser.cdp,
+		`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).map((c) => c.getAttribute('data-provider')))()`,
+	);
+
 	// 上一次跑残留的测试供应商先删掉，保证幂等。
 	//
-	// ⚠️ 按**前缀**清理而不是按固定 id：新建供应商的 id 由页面生成
-	// （`custom`、`custom-2`…），失败的那次运行会把 `custom` 留在设置里，
-	// 下一次就会生成 `custom-2`。只删一个固定 id 会让垃圾越积越多。
+	// ⚠️ 判据是**基址指向本机假服务**（`IS_TEST_CARD`），不是 id 前缀：id 由页面生成
+	// （`custom`、`custom-2`…），与用户自己建的供应商同名。失败的那次运行会把
+	// `custom` 留在设置里，下一次就会生成 `custom-2`，所以也不能只删一个固定 id ——
+	// 两个条件一起用才既幂等又安全。（代价：建完卡片、还没写基址就崩的那种残留
+	// 认不出来 —— 留着一张空卡片，比删掉用户的数据便宜得多。）
 	const staleIds = await evaluate(
 		browser.cdp,
-		`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).map((c) => c.getAttribute('data-provider')).filter((id) => /^(custom|e2e-local)/.test(id)))()`,
+		`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).filter(${IS_TEST_CARD}).map((c) => c.getAttribute('data-provider')))()`,
 	);
 	for (const id of Array.isArray(staleIds) ? staleIds : []) {
 		// 先清密钥（顺带把凭据也删掉），再删供应商
@@ -275,7 +295,7 @@ try {
 	s = await read();
 	const stillStale = await evaluate(
 		browser.cdp,
-		`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).map((c) => c.getAttribute('data-provider')).filter((id) => /^(custom|e2e-local)/.test(id)))()`,
+		`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).filter(${IS_TEST_CARD}).map((c) => c.getAttribute('data-provider')))()`,
 	);
 	check('起点没有测试供应商（幂等）', Array.isArray(stillStale) && stillStale.length === 0, JSON.stringify(stillStale));
 
@@ -296,11 +316,11 @@ try {
 	await sleep(1200);
 	s = await read();
 	check(
-		'出现了一家新的自定义供应商卡片（id 由页面生成，这里匹配前缀）',
-		// 供应商 id 是 freeProviderId('custom') 生成的，因此按前缀找卡片
+		'出现了一家新的自定义供应商卡片（id 由页面生成）',
+		// 认「新出现的那个 id」，不认前缀：用户自己的供应商也可能叫 `custom`
 		await evaluate(
 			browser.cdp,
-			`(() => Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).some((c) => /^custom/.test(c.getAttribute('data-provider'))))()`,
+			`(() => { const seen = ${JSON.stringify(beforeIds)}; return Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).map((c) => c.getAttribute('data-provider')).some((id) => !seen.includes(id)); })()`,
 		) === true,
 		JSON.stringify(s.modelIds),
 	);
@@ -308,9 +328,11 @@ try {
 	// 取到生成的 id，后续都用它
 	const generatedId = await evaluate(
 		browser.cdp,
-		`(() => { const c = Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).find((x) => /^custom/.test(x.getAttribute('data-provider'))); return c ? c.getAttribute('data-provider') : null; })()`,
+		`(() => { const seen = ${JSON.stringify(beforeIds)}; return Array.from(document.querySelectorAll('.ffc-set-card[data-provider]')).map((c) => c.getAttribute('data-provider')).find((id) => !seen.includes(id)) || null; })()`,
 	);
 	check('拿得到新供应商的 id', typeof generatedId === 'string' && generatedId !== '', String(generatedId));
+	// 后面的 `PROBE` 一律只看这张卡片（不然中间那些断言读的是别人的卡片）
+	await evaluate(browser.cdp, `window.__ffcE2eId = ${JSON.stringify(String(generatedId))}; true`);
 
 	// 填显示名与接口基址（两个都是**失焦提交**的字段，必须用真实输入 + 真实失焦）
 	await fillField(`[data-provider="${String(generatedId)}"] input[data-field="label"]`, 'E2E 本地假供应商');
@@ -488,6 +510,12 @@ try {
 
 	// ── 7. 设为默认图像模型 ──
 	console.log('\n7) 设为默认图像模型');
+	// 先记下用户原来的默认图像模型：收尾时**恢复它**（而不是一律清成「自动」——
+	// 那会把用户自己选的那个悄悄改掉，NOTES §8.66 同一类毛病）
+	const defaultImageBefore = await evaluate(
+		browser.cdp,
+		`(() => { const s = document.querySelector('select[data-default="image"]'); return s ? s.value : ''; })()`,
+	);
 	await evaluate(
 		browser.cdp,
 		`(() => {
@@ -531,8 +559,9 @@ try {
 	);
 	check('测试用的供应商已删除（不给用户留垃圾配置）', gone === true);
 
-	// 默认模型也要恢复成「自动」：测试把它改成了自己的模型，删掉供应商之后
+	// 默认图像模型**恢复成用户原来那个**：测试把它改成了自己的模型，删掉供应商之后
 	// 那个默认值就指向不存在的模型（界面上会显示成「（已失效）」）—— 那也是垃圾。
+	// ⚠️ 恢复成「用户原来的值」，不是一律清成「自动」：后者会把用户自己选的模型改掉。
 	await evaluate(
 		browser.cdp,
 		`(() => {
@@ -540,7 +569,7 @@ try {
 			if (!sel) return false;
 			// select 用原生 setter + change 事件（React 的 onChange 走原生 change）
 			const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
-			setter.call(sel, '');
+			setter.call(sel, ${JSON.stringify(String(defaultImageBefore ?? ''))});
 			sel.dispatchEvent(new Event('change', { bubbles: true }));
 			return true;
 		})()`,
@@ -551,9 +580,9 @@ try {
 		`(() => { const sel = document.querySelector('select[data-default="image"]'); return sel ? sel.value : null; })()`,
 	);
 	check(
-		'默认图像模型已恢复成「自动」（不留指向已删除模型的失效值）',
-		defaultAfter === '',
-		String(defaultAfter),
+		'默认图像模型恢复成跑之前那个值（不留指向已删除模型的失效值）',
+		defaultAfter === String(defaultImageBefore ?? ''),
+		`${String(defaultAfter)}（跑之前是 ${String(defaultImageBefore ?? '')}）`,
 	);
 
 	const shot = await browser.cdp.send('Page.captureScreenshot', { format: 'png' });

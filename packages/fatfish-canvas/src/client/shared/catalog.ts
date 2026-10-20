@@ -24,8 +24,17 @@
  * @module fatfish-canvas/shared/catalog
  */
 
-/** 设置 namespace 名。宿主注册它、设置页绑定它，因此和目录一起放在共享模块。 */
-export const MEDIA_NS = 'media-generation';
+/**
+ * 设置分节的键 = 本插件的 **Loader entry id**（profile patch 里那一行的 `id:`）。
+ *
+ * 0.2.0 起没有「插件自建 namespace」这回事了：设置服务按 entry id 找到插件
+ * 运行时的 `Config`（`dsh-settings` 的 `schema(entry)`），客户端也用同一个
+ * 字符串 `ctx.configForms.get(...)`，宿主侧写回则是
+ * `ctx.settings.mutate(<entry id>, ops)`。因此它必须与
+ * `cordis.patch.yml`（或 profile patch）里那行的 `id:` **逐字相同** ——
+ * 宿主半边、设置页与工具条共用这一份常量，就是为了不可能写歪。
+ */
+export const SETTINGS_ENTRY_ID = 'fatfish-canvas';
 
 /** 媒体种类（一次**生成**的产物）。 */
 export type MediaKind = 'image' | 'video';
@@ -186,6 +195,14 @@ export function parseModelRef(value: string): { providerId: string; modelId: str
 	return { providerId: value.slice(0, at).trim(), modelId: value.slice(at + 2).trim() };
 }
 
+/**
+ * 默认**档位**字段：`{ "供应商::词干": "high" }`。
+ *
+ * 只承载**质量轴**（请求参数那种档位）；分辨率轴的档位就是模型 id 本身，
+ * 记在 `defaultImage` / `defaultVideo` 里，不需要第二个字段。
+ */
+export const FIELD_DEFAULT_TIERS = 'defaultTiers';
+
 /** 默认图像模型字段。 */
 export const FIELD_DEFAULT_IMAGE = 'defaultImage';
 /** 默认视频模型字段。 */
@@ -196,6 +213,299 @@ export const FIELD_DEFAULT_VISION = 'defaultVision';
 export const FIELD_TIMEOUT = 'timeoutMs';
 /** 供应商字典字段。 */
 export const FIELD_PROVIDERS = 'providers';
+/**
+ * 生成结果**本地留档**目录字段（P32）。
+ *
+ * 空 = 不留档（默认）：供应商回的是会过期的签名地址，留档就是把字节抓下来
+ * 写进这个目录，之后聊天与画布都指向本地副本。
+ */
+export const FIELD_ARCHIVE_DIR = 'archiveDir';
+
+/**
+ * 「设计技能」的**开关**字段（缺省 = 开）。
+ *
+ * 聊天框那格鲸鱼尾巴的**右键**写的就是它：开 = 把
+ * {@link DESIGN_SKILL_BUILTIN}（或用户改过的那份）注入**聊天模型**的 system prompt
+ * （由它组织出让生成模型懂、又符合设计要求的提示词），
+ * 关 = 注入一段空文本、渲染时被平台滤掉（尾巴也压回默认的纯色）。客户端快照读不到
+ * 这个键时同样按开算（与 schema 的缺省一致），因此「关」必须是**显式**写进设置的 false。
+ */
+export const FIELD_DESKILL_ON = 'designSkillOn';
+
+/**
+ * 「设计技能」的**文案**字段：开关开着时注入聊天模型 system prompt 的那段文字。
+ *
+ * 它是用户数据（「肥鱼画布」设置页里直接编辑）：出图效果不合意时改这里，不用改代码。
+ * unset（清空提交）= 回到下面的内置文案。
+ */
+export const FIELD_DESKILL_TEXT = 'designSkill';
+
+/**
+ * 内置的设计技能文案（{@link FIELD_DESKILL_TEXT} 的 schema 缺省值）。
+ *
+ * 注入的是**写提示词的大语言模型**，不是生成模型 —— 所以写成「给模型的行为要求」：
+ * 它按这些要求去为 media_generate 组织 prompt。生成效果不合意时用户在设置页里
+ * 改这一份，代码不参与演化。
+ */
+export const DESIGN_SKILL_BUILTIN = [
+	'- 主体清晰、构图有主次，画面干净利落：不要杂乱元素、水印和多余文字。',
+	'- 色彩与光影统一协调，对比与留白得当，贴合场景氛围。',
+	'- 材质、纹理与细节真实可信，整体有专业设计感与精致质感。',
+].join('\n');
+
+// ─────────────────────── 档位（家族 × 两条轴） ───────────────────────
+//
+// 「档位」在这个插件里是**两条不同的轴**，必须分开解，否则会把一件根本不用
+// 动数据的事（分辨率）和一件必须动数据的事（质量）搅在一起：
+//
+//   1. **分辨率轴 = 网关上的兄弟模型 id**（`…-1k` / `…-2k` / `…-4k`）。
+//      它不是新机制：选中那个兄弟 id 就是选中档位，`defaultImage` 一个字段
+//      就够了，请求体里的 `model` 自然是对的。因此它**不落盘、不用配置**。
+//   2. **质量轴 = 请求参数**（`quality: low|high`）。`GET /models` 只回 id，
+//      没有任何「这个模型收哪些 quality」的信号 —— 所以它**只能由用户在设置里
+//      声明**（`models[].tiers`）。假装能自动探测是撒谎，这里不干。
+//
+// 两条轴共用一个概念：**家族**（family）= 供应商 + 词干。词干 = 模型 id 去掉
+// 尾部档位词。家族是**派生**的（不落盘），因此「配置完之后自动多出一个档位
+// 选择」在没有兄弟、也没有声明的模型上**自然退化成今天的平铺行**。
+
+/**
+ * 档位词闭集：只有 id 的**最后一段**命中它才当成档位。
+ *
+ * 宁可漏分组也不错分组：漏了只是少一层折叠（用户看到的还是完整 id），
+ * 错了会把两个不相干的模型塞进同一行。所以这里只收「几乎只可能是档位」的词。
+ */
+export const TIER_WORDS: readonly string[] = [
+	'1k',
+	'2k',
+	'4k',
+	'8k',
+	'low',
+	'medium',
+	'high',
+	'xhigh',
+	'auto',
+	'fast',
+	'standard',
+	'hd',
+	'pro',
+	'max',
+	'turbo',
+	'mini',
+	'plus',
+	'ultra',
+];
+
+/** 查表用（`TIER_WORDS` 的集合形态）。 */
+const TIER_WORD_SET = new Set(TIER_WORDS);
+
+/** 档位参数名的合法形状（它要原样进请求体，因此收得比供应商 id 还紧）。 */
+export const TIER_PARAM_RE = /^[a-z][a-z0-9_]*$/;
+
+/**
+ * 参数键里**不许用**的名字（质量轴与其他参数共用这一份清单）。
+ *
+ * 这几个键是适配器自己写的（`model` / `prompt` / `n` 与参考图字段），声明它们
+ * 等于让用户把请求写坏 —— 而失败还发生在供应商那侧，报错很难看懂。
+ *
+ * `n` 尤其要紧：网关按 n 出图、而适配器只读 `data[0]`（见 host/providers.ts），
+ * 于是 n>1 是**静默丢图**（钱花了、图没了）。多张的正路是并发调用多次。
+ *
+ * ⚠️ **只有这一份**（`modelPresets.isParamKey` 从这里取）：曾经两处各写一份，
+ * 一份漏了 `n`，于是设置页不让声明、宿主却照收 —— 两半边的判断必须同源。
+ */
+export const RESERVED_PARAM_KEYS: readonly string[] = ['model', 'prompt', 'n', 'image'];
+
+/**
+ * 质量轴：一个家族上「哪个参数、有哪些取值、取值怎么显示」的声明。
+ *
+ * 它是**用户数据**（设置里的 `models[].tiers`），不是目录：不同网关同一件事
+ * 的参数名并不统一（`quality` / `resolution` / `hd`…），写死在代码里只能覆盖一家。
+ */
+export interface TierAxis {
+	/** 请求体里的参数名（如 `quality`）。 */
+	param: string;
+	/** 可选取值（按显示顺序）。 */
+	values: readonly string[];
+	/** 取值 → 展示名（`low` → `低`）；缺省用取值原文。 */
+	labels: Readonly<Record<string, string>>;
+	/**
+	 * 用户还没选过时用哪个取值（缺省 = `values[0]`）。
+	 *
+	 * 空串是**有意义**的：表示「没选就不写进请求体」。内置预置表就是这么声明的
+	 * （见 `shared/modelPresets.ts`）—— 预置负责把那一排 chip 摆出来，
+	 * 要不要发这个参数由用户点那一下决定。
+	 */
+	fallback?: string;
+}
+
+/**
+ * 拆一个模型 id 的**尾部档位词**（纯函数）。
+ *
+ * 只认最后一段，且必须在 `TIER_WORDS` 里：`gpt-image-2.5-sunburst-2k` →
+ * `{ stem: 'gpt-image-2.5-sunburst', tier: '2k' }`；`Kwai-Kolors/Kolors` →
+ * 原样（词干 = 自己，没有档位）。
+ * @param modelId - 线上模型名。
+ * @returns 词干（家族的一半）与档位词（没有则为空串）。
+ */
+export function splitTier(modelId: string): { stem: string; tier: string } {
+	const at = modelId.lastIndexOf('-');
+	if (at <= 0) return { stem: modelId, tier: '' };
+	const tail = modelId.slice(at + 1);
+	if (!TIER_WORD_SET.has(tail.toLowerCase())) return { stem: modelId, tier: '' };
+	return { stem: modelId.slice(0, at), tier: tail };
+}
+
+/**
+ * 家族键：`供应商::词干`（`defaultTiers` 的键，也是设置里声明的归属单位）。
+ *
+ * 词干由 `splitTier` 从模型 id 现拆：`…-2k` / `…-4k` 这类尾缀兄弟因此共用一行
+ * （「同一支模型的两种 id 写法」**不**在这里归并 —— 那会改变家族键，
+ * 见 `shared/modelPresets.ts` 里 `nano-banana` 那条注释）。
+ * @param providerId - 供应商 id。
+ * @param modelId - 线上模型名。
+ * @returns 家族键。
+ */
+export function familyRefOf(providerId: string, modelId: string): string {
+	return modelRef(providerId, splitTier(modelId).stem);
+}
+
+/**
+ * 把一个模型条目里的 `tiers` 声明收敛成质量轴（纯函数，形状不可信）。
+ *
+ * 参数名非法或取值清单为空时返回 undefined —— **不抛错**：设置可能是手工改坏的，
+ * 那种情况下「这个家族没有质量轴」是唯一安全的理解（生成照常进行）。
+ * @param raw - 设置里的 `tiers` 原始值。
+ * @returns 质量轴；不是有效声明时 undefined。
+ */
+export function parseTierAxis(raw: unknown): TierAxis | undefined {
+	if (raw === null || typeof raw !== 'object') return undefined;
+	const record = raw as { param?: unknown; values?: unknown; labels?: unknown };
+	const param = typeof record.param === 'string' ? record.param.trim() : '';
+	if (!TIER_PARAM_RE.test(param) || RESERVED_PARAM_KEYS.includes(param)) return undefined;
+
+	const values: string[] = [];
+	for (const entry of Array.isArray(record.values) ? record.values : []) {
+		const value = typeof entry === 'string' ? entry.trim() : '';
+		if (value !== '' && !values.includes(value)) values.push(value);
+	}
+	if (values.length === 0) return undefined;
+
+	const labels: Record<string, string> = {};
+	if (record.labels !== null && typeof record.labels === 'object') {
+		for (const [key, value] of Object.entries(record.labels as Record<string, unknown>)) {
+			if (typeof value === 'string' && value.trim() !== '') labels[key] = value.trim();
+		}
+	}
+	return { param, values, labels };
+}
+
+/**
+ * 一个供应商里「词干 → 质量轴」的表。
+ *
+ * 同一个词干下**任何一个成员**声明了就算这个家族有这条轴（取第一个有效声明）：
+ * 用户在设置页只需要在家族里任意一行上配一次，不必给每个分辨率档都配一遍。
+ * @param models - 该供应商的模型清单（形状不可信，逐字段校验）。
+ * @returns 词干 → 质量轴。
+ */
+export function tierAxesOf(models: readonly { id?: unknown; tiers?: unknown }[]): Map<string, TierAxis> {
+	const axes = new Map<string, TierAxis>();
+	for (const model of models) {
+		if (model === null || typeof model !== 'object') continue;
+		const modelId = typeof model.id === 'string' ? model.id.trim() : '';
+		if (modelId === '') continue;
+		const axis = parseTierAxis(model.tiers);
+		if (axis === undefined) continue;
+		const stem = splitTier(modelId).stem;
+		if (!axes.has(stem)) axes.set(stem, axis);
+	}
+	return axes;
+}
+
+/**
+ * 家族当前的质量档：存的值合法就用它，否则退回声明的默认值。
+ *
+ * 默认值 = `fallback`（可能是空串 = 不传）；用户手写的声明没有 `fallback`，
+ * 因此行为与 P28 完全一致（取第一个取值）。
+ * @param stored - `defaultTiers[家族键]` 的原始值。
+ * @param axis - 这个家族的质量轴；没有轴时返回空串。
+ * @returns 生效的档位取值。
+ */
+export function currentTier(stored: unknown, axis: TierAxis | undefined): string {
+	if (axis === undefined || axis.values.length === 0) return '';
+	const value = typeof stored === 'string' ? stored.trim() : '';
+	if (axis.values.includes(value)) return value;
+	const fallback = axis.fallback ?? axis.values[0] ?? '';
+	return axis.values.includes(fallback) ? fallback : '';
+}
+
+/**
+ * 一个档位取值的展示名（`low` → `低`）。
+ * @param value - 档位取值。
+ * @param axis - 质量轴（提供 labels）；没有时用取值原文。
+ * @returns 展示名。
+ */
+export function tierLabel(value: string, axis: TierAxis | undefined): string {
+	const label = axis?.labels[value];
+	return label === undefined || label === '' ? value : label;
+}
+
+/**
+ * 一个**家族**（`供应商::词干`）的「常用模型」配置。
+ *
+ * 键是家族而不是模型 id：这正是「同一类型的模型共用一份配置」的落点 ——
+ * 将来网关多出一个 `…-4k` 尾缀的兄弟，它落在同一个词干上，**不用再配一次**。
+ */
+export interface CommonModelConfig {
+	/** 是否进聊天栏那格的「常用」分区。 */
+	pinned: boolean;
+	/**
+	 * 是否使用质量参数（缺省 true）。
+	 *
+	 * `false` 只对**内置预置**有意义：手写的 `models[].tiers` 声明永远优先，
+	 * 它是用户明说过的，不该被一个开关压掉。
+	 */
+	quality: boolean;
+	/** 其他参数：键 → 默认值（空串 = 只声明、默认不传）。 */
+	params: Readonly<Record<string, string>>;
+}
+
+/** 一个家族都没有配过时的缺省值。 */
+export const EMPTY_COMMON: CommonModelConfig = { pinned: false, quality: true, params: {} };
+
+/**
+ * 「常用模型」字段：`{ "供应商::词干": { pinned, quality, params } }`。
+ */
+export const FIELD_COMMON_MODELS = 'commonModels';
+
+/**
+ * 把设置里的 `commonModels` 收敛成一张表（纯函数，形状不可信）。
+ *
+ * 坏数据只让**那一项**退回缺省，不抛错：设置可能被手工改坏，而「这个家族没配过」
+ * 是唯一安全的理解（生成照常进行）。
+ * @param raw - 设置里的原始值。
+ * @returns 家族键 → 配置。
+ */
+export function parseCommonModels(raw: unknown): Record<string, CommonModelConfig> {
+	const out: Record<string, CommonModelConfig> = {};
+	if (raw === null || typeof raw !== 'object') return out;
+	for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+		if (entry === null || typeof entry !== 'object') continue;
+		const record = entry as { pinned?: unknown; quality?: unknown; params?: unknown };
+		const params: Record<string, string> = {};
+		if (record.params !== null && typeof record.params === 'object') {
+			for (const [name, value] of Object.entries(record.params as Record<string, unknown>)) {
+				if (typeof value === 'string') params[name] = value.trim();
+			}
+		}
+		out[key] = {
+			pinned: record.pinned === true,
+			quality: record.quality !== false,
+			params,
+		};
+	}
+	return out;
+}
 
 /** 供应商 id 的合法形状：小写字母开头，只含小写字母 / 数字 / 短横线。 */
 export const PROVIDER_ID_RE = /^[a-z][a-z0-9-]*$/;

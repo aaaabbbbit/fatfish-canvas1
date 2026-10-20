@@ -1,20 +1,25 @@
 /**
- * P7 端到端：画布按会话隔离（真实浏览器 + 真实点击）。
+ * 端到端：画布按工作区分隔（真实浏览器 + 真实点击）。
  *
- * 离线测试能证明「作用域换了键、画布没丢」，但有一件事只有真实 GUI 能证明：
- * **工具条上那枚读数点得动、点完真的换了画布**（P10 之前这项在「视图」菜单里，
- * 现在读数自己就是开关）。链路是
- * 读数按钮 → `state` 偏好 → `scope.applyBoardScope` → `store.setBoardScope`，
- * 外加桥报来的会话 id；任何一环没接上，离线测试都照样全绿。
+ * 离线测试能证明「作用域是工作区路径、拆分按会话走」，但有三件事只有真实 GUI
+ * 能证明：
+ *   1. **桥真的拿得到工作区** —— 工作区来自会话列表行上的 `cwd`，而那行是宿主
+ *      发过来的；离线替身里的 `cwd` 是我们自己塞的（NOTES §8.x：替身与真机一起
+ *      漂移过一次，代价是画布永远空）。
+ *   2. **共用那块上属于当前会话的节点真的被拆出来了**：拆分要用「节点 → 会话 →
+ *      工作区」两步查表，任何一环没接上都只会静静地把节点留在原地。
+ *   3. **工具条上那枚读数点得动、点完真的换了画布**（读数按钮 → `state` 偏好 →
+ *      `scope.applyBoardScope` → `store.setBoardScope`）。
  *
  * 覆盖：
- *   1. 默认共用：工具条读数是「共用画布」，关掉开关时什么都不换
- *   2. 打开隔离：读数变「本会话画布」，出现 **一个** 会话作用域的键，
- *      且它带着原来的画布（adopt —— 用户看不到「画布突然空了」）
- *   3. 键名必须是完整的会话 id（`session-<uuid>`）：削掉前缀会静默落到
- *      别的会话上，是这块功能最容易犯又最看不见的错
- *   4. 关掉隔离：回到共用那块（内容原样），会话那块**保留**在存储里
- *      （下次打开还能回来），刷新之后偏好仍然记得
+ *   1. 默认就按工作区分：读数是「本工作区画布」，且共用那块上属于当前会话的节点
+ *      被拆进当前工作区那块（拆完就渲染出来了）
+ *   2. 拆分只搬认得出来的：没有会话标记的节点留在共用那块
+ *   3. 画布键必须是**完整的工作区路径**（会话的 cwd），与读数上那枚 `data-ffc-scope-path` 一致
+ *   4. 共用那块一个字节都不动（它是全部内容的备份）
+ *   5. 点一下读数：回到「共用画布」（两个节点都在），再点回来还是本工作区
+ *      （节点不重复、不丢）
+ *   6. 刷新之后仍在工作区那块
  *
  * 用法（需放宽沙箱：无头 Chrome 要创建命名管道）：
  *   node scripts/e2e-scope.mjs
@@ -73,17 +78,18 @@ const PROBE = `(() => {
         : null,
     };
   })();
-  // 存储里所有「画布」键：全局那个无后缀，会话作用域的那块带 :session-…。
+  // 存储里所有「画布」键：共用那块无后缀，按工作区的那块带 :<工作区路径>。
   // ⚠️ 前缀必须带冒号：fatfish-canvas:board-scope（偏好）也以
   // fatfish-canvas:board 开头，用不带冒号的前缀筛会把偏好键当成一块画布。
   const keys = Object.keys(window.localStorage).filter((k) => k.indexOf('fatfish-canvas:board') === 0).sort();
   const scoped = keys.filter((k) => k.indexOf('fatfish-canvas:board:') === 0);
+  const nodeIds = qa('.ffc-node').map((n) => n.dataset.nodeId);
   return JSON.stringify({
     mode: document.body.dataset.ffcMode ?? null,
-    // P10：作用域开关从「视图」菜单搬到了工具条那枚读数上（读数自己就是按钮）
     scopeBadge: badge
       ? {
           scope: badge.getAttribute('data-ffc-scope'),
+          path: badge.getAttribute('data-ffc-scope-path'),
           text: (badge.textContent || '').trim(),
           title: badge.getAttribute('title'),
           tag: badge.tagName.toLowerCase(),
@@ -97,23 +103,20 @@ const PROBE = `(() => {
         }
       : null,
     toolbar,
-    boardNodes: qa('.ffc-node').map((n) => n.dataset.nodeId),
+    boardNodes: nodeIds,
+    // 同一个节点渲染两次 = 拆分没去重（画布上会出现两块一模一样的图）
+    boardNodesUnique: new Set(nodeIds).size === nodeIds.length,
     storage: {
       pref: window.localStorage.getItem('fatfish-canvas:board-scope'),
       keys,
       scoped,
-      // 会话候选（本地记录）：用来交叉核对键后缀确实是当前会话的 id
+      // 会话候选（本地记录）：用来给种下的节点标上「是哪个会话生成的」
       current: window.localStorage.getItem('dsh.sessions.current'),
     },
-    // 会话 id 的页面内独立来源（若宿主把当前会话挂在了 DOM 上）
-    domSession: (() => {
-      const el = q('[data-session-id]') || q('[data-session]');
-      return el ? (el.getAttribute('data-session-id') || el.getAttribute('data-session')) : null;
-    })(),
   });
 })()`;
 
-/** 种下的共用画布：一个节点，用来观察「切换会不会把画布弄丢」。 */
+/** 种下的共用画布：两个节点，一个属于当前会话（会被拆走），一个认不出来（留下）。 */
 const SEED = JSON.stringify({
 	version: 2,
 	nodes: [
@@ -127,8 +130,21 @@ const SEED = JSON.stringify({
 			z: 1,
 			status: 'ready',
 			src: 'data:,kept',
-			title: '共用画布上的鱼',
+			title: '本会话生成的鱼',
 			createdAt: 1,
+		},
+		{
+			id: 'orphan',
+			kind: 'image',
+			x: 400,
+			y: 0,
+			w: 320,
+			h: 320,
+			z: 2,
+			status: 'ready',
+			src: 'data:,orphan',
+			title: '不知道是谁生成的鱼',
+			createdAt: 2,
 		},
 	],
 	viewport: { x: 0, y: 0, zoom: 1 },
@@ -139,7 +155,7 @@ const browser = await launch();
 const read = async () => JSON.parse(await evaluate(browser.cdp, PROBE));
 
 /**
- * 点一次作用域读数（P10 起那枚读数自己就是开关）。
+ * 点一次作用域读数（读数自己就是开关）。
  * @returns 点击后的页面事实。
  */
 async function toggleScope() {
@@ -150,21 +166,32 @@ async function toggleScope() {
 	return read();
 }
 
-console.log(`\n肥鱼画布 · P7 端到端（画布按会话隔离）\n目标：${URL_TARGET}\n`);
+console.log(`\n肥鱼画布 · 端到端（画布按工作区分隔）\n目标：${URL_TARGET}\n`);
 
 try {
-	// ── 就位：清掉上一轮留下的会话画布，种下共用画布，进画布模式 ──
+	// ── 就位：先认出当前会话（种下的节点要标上它），再种共用画布、进画布模式 ──
 	let loaded = browser.cdp.once('Page.loadEventFired');
 	await browser.cdp.send('Page.navigate', { url: URL_TARGET });
 	await loaded;
+	await sleep(4000);
+	const candidate = await evaluate(
+		browser.cdp,
+		`(() => { try { return JSON.parse(window.localStorage.getItem('dsh.sessions.current') || 'null')?.sessionId ?? null; } catch { return null; } })()`,
+	);
+	check(
+		'前置：探针 profile 里认得出当前会话（不然「按会话拆分」无从判起）',
+		typeof candidate === 'string' && candidate !== '',
+		String(candidate),
+	);
+
 	await evaluate(
 		browser.cdp,
 		`(() => {
-			// ⚠️ 先把**全局那块**的落图账本读出来 —— 下面会把所有画布键删掉
-			// （包括别的套件留下的会话画布，这是有意隔离），但账本不能跟着丢：
+			// ⚠️ 先把**共用那块**的落图账本读出来 —— 下面会把所有按工作区的画布键删掉
+			// （包括别的套件留下的，这是有意隔离），但账本不能跟着丢：
 			// 账本一空，「最近结果补落」（INGEST_FRESH_MS = 10 分钟）就会把同一个
 			// 会话里刚跑过的 /generate 节点**又造回画布**，后面所有数节点的断言
-			// 都会莫名其妙多出几个（本轮实测：e2e-p4 数到 7 个而不是 3 个）。
+			// 都会莫名其妙多出几个（NOTES §8.61）。
 			let ledger = [];
 			try {
 				const prev = JSON.parse(window.localStorage.getItem('fatfish-canvas:board') || 'null');
@@ -179,11 +206,15 @@ try {
 			// 再 stringify 一次会写成「一个 JSON 字符串」→ store 反序列化出字符串
 			// （typeof !== 'object'）→ 回退成空画布，种下的节点一个都不见。
 			const seed = ${SEED};
+			// 「kept」标上当前会话：拆分就是靠这个字段把它送回本工作区的。
+			seed.nodes[0].sessionId = ${JSON.stringify(candidate)};
 			seed.ingested = ledger;
 			window.localStorage.setItem('fatfish-canvas:board', JSON.stringify(seed));
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'canvas');
 			// 固定成**最窄**的画布宽度：常驻徽标挤爆工具条这件事只在窄的时候发生
 			window.localStorage.setItem('fatfish-canvas:canvas-width', '40%');
+			// 清掉偏好 → 走**默认**（按工作区）。作用域的行为就是这个套件要测的，
+			// 不能被上一轮留下的偏好顶掉。
 			window.localStorage.removeItem('fatfish-canvas:board-scope');
 			return true;
 		})()`,
@@ -195,19 +226,47 @@ try {
 
 	let s = await read();
 	check('画布模式已生效', s.mode === 'canvas', String(s.mode));
-	check('种下的共用画布已渲染', s.boardNodes.includes('kept'), JSON.stringify(s.boardNodes));
 
-	// ── 1. 默认共用 ──
-	console.log('1) 默认：所有会话共用一块画布');
+	// ── 1. 默认就按工作区分 ──
+	console.log('1) 默认：一个工作区一块画布');
 	check(
-		'工具条读数是「共用画布」且 data-ffc-scope=shared',
-		s.scopeBadge?.scope === 'shared' && s.scopeBadge?.text === '共用画布',
+		'工具条读数是「本工作区画布」且 data-ffc-scope=workspace',
+		s.scopeBadge?.scope === 'workspace' && s.scopeBadge?.text === '本工作区画布',
 		JSON.stringify(s.scopeBadge),
 	);
 	check(
-		'起点只有全局那一个画布键',
-		s.storage.keys.length === 1 && s.storage.scoped.length === 0,
+		'读数把工作区路径写在 DOM 上（绝对路径，不是会话 id）',
+		typeof s.scopeBadge?.path === 'string' && /^[A-Za-z]:[\\/]|^\//.test(s.scopeBadge.path),
+		String(s.scopeBadge?.path),
+	);
+	check(
+		'属于当前会话的节点已经拆进本工作区那块，并且渲染出来了',
+		s.boardNodes.includes('kept'),
+		`工作区=${String(s.scopeBadge?.path)} 节点=${JSON.stringify(s.boardNodes)}`,
+	);
+	check(
+		'认不出会话的节点留在共用那块（不在本工作区画布上）',
+		!s.boardNodes.includes('orphan'),
+		JSON.stringify(s.boardNodes),
+	);
+	check(
+		'出现且仅出现一个工作区画布键，后缀就是刚才那个工作区路径',
+		s.storage.scoped.length === 1 &&
+			s.storage.scoped[0] === `fatfish-canvas:board:${String(s.scopeBadge?.path)}`,
 		JSON.stringify(s.storage.keys),
+	);
+	const scopedKey = s.storage.scoped[0] ?? '';
+	const scopedRaw = String(await evaluate(browser.cdp, `window.localStorage.getItem(${JSON.stringify(scopedKey)})`));
+	check(
+		'工作区那块里只写了它自己的节点（没把共用那块整块抄过来）',
+		scopedRaw.includes('"kept"') && !scopedRaw.includes('"orphan"'),
+		scopedRaw.slice(0, 120),
+	);
+	const sharedRaw = String(await evaluate(browser.cdp, "window.localStorage.getItem('fatfish-canvas:board')"));
+	check(
+		'共用那块一个字节都不动（它是全部内容的备份）',
+		sharedRaw.includes('"kept"') && sharedRaw.includes('"orphan"'),
+		sharedRaw.slice(0, 120),
 	);
 	check('偏好还没有写（默认值不该落盘）', s.storage.pref === null, String(s.storage.pref));
 
@@ -229,113 +288,72 @@ try {
 		`visible=${String(s.toolbar?.badgeVisible)} hit=${String(s.toolbar?.badgeHit)} bar=${String(s.toolbar?.w)}px`,
 	);
 
-	// ── 2. 开关本身就是那枚读数（P10：原来的「视图」菜单项已移除） ──
+	// ── 2. 读数即开关 ──
 	console.log('\n2) 作用域读数即开关');
 	s = await read();
 	check('读数是 <button>（不是纯文字徽标）', s.scopeBadge?.tag === 'button', String(s.scopeBadge?.tag));
 	check(
-		'默认未按下（aria-pressed=false，默认共用一块）',
-		s.scopeBadge?.pressed === 'false',
+		'按工作区分时是按下态（aria-pressed=true）',
+		s.scopeBadge?.pressed === 'true',
 		String(s.scopeBadge?.pressed),
 	);
 	check('读数可命中（点得动，不是死按钮）', s.scopeBadge?.hit === true, JSON.stringify(s.scopeBadge));
 	check(
-		'title 说明了点它会切换（读数与开关是同一件事的两面）',
-		String(s.scopeBadge?.title).includes('点击'),
+		'title 带着当前工作区路径，并说明点它会切换',
+		String(s.scopeBadge?.title).includes('点击') &&
+			String(s.scopeBadge?.title).includes(String(s.scopeBadge?.path)),
 		String(s.scopeBadge?.title),
 	);
 
-	// ── 3. 打开隔离：真的换到会话那块，且画布跟着走 ──
-	console.log('\n3) 打开隔离');
+	// ── 3. 切回共用：两个节点都回来 ──
+	console.log('\n3) 切回「共用画布」');
 	s = await toggleScope();
 	check(
-		'工具条读数变成「本会话画布」',
-		s.scopeBadge?.scope === 'session' && s.scopeBadge?.text === '本会话画布',
+		'工具条读数变成「共用画布」',
+		s.scopeBadge?.scope === 'shared' && s.scopeBadge?.text === '共用画布',
 		JSON.stringify(s.scopeBadge),
 	);
-	check('偏好已持久化', s.storage.pref === 'session', String(s.storage.pref));
+	check('偏好已持久化', s.storage.pref === 'shared', String(s.storage.pref));
 	check(
-		'出现且仅出现一个会话画布键',
-		s.storage.scoped.length === 1,
-		JSON.stringify(s.storage.keys),
-	);
-	const scopedKey = s.storage.scoped[0] ?? '';
-	check(
-		'会话画布的键名带完整会话 id（`session-<uuid>`，没被削掉前缀）',
-		/^fatfish-canvas:board:session-[0-9a-fA-F-]{36}$/.test(scopedKey),
-		scopedKey,
-	);
-	check(
-		'画布没有变空：原来的节点被带进了会话画布（adopt）',
-		s.boardNodes.includes('kept'),
+		'共用那块上两个节点都在（拆走的节点没丢：它本来就在这儿）',
+		s.boardNodes.includes('kept') && s.boardNodes.includes('orphan'),
 		JSON.stringify(s.boardNodes),
 	);
-	const scopedRaw = await evaluate(browser.cdp, `window.localStorage.getItem(${JSON.stringify(scopedKey)})`);
+
+	// ── 4. 再切回工作区：幂等，不重复也不丢 ──
+	console.log('\n4) 再切回「本工作区画布」');
+	s = await toggleScope();
 	check(
-		'会话画布键里已经写好了内容（不等下一次改动）',
-		String(scopedRaw).includes('"kept"'),
-		String(scopedRaw).slice(0, 90),
+		'读数回到「本工作区画布」',
+		s.scopeBadge?.scope === 'workspace' && s.scopeBadge?.text === '本工作区画布',
+		JSON.stringify(s.scopeBadge),
 	);
-	const sharedRaw = await evaluate(browser.cdp, "window.localStorage.getItem('fatfish-canvas:board')");
 	check(
-		'共用那块原样保留（采用不等于搬走）',
-		String(sharedRaw).includes('"kept"'),
-		String(sharedRaw).slice(0, 90),
+		'画布上还是那个节点，且**没有重复渲染**（重复 = 拆分没去重）',
+		s.boardNodes.includes('kept') && !s.boardNodes.includes('orphan') && s.boardNodesUnique === true,
+		JSON.stringify(s.boardNodes),
+	);
+	check(
+		'工作区那块仍然只有自己的节点（重复拆分不会把它撑成两份）',
+		String(await evaluate(browser.cdp, `window.localStorage.getItem(${JSON.stringify(scopedKey)})`)).split('"kept"').length === 2,
 	);
 
-	// 交叉核对：会话候选（页面自己记的）与键后缀一致
-	const candidate = (() => {
-		try {
-			return JSON.parse(s.storage.current ?? 'null')?.sessionId ?? null;
-		} catch {
-			return null;
-		}
-	})();
-	check(
-		'键后缀与页面记录的当前会话一致（不是随手编的键）',
-		candidate === null || scopedKey === `fatfish-canvas:board:${String(candidate)}`,
-		`候选=${String(candidate)} 键=${scopedKey}`,
-	);
-
-	// ── 4. 刷新后偏好还记得 ──
-	console.log('\n4) 刷新之后');
+	// ── 5. 刷新后仍在工作区那块 ──
+	console.log('\n5) 刷新之后');
 	loaded = browser.cdp.once('Page.loadEventFired');
 	await browser.cdp.send('Page.reload', { ignoreCache: false });
 	await loaded;
 	await sleep(9000);
 	s = await read();
 	check(
-		'刷新后仍在会话画布上（偏好从存储恢复）',
-		s.scopeBadge?.scope === 'session',
+		'刷新后仍在本工作区画布上',
+		s.scopeBadge?.scope === 'workspace',
 		JSON.stringify(s.scopeBadge),
 	);
 	check(
-		'刷新后画布内容还在（从会话键读回来）',
-		s.boardNodes.includes('kept'),
+		'刷新后画布内容还在（从工作区键读回来）',
+		s.boardNodes.includes('kept') && !s.boardNodes.includes('orphan'),
 		JSON.stringify(s.boardNodes),
-	);
-
-	// ── 5. 关掉隔离：回到共用那块，会话那块留着 ──
-	console.log('\n5) 关掉隔离');
-	s = await toggleScope();
-	check(
-		'工具条读数回到「共用画布」',
-		s.scopeBadge?.scope === 'shared' && s.scopeBadge?.text === '共用画布',
-		JSON.stringify(s.scopeBadge),
-	);
-	check('偏好变回 shared', s.storage.pref === 'shared', String(s.storage.pref));
-	check(
-		'共用画布内容原样',
-		s.boardNodes.includes('kept'),
-		JSON.stringify(s.boardNodes),
-	);
-	const scopedAfter = String(
-		await evaluate(browser.cdp, `window.localStorage.getItem(${JSON.stringify(scopedKey)})`),
-	);
-	check(
-		'会话画布的那块仍然留在存储里（下次开开关还能回来）',
-		s.storage.scoped.length === 1 && scopedAfter.includes('"kept"'),
-		JSON.stringify(s.storage.keys),
 	);
 
 	// ── 截图（人工复核用） ──

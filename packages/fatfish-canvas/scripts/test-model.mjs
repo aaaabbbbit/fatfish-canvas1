@@ -135,9 +135,24 @@ globalThis.window = {
 
 /** 裸 specifier 的桩见文件顶部（必须在 loadTsModule 之前）。 */
 
+/**
+ * 让「已经废弃的 store 实例」的待写盘定时器全部烧完。
+ *
+ * 本文件的每一小节都用**新的模块实例**（`loadTsModule`），每个实例各自带一个
+ * 400ms 去抖写盘定时器；被丢下的实例并不会因此安静 —— 它的定时器会在**后面的
+ * `await` 里**照样触发，把那一节留下的旧画布写回全局键。于是下一节 load 出来的
+ * 画布会莫名其妙多出几个陌生节点（真的出现过：3 个节点里混进两个 `n_…`，
+ * 而且**间歇性**通过，最难查）。
+ * 这不是被测代码的 bug（真实运行中同一时刻只有一个 store 实例，且切换作用域会
+ * 先 flush），是**测试要自己把时间轴清干净**：先等定时器烧完，再 clear，再 load。
+ * @returns 定时器排空后的 promise。
+ */
+const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
+
 // ─────────────────── 载入被测模块 ───────────────────
 
 const model = await loadTsModule(resolve(root, 'src/client/canvas/model.ts'));
+const zip = await loadTsModule(resolve(root, 'src/client/canvas/zip.ts'));
 
 console.log('\n肥鱼画布 · 画布核心逻辑测试\n');
 
@@ -298,6 +313,87 @@ async function freshStore() {
 	check('setSelection 生效', store.getBoard().selection.length === 1);
 	store.clearSelection();
 	check('clearSelection 清空', store.getBoard().selection.length === 0);
+}
+
+{
+	// 撤销（P51）：快照式 —— 删掉的节点要连坐标、尺寸、顺序一起回来。
+	const store = await freshStore();
+	check('新画布没有可撤回的步骤', store.canUndo() === false);
+	check('栈空时撤回无副作用', store.undo() === false && store.getBoard().nodes.length === 0);
+
+	const first = store.addNode({ kind: 'image', x: 11, y: 22, w: 100, h: 100, status: 'ready' });
+	const second = store.addNode({ kind: 'image', x: 33, y: 44, w: 100, h: 100, status: 'ready' });
+	check('新增后栈里有东西', store.canUndo() === true);
+	store.undo();
+	check('撤回一步退回「只剩一个」', store.getBoard().nodes.length === 1);
+	store.undo();
+	check('再撤回一步退回空画布', store.getBoard().nodes.length === 0);
+	check('撤完栈空', store.canUndo() === false);
+	check('栈空后再撤回无效', store.undo() === false);
+	void first;
+	void second;
+
+	const a = store.addNode({ kind: 'image', x: 11, y: 22, w: 100, h: 100, status: 'ready' });
+	const b = store.addNode({ kind: 'image', x: 33, y: 44, w: 100, h: 100, status: 'ready' });
+
+	// 视口与选择集不进历史：它们不换 nodes 引用
+	store.setViewport({ x: -1, y: -2, zoom: 1.5 });
+	store.setSelection([b.id]);
+	store.clearSelection();
+
+	store.removeNodes([a.id]);
+	check('删除后可撤回', store.canUndo() === true);
+	store.undo();
+	const back = store.getBoard().nodes.find((node) => node.id === a.id);
+	check('撤回把删掉的节点放回来', back !== undefined);
+	check('撤回还原坐标与尺寸', back !== undefined && back.x === 11 && back.y === 22 && back.w === 100);
+	check(
+		'撤回还原前后顺序',
+		store.getBoard().nodes.map((node) => node.id).join(',') === `${a.id},${b.id}`,
+		store.getBoard().nodes.map((node) => node.id).join(','),
+	);
+
+	// 视口变更同样不占撤销步：撤回落到的是「节点那一步」，连视口一起还原
+	store.removeNodes([b.id]);
+	store.setViewport({ x: 999, y: 999, zoom: 2 });
+	store.undo();
+	check('视口变更不占撤销步', store.getBoard().nodes.length === 2, String(store.getBoard().nodes.length));
+	check('撤回连视口一起还原', store.getBoard().viewport.zoom === 1.5, String(store.getBoard().viewport.zoom));
+
+	// 连删两个节点是两件事：不能被时间窗并成一步
+	store.removeNodes([a.id]);
+	store.removeNodes([b.id]);
+	store.undo();
+	check('连删两步：撤一步只回来一个', store.getBoard().nodes.length === 1);
+	store.undo();
+	check('再撤一步回满', store.getBoard().nodes.length === 2);
+
+	// 拖拽每帧都在 patchNodes：同一批节点的连续微调必须并成一步
+	store.patchNodes(new Map([[a.id, { x: 100 }]]));
+	store.patchNodes(new Map([[a.id, { x: 110 }]]));
+	store.patchNodes(new Map([[a.id, { x: 120 }]]));
+	store.undo();
+	check(
+		'拖拽的连续微调并成一步（不会塞满撤销栈）',
+		store.getBoard().nodes.find((node) => node.id === a.id).x === 11,
+		String(store.getBoard().nodes.find((node) => node.id === a.id).x),
+	);
+
+	// 最吓人的那个动作也要能退回来
+	store.clearBoard();
+	check('清空后画布为空', store.getBoard().nodes.length === 0);
+	store.undo();
+	check('清空画布可撤回', store.getBoard().nodes.length === 2);
+}
+
+{
+	// 换工作区必须清空撤销栈：否则在工作区 B 按一下 Ctrl+Z 会把 A 的节点搬进来
+	// （「一个工作区一块画布」是数据隔离，不只是显示）。
+	const store = await freshStore();
+	store.addNode({ kind: 'image', x: 0, y: 0, w: 10, h: 10, status: 'ready' });
+	check('新增后可撤回', store.canUndo() === true);
+	store.setBoardScope('D:\\ws\\one');
+	check('换工作区后撤销栈清空', store.canUndo() === false);
 }
 
 {
@@ -664,6 +760,581 @@ console.log('\n3c) 生成模型目录');
 		settings.mediaCatalog(null).image.length === 0 && settings.mediaCatalog(undefined).video.length === 0,
 	);
 	check('目录：默认值缺失时为空串（= 自动）', settings.mediaCatalog({ providers: {} }).defaults.image === '');
+	// 设计技能开关（P41）：缺席 = 开，只有显式 false 才算关 —— 与宿主 schema 缺省同一语义
+	check(
+		'目录：设计技能缺省按开算（缺席一律 = 开）',
+		settings.mediaCatalog({ providers: {} }).designSkillOn === true &&
+			catalog.designSkillOn === true,
+		String(catalog.designSkillOn),
+	);
+	check(
+		'目录：显式关了才报关（尾巴右键写的 false 在这里读得回来）',
+		settings.mediaCatalog({ providers: {}, designSkillOn: false }).designSkillOn === false,
+	);
+	check(
+		'目录：坏数据 / 非布尔不吞掉开关语义（任何不是 false 的值都按开算）',
+		settings.mediaCatalog({ providers: {}, designSkillOn: 0 }).designSkillOn === true,
+	);
+}
+
+// ─────── 3d. 档位：分辨率轴（兄弟 id）+ 质量轴（请求参数） ───────
+
+console.log('\n3d) 档位：家族与两条轴');
+
+{
+	const settings = await loadTsModule(resolve(root, 'src/client/settings/models.ts'));
+	const catalogLib = await loadTsModule(resolve(root, 'src/client/shared/catalog.ts'));
+
+	// ── 分辨率轴：纯名字派生，因此「检测」就是一次拆分 ──
+	const split = catalogLib.splitTier('gpt-image-2.5-sunburst-2k');
+	check(
+		'splitTier：尾部的档位词拆出去，剩下的是家族词干',
+		split.stem === 'gpt-image-2.5-sunburst' && split.tier === '2k',
+		JSON.stringify(split),
+	);
+	check(
+		'splitTier：认不出的尾巴不算档位（宁可不分组，也不误分组）',
+		catalogLib.splitTier('gpt-image-1').tier === '' &&
+			catalogLib.splitTier('Kwai-Kolors/Kolors').tier === '' &&
+			catalogLib.splitTier('2k').tier === '',
+		[
+			catalogLib.splitTier('gpt-image-1').tier,
+			catalogLib.splitTier('Kwai-Kolors/Kolors').tier,
+			catalogLib.splitTier('2k').tier,
+		].join('|'),
+	);
+	check(
+		'家族键按供应商隔离（两个供应商的同名词干不会挤成一行）',
+		catalogLib.familyRefOf('acme', 'shot-2k') === 'acme::shot' &&
+			catalogLib.familyRefOf('bare', 'shot-2k') !== catalogLib.familyRefOf('acme', 'shot-2k'),
+		catalogLib.familyRefOf('acme', 'shot-2k'),
+	);
+
+	// ── 质量轴：声明制（`/models` 没有任何「收哪些 quality」的信号） ──
+	check(
+		'parseTierAxis：坏形状一律当作「没有轴」（不抛：设置可能被手工改坏）',
+		catalogLib.parseTierAxis(null) === undefined &&
+			catalogLib.parseTierAxis('quality') === undefined &&
+			catalogLib.parseTierAxis({ param: 'quality', values: [] }) === undefined &&
+			catalogLib.parseTierAxis({ param: '', values: ['low'] }) === undefined,
+	);
+	check(
+		'parseTierAxis：拒掉会写坏请求的参数名（model / prompt / n / image）',
+		['model', 'prompt', 'n', 'image'].every(
+			(param) => catalogLib.parseTierAxis({ param, values: ['low'] }) === undefined,
+		),
+	);
+	check(
+		'parseTierAxis：取值去重、labels 只留非空串',
+		(() => {
+			const axis = catalogLib.parseTierAxis({
+				param: 'quality',
+				values: ['low', 'low', '', 'high'],
+				labels: { low: '低', high: '  ', junk: 3 },
+			});
+			return (
+				axis !== undefined &&
+				axis.values.join(',') === 'low,high' &&
+				axis.labels.low === '低' &&
+				axis.labels.high === undefined &&
+				axis.labels.junk === undefined
+			);
+		})(),
+	);
+	check(
+		'currentTier：存的值合法就用它，非法/缺失退回第一个取值',
+		catalogLib.currentTier('high', { param: 'q', values: ['low', 'high'], labels: {} }) === 'high' &&
+			catalogLib.currentTier('  ', { param: 'q', values: ['low', 'high'], labels: {} }) === 'low' &&
+			catalogLib.currentTier('nope', { param: 'q', values: ['low', 'high'], labels: {} }) === 'low',
+	);
+
+	// ── 目录：模型条目带上家族与轴 ──
+	const CONFIG = {
+		providers: {
+			acme: {
+				label: 'Acme',
+				models: [
+					{ id: 'shot-1k', kind: 'image' },
+					{ id: 'shot-2k', kind: 'image' },
+					{
+						id: 'shot-4k',
+						kind: 'image',
+						// 声明写在**任意一个**成员上都算这个家族的（这里刻意写在 4k 上）
+						tiers: { param: 'quality', values: ['low', 'high'], labels: { low: '低', high: '高' } },
+					},
+					{ id: 'solo', kind: 'image' },
+					{ id: 'lone-with-axis', kind: 'image', tiers: { param: 'quality', values: ['low', 'high'] } },
+				],
+			},
+			bare: { models: [{ id: 'shot-8k', kind: 'image' }] },
+		},
+		defaultImage: 'acme::shot-2k',
+		defaultTiers: { 'acme::shot': 'high' },
+	};
+	const catalog = settings.mediaCatalog(CONFIG);
+	const rows = settings.pickRows(catalog.image, catalog.tiers);
+	const shot = rows.find((row) => row.key === 'acme::shot');
+
+	check('目录：模型条目带上家族键与分辨率档位词',
+		catalog.image[1].familyRef === 'acme::shot' && catalog.image[1].tier === '2k',
+		`${catalog.image[1].familyRef} / ${catalog.image[1].tier}`);
+	check('目录：家族里谁声明，全体成员都拿到这条轴',
+		catalog.image[0].axis?.param === 'quality' && catalog.image[2].axis?.param === 'quality');
+	check('目录：当前档位从 defaultTiers 读出来', catalog.tiers['acme::shot'] === 'high');
+	check(
+		'pickRows：三个分辨率兄弟折成一行（家族名 = 词干）',
+		shot !== undefined && shot.kind === 'family' && shot.label === 'shot' && shot.options.length === 3,
+		JSON.stringify(shot?.kind === 'family' ? [shot.label, shot.options.length] : shot),
+	);
+	check('pickRows：家族当前档位取生效值', shot?.kind === 'family' && shot.tier === 'high', String(shot?.tier));
+	check(
+		'pickRows：没有兄弟、也没有声明的模型仍是平铺行（升级后观感不变）',
+		rows.some((row) => row.kind === 'one' && row.option.modelId === 'solo'),
+		rows.map((row) => row.kind).join(','),
+	);
+	check(
+		'pickRows：只有一个成员也可以是一个家族（声明了轴就要能选出档位）',
+		rows.some((row) => row.kind === 'family' && row.options.length === 1 && row.options[0].modelId === 'lone-with-axis'),
+	);
+	check(
+		'pickRows：另一个供应商的同名词干自成一个平铺行（不跨供应商合并）',
+		rows.filter((row) => row.kind === 'one' && row.option.providerId === 'bare').length === 1,
+	);
+	check(
+		'pickRows：存了一个已经不在取值清单里的档位 → 退回第一个取值',
+		settings.pickRows(catalog.image, { 'acme::shot': 'ultra' }).find((row) => row.key === 'acme::shot')?.tier === 'low',
+	);
+	check(
+		'tierTextOf：当前模型在家族里就报出档位展示名，否则空串',
+		settings.tierTextOf(rows, 'acme::shot-2k') === '高' &&
+			settings.tierTextOf(rows, 'acme::solo') === '' &&
+			settings.tierTextOf(rows, 'acme::lone-with-axis') === 'low',
+		String(settings.tierTextOf(rows, 'acme::shot-2k')),
+	);
+
+	// ── 设置页草稿 ⇄ 轴（读取与写入共用同一个校验） ──
+	const draft = settings.parseTierDraft('quality', 'low=低, high=高');
+	check(
+		'parseTierDraft：取值与中文展示名都解析出来',
+		draft.axis?.values.join(',') === 'low,high' && draft.axis.labels.high === '高',
+		JSON.stringify(draft.axis),
+	);
+	check(
+		'parseTierDraft：中文逗号也认，缺省展示名用取值原文',
+		settings.parseTierDraft('quality', 'low，high').axis?.values.join(',') === 'low,high' &&
+			settings.parseTierDraft('quality', 'low，high').axis.labels.low === undefined,
+	);
+	check(
+		'parseTierDraft：参数名非法 / 保留名 / 空取值都当场报错（不写进去再静默失效）',
+		settings.parseTierDraft('Model', 'low').axis === undefined &&
+			settings.parseTierDraft('model', 'low').error !== '' &&
+			settings.parseTierDraft('quality', '  ').error !== '',
+		settings.parseTierDraft('model', 'low').error,
+	);
+	check(
+		'tierDraftOf：把已存的轴还原成草稿原文（打开编辑器时预填）',
+		settings.tierDraftOf(settings.parseTierDraft('quality', 'low=低, high').axis) === 'low=低, high',
+		settings.tierDraftOf(settings.parseTierDraft('quality', 'low=低, high').axis),
+	);
+}
+
+// ─────── 3e. 常用模型：类型预置 / 其他参数 / 家族行（P29） ───────
+
+console.log('\n3e) 常用模型：类型预置与其他参数');
+
+{
+	const settings = await loadTsModule(resolve(root, 'src/client/settings/models.ts'));
+	const presets = await loadTsModule(resolve(root, 'src/client/shared/modelPresets.ts'));
+	const catalogLib = await loadTsModule(resolve(root, 'src/client/shared/catalog.ts'));
+
+	// ── 预置按词干匹配：这就是「覆盖将来带 2K / 4K 尾缀的模型」的落点 ──
+	const stemOf = (id) => catalogLib.splitTier(id).stem;
+	check(
+		'预置：同一个类型的 -1k / -2k / -4k 兄弟命中同一条预置',
+		['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k'].every(
+			(id) => presets.presetOf('image', stemOf(id))?.id === 'gpt-image-2',
+		),
+		['gpt-image-2', 'gpt-image-2-2k', 'gpt-image-2-4k']
+			.map((id) => `${id}→${presets.presetOf('image', stemOf(id))?.id ?? '(无)'}`)
+			.join(','),
+	);
+	check(
+		'预置：更具体的前缀先匹配（2.5 的兄弟不会被 2 那条吃掉）',
+		presets.presetOf('image', stemOf('gpt-image-2.5-sunburst-2k'))?.id === 'gpt-image-2.5' &&
+			presets.presetOf('image', stemOf('nano-banana-pro-4k'))?.id === 'nano-banana',
+		[
+			presets.presetOf('image', stemOf('gpt-image-2.5-sunburst-2k'))?.id,
+			presets.presetOf('image', stemOf('nano-banana-pro-4k'))?.id,
+		].join(','),
+	);
+	check(
+		'预置：gemini-nano-banana-2.1 与**之前的香蕉是同一条**（2.1 不是新系列；' +
+			'参数也只有 aspect_ratio + image_size，与 T8-penguin-canvas 的 banana-ratio 通道一致）',
+		['gemini-nano-banana-2.1', 'gemini-nano-banana-2.1-4k'].every(
+			(id) => presets.presetOf('image', stemOf(id))?.id === 'nano-banana',
+		) &&
+			presets
+				.presetOf('image', stemOf('gemini-nano-banana-2.1'))
+				.params.map((spec) => spec.key)
+				.join(',') === 'aspect_ratio,image_size' &&
+			presets
+				.presetOf('image', stemOf('gemini-nano-banana-2.1'))
+				.params.find((spec) => spec.key === 'image_size')
+				.values.join(',') === '1K,2K,4K',
+		['gemini-nano-banana-2.1', 'gemini-nano-banana-2.1-4k']
+			.map((id) => `${id}→${presets.presetOf('image', stemOf(id))?.id ?? '(无)'}`)
+			.join(','),
+	);
+	check(
+		'预置：种类不串（视频词干不会命中图像预置）',
+		presets.presetOf('video', 'gpt-image-2') === undefined &&
+			presets.presetOf('video', 'sora-2')?.id === 'sora',
+		String(presets.presetOf('video', 'sora-2')?.id),
+	);
+	check(
+		'预置：认不出来的模型没有预置（宁可不猜，也不要塞错参数）',
+		presets.presetOf('image', 'Kwai-Kolors/Kolors') === undefined &&
+			presets.presetOf('image', 'acme-large') === undefined,
+	);
+
+	// ── MiniMax H3（海螺）：这一族走 seedance-nz 协议，键名与缺省那套逐个不同 ──
+	const minimax = presets.presetOf('video', stemOf('minimax-h3-ow-r2v'));
+	const minimaxSpec = (key) => minimax?.params.find((spec) => spec.key === key);
+	check(
+		'预置：MiniMax H3 一族（-ow-t2v / -ow-r2v / -fast）共用一条，键按 seedance-nz 协议声明',
+		minimax?.id === 'minimax-h3' &&
+			minimax.wire === 'seedance-nz' &&
+			['minimax-h3-ow-t2v', 'minimax-h3-ow-r2v-fast'].every(
+				(id) => presets.presetOf('video', stemOf(id))?.id === 'minimax-h3',
+			) &&
+			minimaxSpec('seconds')?.values.join(',') === '5,10,15' &&
+			minimaxSpec('resolution')?.values.join(',') === '480P,768P,1080P' &&
+			minimaxSpec('ratio')?.values.join(',') === '1:1,2:3,3:2,3:4,4:3,9:16,16:9,21:9' &&
+			// 设置页里的键是平铺的，请求体里是 `metadata.…` —— 提示文案与拼装必须同一份说法
+			presets.wirePathOf(minimax.wire, 'resolution') === 'metadata.resolution' &&
+			presets.wirePathOf(minimax.wire, 'seconds') === 'seconds' &&
+			presets.wirePathOf(undefined, 'resolution') === 'resolution',
+		JSON.stringify(minimax?.params.map((spec) => spec.key)),
+	);
+
+	// ── MJ 出图：参数不是请求体字段，而是提示词里的 flag（`wire: 'mj-imagine'`） ──
+	const mjImagine = presets.presetOf('image', stemOf('mj_fast_imagine'));
+	check(
+		'预置：mj_fast_imagine 命中 mj-imagine（提示文案给的是 --flag，不是请求体路径）',
+		mjImagine?.id === 'mj-imagine' &&
+			mjImagine.wire === 'mj-imagine' &&
+			mjImagine.params.some((spec) => spec.key === 'ar') &&
+			presets.wirePathOf(mjImagine.wire, 'stylize') === '--stylize（拼进提示词，不是请求体字段）',
+		JSON.stringify(mjImagine?.params.map((spec) => spec.key)),
+	);
+	check(
+		'预置：relax / turbo / 别的动作**刻意不命中这条**（模式是路径或令牌选的 —— 挂上它就是静默按 fast 计费）',
+		['mj_relax_imagine', 'mj_turbo_imagine', 'mj_fast_upscale'].every(
+			(id) => presets.presetOf('image', stemOf(id)) === undefined,
+		),
+		['mj_relax_imagine', 'mj_turbo_imagine', 'mj_fast_upscale']
+			.map((id) => `${id}→${presets.presetOf('image', stemOf(id))?.id ?? '(无)'}`)
+			.join(','),
+	);
+
+	// ── 质量轴：预置摆出 chip，但**默认不传**（用户点一下才进请求体） ──
+	const axis = presets.presetAxisOf(presets.presetOf('image', 'gpt-image-2'));
+	check(
+		'预置的质量轴：取值齐、默认「未选」（fallback 空串 = 不写进请求体）',
+		axis?.param === 'quality' &&
+			axis.values.join(',') === 'auto,low,medium,high' &&
+			catalogLib.currentTier(undefined, axis) === '' &&
+			catalogLib.currentTier('high', axis) === 'high',
+		JSON.stringify({ values: axis?.values, fallback: axis?.fallback, now: catalogLib.currentTier(undefined, axis) }),
+	);
+	check(
+		'手写声明仍然默认取第一个取值（P28 的行为没被预置改掉）',
+		catalogLib.currentTier(undefined, { param: 'q', values: ['low', 'high'], labels: {} }) === 'low',
+	);
+
+	// ── 值的收敛：声明过的键按类型转，自加的键认字面量 ──
+	const specN = { key: 'n', label: '张数', type: 'number' };
+	check(
+		'coerceParam：数字类型转成数字（"2" → 2），转不了就当作没填',
+		presets.coerceParam(specN, '2') === 2 &&
+			presets.coerceParam(specN, 4) === 4 &&
+			presets.coerceParam(specN, 'two') === undefined,
+		JSON.stringify([presets.coerceParam(specN, '2'), presets.coerceParam(specN, 'two')]),
+	);
+	check(
+		'coerceParam：布尔类型只认 true / false',
+		presets.coerceParam({ key: 'watermark', label: '水印', type: 'boolean' }, 'true') === true &&
+			presets.coerceParam({ key: 'watermark', label: '水印', type: 'boolean' }, 'maybe') === undefined,
+	);
+	check(
+		'coerceParam：自加的键认字面量（`2` 当数字），其余原样',
+		presets.coerceParam(undefined, '2') === 2 &&
+			presets.coerceParam(undefined, 'true') === true &&
+			presets.coerceParam(undefined, '2048x2048') === '2048x2048',
+		JSON.stringify([presets.coerceParam(undefined, '2'), presets.coerceParam(undefined, '2048x2048')]),
+	);
+	check(
+		'coerceParam：闭集不是校验器（网关支持什么我们并不知道，别把值挡在门外）',
+		presets.coerceParam({ key: 'size', label: '尺寸', values: ['1024x1024'] }, '3840x2160') === '3840x2160',
+	);
+	check(
+		'isParamKey：保留键与非法形状一律不收（model / prompt / n / image 会把请求写坏；' +
+			'n 尤其 —— 网关按它出图、我们只读 data[0]，n>1 是静默丢图）',
+		!presets.isParamKey('model') &&
+			!presets.isParamKey('prompt') &&
+			!presets.isParamKey('n') &&
+			!presets.isParamKey('image') &&
+			!presets.isParamKey('Size') &&
+			presets.isParamKey('output_format') &&
+			// 与质量轴那份清单**同源**（各写一份曾经漂移：设置页不让声明、宿主却照收）
+			catalogLib.parseTierAxis({ param: 'n', values: ['low'] }) === undefined,
+	);
+
+	// ── 目录：预置顶上来之后，聊天栏那格才有 chip 可选 ──
+	const CONFIG = {
+		providers: {
+			acme: {
+				label: 'Acme',
+				models: [
+					{ id: 'gpt-image-2', kind: 'image' },
+					{ id: 'gpt-image-2-2k', kind: 'image' },
+					{ id: 'gpt-image-2-4k', kind: 'image' },
+					{ id: 'acme-large', kind: 'image' },
+				],
+			},
+			bare: { models: [{ id: 'sora-2', kind: 'video' }] },
+		},
+		commonModels: {
+			'acme::gpt-image-2': { pinned: true, quality: true, params: { size: '2048x2048' } },
+		},
+	};
+	const catalog = settings.mediaCatalog(CONFIG);
+	const rows = settings.pickRows(catalog.image, catalog.tiers);
+	const family = rows.find((row) => row.key === 'acme::gpt-image-2');
+
+	check(
+		'目录：预置让三个分辨率兄弟折成一行，且带上了质量轴（零配置就有 chip）',
+		family?.kind === 'family' &&
+			family.options.length === 3 &&
+			family.axis?.param === 'quality' &&
+			family.tier === '',
+		JSON.stringify(family?.kind === 'family' ? [family.options.length, family.axis?.param, family.tier] : family),
+	);
+	check(
+		'目录：认不出的模型仍是平铺行（预置没命中就什么都不变）',
+		rows.some((row) => row.kind === 'one' && row.option.modelId === 'acme-large'),
+		rows.map((row) => row.kind).join(','),
+	);
+	check(
+		'目录：勾了「常用」的家族读得出来（聊天栏那格据此分区）',
+		catalog.common['acme::gpt-image-2']?.pinned === true &&
+			catalog.common['acme::acme-large'] === undefined,
+		JSON.stringify(Object.keys(catalog.common)),
+	);
+	check(
+		'目录：设置里的其他参数读得出来（键值原样，收敛在宿主侧做）',
+		catalog.common['acme::gpt-image-2']?.params.size === '2048x2048',
+		JSON.stringify(catalog.common['acme::gpt-image-2']?.params),
+	);
+	check(
+		'目录：坏形状的 commonModels 整项丢掉（下游用缺省值兜，不抛错）',
+		(() => {
+			const bad = settings.mediaCatalog({ providers: {}, commonModels: { x: null, y: 'nope' } });
+			return bad.common.x === undefined && bad.common.y === undefined;
+		})(),
+		JSON.stringify(settings.mediaCatalog({ providers: {}, commonModels: { x: null } }).common),
+	);
+
+	// ── 关掉质量参数：预置的轴不再顶上来 ──
+	const offCatalog = settings.mediaCatalog({
+		...CONFIG,
+		commonModels: { 'acme::gpt-image-2': { pinned: false, quality: false, params: {} } },
+	});
+	check(
+		'目录：设置里关掉质量参数之后，预置的轴不再顶上来（回到平铺 + 折叠都没有）',
+		offCatalog.image[0]?.axis === undefined &&
+			settings
+				.pickRows(offCatalog.image, {})
+				.find((row) => row.key === 'acme::gpt-image-2')?.axis === undefined,
+		JSON.stringify(offCatalog.image[0]?.axis ?? null),
+	);
+
+	// ── 聊天栏那格的分区：勾过的排前面，一个都没勾就照旧铺开 ──
+	const partition = settings.pickerPartition(rows, catalog.common);
+	check(
+		'pickerPartition：勾了常用的家族分到「常用」那一段（其余进「其他模型」）',
+		partition.pinned.length === 1 &&
+			partition.pinned[0]?.key === 'acme::gpt-image-2' &&
+			partition.others.some((row) => row.key === 'acme::acme-large'),
+		`pinned=${partition.pinned.map((row) => row.key).join(',')} others=${partition.others.length}`,
+	);
+	check(
+		'pickerPartition：没勾过任何常用时「常用」为空（观感与升级前一致）',
+		settings.pickerPartition(rows, {}).pinned.length === 0 &&
+			settings.pickerPartition(rows, {}).others.length === rows.length,
+	);
+	check(
+		'pickerPartition：平铺行也能勾常用（两种行的 key 都是家族键）',
+		settings.pickerPartition(rows, { 'acme::acme-large': { pinned: true, quality: true, params: {} } }).pinned[0]
+			?.kind === 'one',
+	);
+
+	// ── 点档位 = 选用这个模型（家族行只是展开开关，只有一个成员的家族没有别的入口） ──
+	const familyRowsOf = (models) =>
+		settings.pickRows(settings.mediaCatalog({ providers: { acme: { models } } }).image, {});
+	const single = familyRowsOf([{ id: 'gpt-image-2', kind: 'image' }]).find((row) => row.kind === 'family');
+	const pair = familyRowsOf([
+		{ id: 'gpt-image-2-2k', kind: 'image' },
+		{ id: 'gpt-image-2-4k', kind: 'image' },
+	]).find((row) => row.kind === 'family');
+	const withBase = familyRowsOf([
+		{ id: 'gpt-image-2-4k', kind: 'image' },
+		{ id: 'gpt-image-2', kind: 'image' },
+	]).find((row) => row.kind === 'family');
+
+	check(
+		'familyTarget：只有一个成员的家族也要能选中它（「展开挡住了选用按钮」的修法）',
+		settings.familyTarget(single, '')?.ref === 'acme::gpt-image-2',
+		String(settings.familyTarget(single, '')?.ref),
+	);
+	check(
+		'familyTarget：当前默认已经在这个家族里 → 就用它（换档不会顺带换分辨率）',
+		settings.familyTarget(pair, 'acme::gpt-image-2-4k')?.ref === 'acme::gpt-image-2-4k' &&
+			settings.familyTarget(withBase, 'acme::gpt-image-2-4k')?.ref === 'acme::gpt-image-2-4k',
+		String(settings.familyTarget(pair, 'acme::gpt-image-2-4k')?.ref),
+	);
+	check(
+		'familyTarget：当前默认不在这个家族里 → 优先选不带分辨率尾缀的那个（基名）',
+		settings.familyTarget(withBase, 'other::x')?.ref === 'acme::gpt-image-2',
+		String(settings.familyTarget(withBase, 'other::x')?.ref),
+	);
+	check(
+		'familyTarget：家族里全是尾缀档（没有基名）→ 退回第一个',
+		settings.familyTarget(pair, 'other::x')?.ref === 'acme::gpt-image-2-2k',
+		String(settings.familyTarget(pair, 'other::x')?.ref),
+	);
+
+	// ── 设置页那一块的数据：家族行 ──
+	const families = settings.familyRows(CONFIG);
+	const gpt = families.find((row) => row.familyRef === 'acme::gpt-image-2');
+	check(
+		'familyRows：一个家族一行，成员含全部 -2k / -4k 兄弟（将来多一个尾缀也自动进这一行）',
+		gpt?.members.join(',') === 'gpt-image-2,gpt-image-2-2k,gpt-image-2-4k' &&
+			gpt.preset?.id === 'gpt-image-2' &&
+			gpt.declared === false,
+		JSON.stringify(gpt?.members),
+	);
+	check(
+		'familyRows：视频家族也在（种类只影响预置匹配与徽标）',
+		families.some(
+			(row) => row.familyRef === 'bare::sora-2' && row.kind === 'video' && row.preset?.id === 'sora',
+		),
+		families.map((row) => row.familyRef).join(','),
+	);
+	check(
+		'familyRows：视觉模型不进这一块（它不是产物，没有档位也没有常用之说）',
+		settings
+			.familyRows({ providers: { a: { models: [{ id: 'vl-1', kind: 'vision' }] } } })
+			.length === 0,
+	);
+	check(
+		'familyRows：用户那把 mj_fast_imagine（挂在 custom 供应商下）照样成一行，并挂上 MJ 那套参数',
+		(() => {
+			const row = settings.familyRows({
+				providers: { custom: { models: [{ id: 'mj_fast_imagine', kind: 'image' }] } },
+			})[0];
+			return (
+				row?.familyRef === 'custom::mj_fast_imagine' &&
+				row.preset?.id === 'mj-imagine' &&
+				row.preset.label === 'Midjourney Imagine'
+			);
+		})(),
+	);
+	check(
+		'familyRows：2.1 是**自己一行**（与 3.1-preview 不并——并了它就从聊天栏那格的常用里消失）',
+		(() => {
+			// 用用户真实的三个 id + 真实的顺序（-2k 在前、2.1 在最后）
+			const rows = settings.familyRows({
+				providers: {
+					custom: {
+						models: [
+							{ id: 'gemini-3.1-flash-image-preview-2k', kind: 'image' },
+							{ id: 'gemini-3.1-flash-image-preview', kind: 'image' },
+							{ id: 'gemini-nano-banana-2.1', kind: 'image' },
+						],
+					},
+				},
+			});
+			const preview = rows.find((row) => row.familyRef === 'custom::gemini-3.1-flash-image-preview');
+			const nano = rows.find((row) => row.familyRef === 'custom::gemini-nano-banana-2.1');
+			return (
+				rows.length === 2 &&
+				preview?.members.join(',') === 'gemini-3.1-flash-image-preview-2k,gemini-3.1-flash-image-preview' &&
+				nano?.members.join(',') === 'gemini-nano-banana-2.1' &&
+				// 行分开、预置共用：2.1 照旧拿到香蕉那份参数（aspect_ratio + image_size）
+				preview?.preset?.id === 'nano-banana' &&
+				nano?.preset?.id === 'nano-banana' &&
+				nano?.stem === 'gemini-nano-banana-2.1'
+			);
+		})(),
+		(() => {
+			const rows = settings.familyRows({
+				providers: {
+					custom: {
+						models: [
+							{ id: 'gemini-3.1-flash-image-preview-2k', kind: 'image' },
+							{ id: 'gemini-3.1-flash-image-preview', kind: 'image' },
+							{ id: 'gemini-nano-banana-2.1', kind: 'image' },
+						],
+					},
+				},
+			});
+			return rows.map((row) => `${row.familyRef}[${row.members.join('/')}]`).join(' | ');
+		})(),
+	);
+	check(
+		'familyRows：两行的配置各归各的（老键 `custom::gemini-3.1-flash-image-preview` 只作用在预览那行）',
+		(() => {
+			const rows = settings.familyRows({
+				providers: {
+					custom: {
+						models: [
+							{ id: 'gemini-3.1-flash-image-preview', kind: 'image' },
+							{ id: 'gemini-nano-banana-2.1', kind: 'image' },
+						],
+					},
+				},
+				commonModels: {
+					'custom::gemini-3.1-flash-image-preview': { pinned: true },
+					'custom::gemini-nano-banana-2.1': { pinned: true, params: { image_size: '2K' } },
+				},
+			});
+			const preview = rows.find((row) => row.familyRef === 'custom::gemini-3.1-flash-image-preview');
+			const nano = rows.find((row) => row.familyRef === 'custom::gemini-nano-banana-2.1');
+			return (
+				rows.length === 2 &&
+				preview?.common.pinned === true &&
+				preview?.common.params.image_size === undefined &&
+				nano?.common.pinned === true &&
+				nano?.common.params.image_size === '2K'
+			);
+		})(),
+	);
+	check(
+		'familyRows：手写声明优先，并标出「这是声明的」（设置页据此显示「清除声明」）',
+		(() => {
+			const row = settings.familyRows({
+				providers: {
+					a: { models: [{ id: 'gpt-image-2', kind: 'image', tiers: { param: 'resolution', values: ['1k'] } }] },
+				},
+			})[0];
+			return row?.declared === true && row.axis?.param === 'resolution';
+		})(),
+	);
+	check(
+		'familyRows：坏数据不炸（null / 非数组 models）',
+		settings.familyRows({ providers: { a: null, b: { models: 'x' } } }).length === 0,
+	);
 }
 
 // ─────────────────── 4. 生成结果 → 画布落图（P3） ───────────────────
@@ -671,6 +1342,11 @@ console.log('\n3c) 生成模型目录');
 console.log('\n4) 生成结果 → 画布落图（P3）');
 
 {
+	// ⚠️ 先排空**前面小节遗留的去抖写盘**再清存储（见 drainPersistTimers 的说明）：
+	// 少了这一句，3b 的拖放测试留下的 400ms 定时器会在本节的某个 await 里落地，
+	// 把它的画布写回全局键 —— 本节 load 出来的画布就多出几个陌生节点
+	// （现象：`节点 id 由 callId 派生` 等一串断言全红，而且**间歇性**）。
+	await drainPersistTimers();
 	storage.clear();
 	// ingest 与 store 必须共用同一份模块实例：落图动作写的是 store 的模块级
 	// 状态，若各加载一份，断言读到的会是另一个空画布。
@@ -680,7 +1356,11 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 	const ingest = await loadTsModule(resolve(root, 'src/client/canvas/ingest.ts'), shared);
 	const media = await loadTsModule(resolve(root, 'src/client/shared/media.ts'), shared);
 
-	const callArgs = JSON.stringify({ prompt: '一只肥鱼', kind: 'image' });
+	const callArgs = JSON.stringify({
+		prompt: '一只肥鱼',
+		kind: 'image',
+		reference: ['https://media.test/ref.png', 'attached'],
+	});
 	const runningSnap = (callId, name = 'media_generate', argsRaw = callArgs) => ({
 		runningCalls: [{ callId, name, argsRaw }],
 		nodes: [],
@@ -746,6 +1426,26 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 			const a = media.parseMediaCallArgs('这不是 JSON');
 			return a.kind === 'image' && a.prompt === '';
 		})(),
+	);
+	// ── 4.1c 参考图句柄：一张写字符串、多张写数组（「生成信息」靠它回看） ──
+	check(
+		'parseMediaCallArgs 收下 reference（字符串与数组两种写法、按顺序、去掉空白）',
+		(() => {
+			const one = media.parseMediaCallArgs({ prompt: '猫', reference: ' https://x/a.png ' });
+			const many = media.parseMediaCallArgs({
+				prompt: '猫',
+				reference: ['https://x/a.png', '', 42, 'attached'],
+			});
+			return (
+				JSON.stringify(one.references) === '["https://x/a.png"]' &&
+				JSON.stringify(many.references) === '["https://x/a.png","attached"]'
+			);
+		})(),
+		JSON.stringify(media.parseMediaCallArgs({ prompt: '猫', reference: ['a', 42, ''] })),
+	);
+	check(
+		'没有 reference 时 references 是 undefined（纯文生图不该显示「参考图 0 张」）',
+		media.parseMediaCallArgs('{"prompt":"猫"}').references === undefined,
 	);
 	// ── 4.1b 参考图句柄（画布菜单据此启用/禁用「以此为参考图生成」） ──
 	check(
@@ -824,6 +1524,11 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 		pending.w === 320 && pending.h === 320,
 		`${String(pending.w)}x${String(pending.h)}`,
 	);
+	check(
+		'参考图句柄写进 pending 节点（生成的那一刻唯一看得到它们的地方）',
+		JSON.stringify(pending.references) === '["https://media.test/ref.png","attached"]',
+		JSON.stringify(pending.references),
+	);
 
 	// 幂等：同一个快照再来多少次都只落一个节点
 	report = ingest.syncConversation(runningSnap('c1'), 'sess-1', { baselineSeq: 0, now: now() });
@@ -871,6 +1576,11 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 	check('结果到达后节点转为 ready', ready?.status === 'ready', String(ready?.status));
 	check('结果写入媒体地址', ready?.src === 'http://media.test/c1.png', String(ready?.src));
 	check('结果写入模型名', ready?.model === 'gpt-image-1', String(ready?.model));
+	check(
+		'结果到达也不丢参考图（改状态只补字段，不重置节点）',
+		JSON.stringify(ready?.references) === '["https://media.test/ref.png","attached"]',
+		JSON.stringify(ready?.references),
+	);
 	check(
 		'状态变更不移动节点（等待中的占位不跳位）',
 		ready?.x === beforePos.x && ready?.y === beforePos.y,
@@ -981,6 +1691,11 @@ console.log('\n4) 生成结果 → 画布落图（P3）');
 		String(storage.get('fatfish-canvas:board')).slice(0, 120),
 	);
 	// v1（P2 时代）的数据没有 ingested 字段，必须照样能读
+	//
+	// ⚠️ 先排空**前面几节遗留的去抖写盘**（§8.20）：废弃的 store 实例会在下面的
+	// `await` 里照样触发，把它那一节的旧画布写回全局键 —— 于是这里「刚写进去的」
+	// 被覆盖，表现为这两条断言**间歇性**红（本轮实测到两次，红的还不是同一条）。
+	await drainPersistTimers();
 	storage.set(
 		'fatfish-canvas:board',
 		JSON.stringify({
@@ -1336,6 +2051,45 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 			model.nodeRatio({ w: Number.NaN, h: 10 }) === undefined &&
 			model.nodeRatio({ w: 999999, h: 10 }) === undefined,
 	);
+	// ── 参考图在「生成信息」里的呈现：能看图的给图，只能看说明的说清它是什么 ──
+	check(
+		'referenceViews：真地址可渲染（http(s) / 本机留档 / 小 data:）',
+		(() => {
+			const views = model.referenceViews([
+				'https://cdn.example.com/a.png',
+				'/ffc-media/海边.png',
+				'data:image/png;base64,QUJD',
+			]);
+			return views.length === 3 && views.every((v) => v.loadable === true && v.note === undefined);
+		})(),
+		JSON.stringify(model.referenceViews(['https://cdn.example.com/a.png'])),
+	);
+	check(
+		'referenceViews：取不到字节的句柄说清是什么，且不许当 src（否则必然是裂图）',
+		(() => {
+			const views = model.referenceViews([
+				'attached',
+				'sha256:abc',
+				'attachment:abc',
+				'C:/pics/a.png',
+			]);
+			return (
+				views.length === 4 &&
+				views.every((v) => v.loadable === false) &&
+				views[0].note?.includes('附在') === true &&
+				views[1].note?.includes('附件') === true &&
+				views[2].note?.includes('附件') === true &&
+				// 本地路径没有更好的说法：原样显示地址（宿主读得到、浏览器读不到）
+				views[3].note === undefined &&
+				views[3].handle === 'C:/pics/a.png'
+			);
+		})(),
+		JSON.stringify(model.referenceViews(['attached', 'sha256:abc', 'C:/pics/a.png'])),
+	);
+	check(
+		'referenceViews：空句柄剔除、缺席即空数组（老节点没有这个字段）',
+		model.referenceViews(['', '  ']).length === 0 && model.referenceViews(undefined).length === 0,
+	);
 
 	// ── 6.2 菜单键盘导航的取项规则 ──
 	const ids = ['a', 'b', 'c', 'd'];
@@ -1422,6 +2176,26 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 				regen.regenerateCommandLine('猫') === '/generate 猫 ',
 			`${regen.regenerateCommandLine('猫', 'image', '16:9')} | ${regen.regenerateCommandLine('海浪', 'video')}`,
 		);
+		check(
+			'regenerateCommandLine：多张参考图 = 多个 --ref，**按给的顺序**',
+			regen.regenerateCommandLine('融合', 'image', '1:1', ['https://x/a.png', 'https://x/b.png']) ===
+				'/generate --ratio 1:1 --ref https://x/a.png --ref https://x/b.png 融合 ',
+			regen.regenerateCommandLine('融合', 'image', '1:1', ['https://x/a.png', 'https://x/b.png']),
+		);
+		check(
+			'referencesOf：只收能当参考图的（http(s) / 小 data:），顺序不变',
+			JSON.stringify(
+				regen.referencesOf([
+					{ src: 'https://x/a.png' },
+					{ src: 'blob:http://localhost/1' },
+					{ src: undefined },
+					{ src: 'data:image/png;base64,QUJD' },
+				]),
+			) === '["https://x/a.png","data:image/png;base64,QUJD"]',
+			JSON.stringify(
+				regen.referencesOf([{ src: 'https://x/a.png' }, { src: 'blob:x' }, { src: 'data:image/png;base64,QUJD' }]),
+			),
+		);
 
 		const lines = [];
 		const prompts = [];
@@ -1442,7 +2216,24 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 				prompts.length === 0,
 			JSON.stringify(lines),
 		);
+		check(
+			'多张参考图也走命令，且两张都在那一行里（顺序不变）',
+			(await regen.regenerate('融合', 'image', undefined, ['https://x/a.png', 'https://x/b.png'])) === 'command' &&
+				String(lines[1]).includes('--ref https://x/a.png --ref https://x/b.png'),
+			String(lines[1]),
+		);
 		off3();
+
+		// 带参考图时**不许**退回提示词：模型看不见图，让它「参考图生成」只会得到一句空话
+		const off3b = regen.setRegenerateTarget({
+			command: () => Promise.resolve({ ok: true, value: { matched: false } }),
+			prompt: () => Promise.resolve({ ok: true }),
+		});
+		check(
+			'带参考图 + 命令不可用 → 返回 null（不退回提示词，免得发一次注定失败的生成）',
+			(await regen.regenerate('融合', 'image', undefined, ['https://x/a.png'])) === null,
+		);
+		off3b();
 
 		const off4 = regen.setRegenerateTarget({
 			command: () => Promise.resolve({ ok: true, value: { matched: false } }),
@@ -1466,6 +2257,9 @@ console.log('\n6) P5：节点右键菜单 / 键盘导航 / 重新生成');
 console.log('\n7) P6：/generate 命令 → 画布节点');
 
 {
+	// ⚠️ 先排空**上一段遗留的去抖写盘**再清存储（见 drainPersistTimers）：
+	// 不排空的话这一节读到的是上一段的画布 —— main 上就有这个偶发（约 1/10）。
+	await drainPersistTimers();
 	storage.clear();
 	const shared = new Map();
 	const storePath = resolve(root, 'src/client/canvas/store.ts');
@@ -1479,7 +2273,7 @@ console.log('\n7) P6：/generate 命令 → 画布节点');
 		time: Date.now(),
 		commandId: 'cmd-1',
 		name: 'generate',
-		args: '--ratio 16:9 一只胖乎乎的肥鱼',
+		args: '--ratio 16:9 --ref https://cdn.example.com/ref.png 一只胖乎乎的肥鱼',
 		outcome: null,
 		...over,
 	});
@@ -1498,6 +2292,11 @@ console.log('\n7) P6：/generate 命令 → 画布节点');
 	check('提示词来自命令行原文（同一套语法）', pending.title === '一只胖乎乎的肥鱼', String(pending.title));
 	check('比例也来自命令行（16:9 → 320×180）', pending.w === 320 && pending.h === 180, `${String(pending.w)}x${String(pending.h)}`);
 	check('带上会话 id', pending.sessionId === 'sess-1', String(pending.sessionId));
+	check(
+		'命令行的 --ref 落到节点上（命令这条路连事后打开页面也记得住）',
+		JSON.stringify(pending.references) === '["https://cdn.example.com/ref.png"]',
+		JSON.stringify(pending.references),
+	);
 
 	// ── 7.2 成功结果 → ready ──
 	const before = { x: pending.x, y: pending.y };
@@ -1514,6 +2313,11 @@ console.log('\n7) P6：/generate 命令 → 画布节点');
 	const ready = board.nodes.find((n) => n.id === 'gencmd_cmd-1');
 	check('命令成功后节点转为 ready', ready?.status === 'ready', String(ready?.status));
 	check('媒体地址取自结果文本的第一行', ready?.src === 'https://cdn.example.com/a.png', String(ready?.src));
+	check(
+		'命令成功后参考图仍在（终态节点上还看得到当时参考了哪张）',
+		JSON.stringify(ready?.references) === '["https://cdn.example.com/ref.png"]',
+		JSON.stringify(ready?.references),
+	);
 	check(
 		'状态变更不移动节点（与工具路径同一条规则）',
 		ready?.x === before.x && ready?.y === before.y,
@@ -1652,22 +2456,9 @@ console.log('\n7) P6：/generate 命令 → 画布节点');
 	storage.clear();
 }
 
-// ─────────────────── 8. P7：画布按会话隔离（作用域） ───────────────────
+// ─────────────── 8. 画布按工作区分隔（一个工作区一块画布） ───────────────
 
-console.log('\n8) P7：画布按会话隔离');
-
-/**
- * 让「已经废弃的 store 实例」的待写盘定时器全部烧完。
- *
- * 本文件的每一小节都用**新的模块实例**（`loadTsModule`），每个实例各自带一个
- * 400ms 去抖写盘定时器；被丢下的实例并不会因此安静 —— 它的定时器会在**后面的
- * `await` 里**照样触发，把那一节留下的旧画布写回全局键。于是下一节 load 出来的
- * 画布会莫名其妙多出几个陌生节点（本轮就出现过：3 个节点里混进两个 `n_…`）。
- * 这不是被测代码的 bug（真实运行中同一时刻只有一个 store 实例，且切换作用域会
- * 先 flush），是**测试要自己把时间轴清干净**：先等定时器烧完，再 clear，再 load。
- * @returns 定时器排空后的 promise。
- */
-const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
+console.log('\n8) 画布按工作区分隔');
 
 {
 	await drainPersistTimers();
@@ -1682,22 +2473,33 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 	const scope = await loadTsModule(scopePath, shared);
 
 	const GLOBAL = 'fatfish-canvas:board';
-	const keyOf = (id) => `fatfish-canvas:board:${id}`;
-	const nodeOf = (id, x = 0) => ({ id, kind: 'image', x, y: 0, w: 100, h: 100, status: 'ready' });
+	const WS_ONE = 'D:\\agent文件目录\\a画布\\泳装';
+	const WS_TWO = 'D:\\agent文件目录\\a画布\\视频';
+	const keyOf = (ws) => `fatfish-canvas:board:${ws}`;
+	const nodeOf = (id, x = 0, sessionId) => ({
+		id,
+		kind: 'image',
+		x,
+		y: 0,
+		w: 100,
+		h: 100,
+		status: 'ready',
+		...(sessionId === undefined ? {} : { sessionId }),
+	});
 
 	check(
-		'作用域 → 存储键：null 是共用那块，字符串是会话自己的键',
-		store.boardKeyFor(null) === GLOBAL && store.boardKeyFor('session-a') === keyOf('session-a'),
-		`${store.boardKeyFor(null)} / ${store.boardKeyFor('session-a')}`,
+		'作用域 → 存储键：null 是所有工作区共用那块，字符串是那个工作区自己的键',
+		store.boardKeyFor(null) === GLOBAL && store.boardKeyFor(WS_ONE) === keyOf(WS_ONE),
+		`${store.boardKeyFor(null)} / ${store.boardKeyFor(WS_ONE)}`,
 	);
 	check(
-		'默认作用域是共用（老用户升级后画布不会突然变空）',
+		'默认作用域是共用（启动时还不知道在哪个工作区）',
 		store.getBoardScope() === null && store.getBoardKey() === GLOBAL,
 		String(store.getBoardScope()),
 	);
 	check(
-		'作用域偏好默认 shared',
-		state.getBoardScopeMode() === 'shared',
+		'作用域偏好默认 workspace（一个工作区一块画布）',
+		state.getBoardScopeMode() === 'workspace',
 		state.getBoardScopeMode(),
 	);
 
@@ -1710,13 +2512,13 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		String(storage.get(GLOBAL)).slice(0, 80),
 	);
 
-	store.setBoardScope('s1');
+	store.setBoardScope(WS_ONE);
 	check(
-		'切到 s1：画布是空的（不 adopt 时不抄旧画布）',
+		'切到工作区：画布是空的（换键本身不搬运，靠拆分送内容）',
 		store.getBoard().nodes.length === 0,
 		`实际 ${String(store.getBoard().nodes.length)}`,
 	);
-	check('切换后当前键跟着换', store.getBoardKey() === keyOf('s1'), store.getBoardKey());
+	check('切换后当前键跟着换', store.getBoardKey() === keyOf(WS_ONE), store.getBoardKey());
 	store.addNode(nodeOf('a1'));
 	store.flushPersist();
 
@@ -1727,7 +2529,7 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
 	);
 	check(
-		'两边的内容没有混：s1 的节点不在共用画布里',
+		'两边的内容没有混：工作区的节点不在共用画布里',
 		store.getBoard().nodes.every((n) => n.id !== 'a1'),
 	);
 	check(
@@ -1735,16 +2537,16 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		String(storage.get(GLOBAL)).includes('"g1"'),
 	);
 
-	store.setBoardScope('s1');
+	store.setBoardScope(WS_ONE);
 	check(
-		'切回 s1：它自己的节点也在',
+		'切回工作区：它自己的节点也在',
 		store.getBoard().nodes.length === 1 && store.getBoard().nodes[0].id === 'a1',
 		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
 	);
 
 	// ── 8.2 记账账本随作用域独立（「不重放」的前提） ──
 	check(
-		's1 的账本里没有别的画布的记账',
+		'工作区那块的账本里没有别的画布的记账',
 		store.getBoard().ingested.length === 0,
 		JSON.stringify(store.getBoard().ingested),
 	);
@@ -1758,9 +2560,9 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 	);
 	store.markIngested(['gen_g1']);
 	store.flushPersist();
-	store.setBoardScope('s1');
+	store.setBoardScope(WS_ONE);
 	check(
-		'再切回 s1：它自己的记账还在（因此历史生成不会被重放）',
+		'再切回工作区：它自己的记账还在（因此历史生成不会被重放）',
 		JSON.stringify(store.getBoard().ingested) === '["gen_a1"]',
 		JSON.stringify(store.getBoard().ingested),
 	);
@@ -1775,54 +2577,71 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		JSON.stringify(store.getBoard().selection),
 	);
 
-	// ── 8.4 adopt：从共用切进隔离时，手上的画布跟着走 ──
+	// ── 8.4 拆分：共用那块按「节点是哪个会话生成的」送到各自的工作区 ──
 	await drainPersistTimers();
 	storage.clear();
 	const store2 = await loadTsModule(storePath); // 新实例：键与内存都从零开始
-	store2.addNode(nodeOf('keep'));
-	store2.markIngested(['gen_keep']);
+	store2.addNode(nodeOf('one', 0, 'sess-1'));
+	store2.addNode(nodeOf('two', 4000, 'sess-2'));
+	store2.addNode(nodeOf('orphan', 200));
+	store2.markIngested(['gen_one']);
 	store2.flushPersist();
-	store2.setBoardScope('s9', { adopt: true });
+	const lookup = (sessionId) =>
+		sessionId === 'sess-1' ? WS_ONE : sessionId === 'sess-2' ? WS_TWO : undefined;
+	const split = () =>
+		store2.rehomeSharedBoard((node) =>
+			node.sessionId === undefined ? null : (lookup(node.sessionId) ?? null),
+		);
+	const moved = split();
 	check(
-		'adopt：新键为空时把当前画布带进新作用域（不会当场变空）',
-		store2.getBoard().nodes.length === 1 && store2.getBoard().nodes[0].id === 'keep',
-		JSON.stringify(store2.getBoard().nodes.map((n) => n.id)),
+		'拆分：按节点记的会话送回各自工作区，认不出的留下',
+		moved.moved === 2 && moved.kept === 1,
+		JSON.stringify(moved),
 	);
 	check(
-		'adopt 顺带把记账也带过去（否则刚落的节点会被历史重放）',
-		store2.getBoard().ingested.includes('gen_keep'),
-		JSON.stringify(store2.getBoard().ingested),
+		'工作区一那块写着它自己的节点',
+		String(storage.get(keyOf(WS_ONE))).includes('"one"'),
+		String(storage.get(keyOf(WS_ONE))).slice(0, 80),
 	);
 	check(
-		'adopt 之后新键立刻有内容（不必等下一次提交）',
-		String(storage.get(keyOf('s9'))).includes('"keep"'),
+		'工作区二那块写着它自己的节点（拆分是全局动作，不只拆当前那个）',
+		String(storage.get(keyOf(WS_TWO))).includes('"two"'),
+		String(storage.get(keyOf(WS_TWO))).slice(0, 80),
 	);
 	check(
-		'adopt 时旧键仍然保留原样（共用画布没被搬走）',
-		String(storage.get(GLOBAL)).includes('"keep"'),
+		'认不出会话的节点留在共用那块（宁可留在原地，也不猜一个工作区）',
+		!String(storage.get(keyOf(WS_ONE))).includes('"orphan"') &&
+			String(storage.get(GLOBAL)).includes('"orphan"'),
 	);
-
-	// ── 8.5 adopt 绝不覆盖已经存在的作用域 ──
-	storage.set(
-		keyOf('s7'),
-		JSON.stringify({
-			version: 2,
-			nodes: [{ id: 'mine', kind: 'image', x: 5, y: 5, w: 20, h: 20, z: 1, status: 'ready', createdAt: 1 }],
-			viewport: { x: 0, y: 0, zoom: 1 },
-			ingested: [],
-		}),
-	);
-	store2.setBoardScope('s7', { adopt: true });
 	check(
-		'adopt 只对「从没写过的键」生效：已有内容的会话画布不被顶掉',
-		store2.getBoard().nodes.length === 1 && store2.getBoard().nodes[0].id === 'mine',
+		'共用那块一个字节都不动（它是全部内容的备份）',
+		['"one"', '"two"', '"orphan"'].every((id) => String(storage.get(GLOBAL)).includes(id)),
+	);
+	check(
+		'拆分把记账账本一起带过去（否则刚落的节点会被「最近结果补落」重放）',
+		String(storage.get(keyOf(WS_ONE))).includes('gen_one'),
+		String(storage.get(keyOf(WS_ONE))).slice(0, 80),
+	);
+	const twoBoard = JSON.parse(String(storage.get(keyOf(WS_TWO))));
+	check(
+		'拆到一块空画布上时视口对准这批节点（不是停在世界原点看一片空白）',
+		twoBoard.viewport.x === 3960 && twoBoard.viewport.y === -40 && twoBoard.viewport.zoom === 1,
+		JSON.stringify(twoBoard.viewport),
+	);
+	const before = String(storage.get(keyOf(WS_ONE)));
+	split();
+	check('拆分是幂等的：再拆一遍不会多出节点', String(storage.get(keyOf(WS_ONE))) === before);
+	store2.setBoardScope(WS_ONE);
+	check(
+		'切到该工作区就能看到刚拆过去的节点，且**没有**别的工作区的节点',
+		JSON.stringify(store2.getBoard().nodes.map((n) => n.id)) === '["one"]',
 		JSON.stringify(store2.getBoard().nodes.map((n) => n.id)),
 	);
 	storage.clear();
 }
 
 {
-	// ── 8.6 策略层：偏好 × 当前会话 → 作用域 ──
+	// ── 8.5 策略层：偏好 × 当前会话的工作区 → 作用域 ──
 	await drainPersistTimers();
 	storage.clear();
 	const shared = new Map();
@@ -1835,82 +2654,121 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 	const scope = await loadTsModule(scopePath, shared);
 	const off = scope.installBoardScope();
 
-	const nodeOf = (id) => ({ id, kind: 'image', x: 0, y: 0, w: 100, h: 100, status: 'ready' });
-	const keyOf = (id) => `fatfish-canvas:board:${id}`;
-
-	// 共用偏好下，报来会话 id 也不换画布
-	scope.setScopeSession('sess-a');
-	check(
-		'偏好是共用时：会话 id 不改变作用域',
-		store.getBoardScope() === null && scope.getScopeSnapshot().sessionId === 'sess-a',
-		JSON.stringify(scope.getScopeSnapshot()),
+	const WS_ONE = 'D:\\ws\\one';
+	const WS_TWO = 'D:\\ws\\two';
+	const GLOBAL = 'fatfish-canvas:board';
+	const keyOf = (ws) => `fatfish-canvas:board:${ws}`;
+	const nodeOf = (id, sessionId) => ({
+		id,
+		kind: 'image',
+		x: 0,
+		y: 0,
+		w: 100,
+		h: 100,
+		status: 'ready',
+		...(sessionId === undefined ? {} : { sessionId }),
+	});
+	scope.setWorkspaceLookup((sessionId) =>
+		sessionId === 'sess-a' || sessionId === 'sess-a2'
+			? WS_ONE
+			: sessionId === 'sess-b'
+				? WS_TWO
+				: undefined,
 	);
 
-	// 打开隔离：立刻换到当前会话的画布，并把手上这块带过去
+	// 共用那块上先有一堆东西：一个认不出会话的，一个属于「另一个工作区」的会话
 	store.addNode(nodeOf('shared-node'));
+	store.addNode(nodeOf('b-node', 'sess-b'));
 	store.flushPersist();
-	state.setBoardScopeMode('session');
+
+	scope.setScopeSession('sess-a', WS_ONE);
 	check(
-		'翻开关立刻生效（偏好变化经订阅自动应用）',
-		store.getBoardScope() === 'sess-a' && store.getBoardKey() === keyOf('sess-a'),
+		'桥报来工作区：画布立刻落到那个工作区的键上',
+		store.getBoardScope() === WS_ONE && store.getBoardKey() === keyOf(WS_ONE),
 		`${String(store.getBoardScope())} / ${store.getBoardKey()}`,
 	);
 	check(
-		'从共用切进隔离：当前画布被采用（用户看不到「画布突然空了」）',
-		store.getBoard().nodes.some((n) => n.id === 'shared-node'),
+		'作用域快照带上了工作区（工具条 title 用它说明「当前是哪个工作区」）',
+		scope.getScopeSnapshot().workspace === WS_ONE && scope.getScopeSnapshot().scope === WS_ONE,
+		JSON.stringify(scope.getScopeSnapshot()),
+	);
+	check(
+		'当前工作区那块是空的：认不出会话的节点不跟过来',
+		store.getBoard().nodes.length === 0,
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
+	);
+	check(
+		'属于别的工作区会话的节点已经被送回**那个**工作区（拆分是全局动作）',
+		String(storage.get(keyOf(WS_TWO))).includes('"b-node"'),
+		String(storage.get(keyOf(WS_TWO))).slice(0, 80),
+	);
+	check(
+		'共用那块内容原样保留（点回「共用画布」还看得到全部）',
+		['"shared-node"', '"b-node"'].every((id) => String(storage.get(GLOBAL)).includes(id)),
+	);
+	check(
+		'默认值不该落盘（用户没选过就不写偏好）',
+		storage.get('fatfish-canvas:board-scope') == null,
+		String(storage.get('fatfish-canvas:board-scope')),
+	);
+
+	// 同一个工作区里换会话：还是同一块画布
+	store.addNode(nodeOf('one-node'));
+	store.flushPersist();
+	scope.setScopeSession('sess-a2', WS_ONE);
+	check(
+		'同一工作区里换个会话：画布不变（一个工作区共用一块）',
+		store.getBoardScope() === WS_ONE &&
+			JSON.stringify(store.getBoard().nodes.map((n) => n.id)) === '["one-node"]',
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
+	);
+
+	// 换到另一个工作区：另一块，互不抄送
+	scope.setScopeSession('sess-b', WS_TWO);
+	check(
+		'换到另一个工作区：拿到它自己的画布（拆过来的节点在），**不会**抄上一个工作区的',
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)) === '["b-node"]',
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
+	);
+
+	scope.setScopeSession('sess-a', WS_ONE);
+	check(
+		'切回第一个工作区：它自己的节点还在',
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)) === '["one-node"]',
+		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
+	);
+	check(
+		'另一个工作区那块也各自持久化着',
+		String(storage.get(keyOf(WS_TWO))).includes('"b-node"'),
+		String(storage.get(keyOf(WS_TWO))).slice(0, 80),
+	);
+
+	// 翻开关：回到共用那块（内容原样，别的画布的东西不许混进来）
+	state.setBoardScopeMode('shared');
+	check(
+		'切回共用：看到的是共用那块（认不出的节点 + 别的工作区那个都在）',
+		store.getBoardScope() === null &&
+			JSON.stringify(store.getBoard().nodes.map((n) => n.id)) === '["shared-node","b-node"]',
 		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
 	);
 	check(
 		'偏好写进 localStorage',
-		storage.get('fatfish-canvas:board-scope') === 'session',
+		storage.get('fatfish-canvas:board-scope') === 'shared',
 		String(storage.get('fatfish-canvas:board-scope')),
 	);
+	state.setBoardScopeMode('workspace');
 	check(
-		'作用域快照：scope 不再是 null（视图据此显示「本会话画布」）',
-		scope.getScopeSnapshot().scope === 'sess-a',
-		JSON.stringify(scope.getScopeSnapshot()),
-	);
-
-	// 会话 A → 会话 B：不抄送
-	store.removeNodes(store.getBoard().nodes.map((n) => n.id));
-	store.addNode(nodeOf('a-node'));
-	store.flushPersist();
-	scope.setScopeSession('sess-b');
-	check(
-		'切到另一个会话：拿到的是它自己的（空）画布，**不会**抄走上一个会话的节点',
-		store.getBoard().nodes.length === 0,
-		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
-	);
-	store.addNode(nodeOf('b-node'));
-	store.flushPersist();
-	scope.setScopeSession('sess-a');
-	check(
-		'切回第一个会话：它自己的节点还在',
-		store.getBoard().nodes.length === 1 && store.getBoard().nodes[0].id === 'a-node',
-		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
-	);
-	check(
-		'会话 B 的画布也各自持久化着',
-		String(storage.get(keyOf('sess-b'))).includes('"b-node"'),
-		String(storage.get(keyOf('sess-b'))).slice(0, 80),
-	);
-
-	// 关掉隔离：回到共用那块
-	state.setBoardScopeMode('shared');
-	check(
-		'关掉隔离：回到共用画布（内容还是原来那块）',
-		store.getBoardScope() === null &&
-			store.getBoard().nodes.length === 1 &&
-			store.getBoard().nodes[0].id === 'shared-node',
+		'再翻回来：回到当前工作区那块（拆过的东西还在，且没有重复）',
+		store.getBoardScope() === WS_ONE &&
+			JSON.stringify(store.getBoard().nodes.map((n) => n.id)) === '["one-node"]',
 		JSON.stringify(store.getBoard().nodes.map((n) => n.id)),
 	);
 
-	// 没有会话时退回共用，而不是记着一块不存在的画布
-	state.setBoardScopeMode('session');
-	scope.setScopeSession(null);
+	// 没有会话时退回共用，而不是记着一块不存在的工作区画布
+	scope.setScopeSession(null, null);
 	check(
-		'打开隔离但没有会话：退回共用（scope 为 null，视图显示「待会话」）',
-		scope.getScopeSnapshot().mode === 'session' &&
+		'认不出工作区（没有会话）：退回共用（scope 为 null，读数显示「共用画布」）',
+		scope.getScopeSnapshot().mode === 'workspace' &&
 			scope.getScopeSnapshot().scope === null &&
 			store.getBoardScope() === null,
 		JSON.stringify(scope.getScopeSnapshot()),
@@ -1921,20 +2779,28 @@ const drainPersistTimers = () => new Promise((r) => setTimeout(r, 600));
 		scope.applyBoardScope() === false && scope.applyBoardScope() === false,
 	);
 
-	// ── 8.7 启动时按存储的偏好恢复 ──
+	// ── 8.6 启动时按存储的偏好恢复 ──
 	off();
 	await drainPersistTimers();
 	storage.clear();
+	// P7 时代留下的 `session`（每个会话一块）读作 `workspace`：同样的意图、更粗的粒度
 	storage.set('fatfish-canvas:board-scope', 'session');
 	const state2 = await loadTsModule(statePath);
 	const scope2 = await loadTsModule(scopePath, new Map([[statePath, { exports: state2 }]]));
 	check(
-		'启动读到 session 偏好',
-		state2.getBoardScopeMode() === 'session',
+		'老偏好 `session` 读作 `workspace`（升级不该把开关关掉）',
+		state2.getBoardScopeMode() === 'workspace',
 		state2.getBoardScopeMode(),
 	);
+	storage.set('fatfish-canvas:board-scope', 'shared');
+	const state3 = await loadTsModule(statePath);
 	check(
-		'重启时还没有会话 → 先停在共用画布上，不炸也不清空',
+		'明文 `shared` 仍然是共用（用户显式选过的要认）',
+		state3.getBoardScopeMode() === 'shared',
+		state3.getBoardScopeMode(),
+	);
+	check(
+		'重启时还没有会话 → 先停在共用那块上，不炸也不清空',
 		scope2.getScopeSnapshot().scope === null && scope2.applyBoardScope() === false,
 		JSON.stringify(scope2.getScopeSnapshot()),
 	);
@@ -2065,7 +2931,9 @@ console.log('\n9) P15：点击意图 · 拖放接管 · 1000% 缩放');
 				this.parts = parts;
 				this.name = name;
 				this.type = opts?.type;
-				this.size = parts.reduce((sum, p) => sum + (p.length ?? p.byteLength ?? 0), 0);
+				// ⚠️ 真实 File 的 BlobPart 可以是 Blob（它只有 `size`，没有 length/byteLength）
+				// —— 替身少认一种形状就会把「字节数」算成 0（P32 实测踩到一次）
+				this.size = parts.reduce((sum, p) => sum + (p.size ?? p.length ?? p.byteLength ?? 0), 0);
 			}
 		};
 		globalThis.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
@@ -2244,6 +3112,540 @@ console.log('\n10) P16：store 订阅（useState + useEffect 路径）');
 		stateWithHooks.getModeFromDom(),
 	);
 	storage.clear();
+}
+
+// ─────────────────── 11. P27：背景点阵与导出归档 ───────────────────
+
+console.log('11) 背景点阵与导出归档');
+
+{
+	// 判据：点阵与节点层必须**共用同一套**视口变换 —— 世界坐标上「整数格」的点，
+	// 必须落在「背景原点 + 整数格」。写错符号（背景往反方向跑）或漏乘 zoom 都会挂。
+	const vp = { x: 37.5, y: -12.25, zoom: 0.4 };
+	const grid = model.gridOf(vp);
+	const step = grid.size / vp.zoom;
+	const screen = model.toScreen({ x: 2 * step, y: 3 * step }, vp);
+	check(
+		'点阵与节点层共用同一套视口变换',
+		Math.abs(screen.x - (grid.x + 2 * grid.size)) < 1e-9 &&
+			Math.abs(screen.y - (grid.y + 3 * grid.size)) < 1e-9,
+		`screen=${JSON.stringify(screen)} grid=${JSON.stringify(grid)}`,
+	);
+	check(
+		'背景原点就是世界原点在屏幕上的位置',
+		grid.x === model.toScreen({ x: 0, y: 0 }, vp).x && grid.y === model.toScreen({ x: 0, y: 0 }, vp).y,
+		`${String(grid.x)},${String(grid.y)}`,
+	);
+
+	const at1 = model.gridOf({ x: -100, y: 60, zoom: 1 });
+	check(
+		'zoom=1 时一格 24px、原点跟着平移走',
+		at1.size === model.GRID_STEP && at1.x === 100 && at1.y === -60,
+		JSON.stringify(at1),
+	);
+
+	// 屏幕上的格距不能太密（否则缩到 10% 时点阵糊成一片灰），且只能是 24 的 2 的幂倍
+	// （不是整数倍就会与节点错位）。
+	for (const zoom of [model.ZOOM_MIN, 0.3, 1, 4, model.ZOOM_MAX]) {
+		const g = model.gridOf({ x: 0, y: 0, zoom });
+		// 浮点：`size / zoom / 24` 会带出 8.000000000000002 这种尾巴，先取整再判
+		const factor = Math.round(g.size / zoom / model.GRID_STEP);
+		check(
+			`zoom=${String(zoom)}：格距 ≥12px 且是世界格距的 2 的幂倍`,
+			g.size >= 12 - 1e-9 && (factor & (factor - 1)) === 0,
+			`screen=${g.size.toFixed(2)} factor=${String(factor)}`,
+		);
+	}
+
+	check('点的半径两头夹住（太小看不见、太大成麻子）', model.gridOf({ x: 0, y: 0, zoom: 0.1 }).dot === 0.5 && model.gridOf({ x: 0, y: 0, zoom: 10 }).dot === 2, '');
+}
+
+{
+	// zip：自己写的 STORE 写入器。这里**逐字节解析回来**，而不是只看函数返回了东西。
+	const enc = new TextEncoder();
+	check('crc32 已知值（"hello"）', zip.crc32(enc.encode('hello')) === 0x3610a686, `0x${zip.crc32(enc.encode('hello')).toString(16)}`);
+	check('crc32 空数据为 0', zip.crc32(new Uint8Array(0)) === 0);
+
+	const files = [
+		{ name: 'a.png', bytes: enc.encode('AAAA'), mime: 'image/png' },
+		{ name: '中文 标题.png', bytes: new Uint8Array([0, 1, 2, 255]), mime: 'image/png' },
+	];
+	const out = zip.zipStore(files);
+	const view = new DataView(out.buffer);
+	const eocd = out.length - 22;
+	check(
+		'EOCD 签名 / 条目数正确',
+		view.getUint32(eocd, true) === 0x06054b50 && view.getUint16(eocd + 10, true) === 2,
+		`sig=0x${view.getUint32(eocd, true).toString(16)}`,
+	);
+
+	const decoder = new TextDecoder();
+	const entries = [];
+	let at = view.getUint32(eocd + 16, true);
+	for (let i = 0; i < view.getUint16(eocd + 10, true); i += 1) {
+		const nameLen = view.getUint16(at + 28, true);
+		const localAt = view.getUint32(at + 42, true);
+		const size = view.getUint32(at + 24, true);
+		const dataAt = localAt + 30 + view.getUint16(localAt + 26, true);
+		entries.push({
+			name: decoder.decode(out.subarray(at + 46, at + 46 + nameLen)),
+			flags: view.getUint16(at + 8, true),
+			method: view.getUint16(at + 10, true),
+			crc: view.getUint32(at + 16, true),
+			bytes: out.subarray(dataAt, dataAt + size),
+			localSig: view.getUint32(localAt, true),
+		});
+		at += 46 + nameLen;
+	}
+	check('中央目录长度与偏移自洽（走完刚好接上 EOCD）', at === eocd, `at=${String(at)} eocd=${String(eocd)}`);
+	check(
+		'两条条目的名字与字节都还原得回来',
+		entries.length === 2 &&
+			entries[0].name === 'a.png' &&
+			decoder.decode(entries[0].bytes) === 'AAAA' &&
+			entries[1].name === '中文 标题.png' &&
+			entries[1].bytes.length === 4 &&
+			entries[1].bytes[3] === 255,
+		JSON.stringify(entries.map((e) => e.name)),
+	);
+	check(
+		'本地头签名正确 / STORE / CRC 落在条目上',
+		entries.every((e) => e.localSig === 0x04034b50 && e.method === 0 && e.crc === zip.crc32(e.bytes)),
+		JSON.stringify(entries.map((e) => e.method)),
+	);
+	check(
+		'文件名置了 UTF-8 位（不置中文解压出来就是乱码）',
+		entries.every((e) => (e.flags & 0x800) !== 0),
+		String(entries[1].flags),
+	);
+
+	check(
+		'safeName 去掉路径分隔符等非法字符',
+		zip.safeName('a/b:c*d?e"f<g>h|i', 'x', 'png') === 'a_b_c_d_e_f_g_h_i.png',
+		zip.safeName('a/b:c*d?e"f<g>h|i', 'x', 'png'),
+	);
+	check('safeName 空标题退回默认名', zip.safeName('   ', '画布图-01', 'jpg') === '画布图-01.jpg', zip.safeName('   ', '画布图-01', 'jpg'));
+	check('safeName 不把已有的图片后缀接成 .png.png', zip.safeName('cat.png', 'x', 'png') === 'cat.png', zip.safeName('cat.png', 'x', 'png'));
+	check(
+		// 导出改成复合（图 + 视频）之后才会踩到：视频标题自带 .mp4，老的正则只剥图片后缀
+		'safeName 也不把视频后缀接成 .mp4.mp4',
+		zip.safeName('海边.mp4', '画布视频-01', 'mp4') === '海边.mp4' &&
+			zip.safeName('海边.MOV', 'x', 'mov') === '海边.mov',
+		zip.safeName('海边.mp4', '画布视频-01', 'mp4'),
+	);
+	check(
+		'extOf 认识视频的 MIME（导出靠它定后缀，quicktime 要落成 .mov）',
+		zip.extOf('video/mp4') === 'mp4' &&
+			zip.extOf('video/quicktime') === 'mov' &&
+			zip.extOf('video/x-matroska') === 'mkv',
+		`${zip.extOf('video/mp4')} / ${zip.extOf('video/quicktime')}`,
+	);
+	check(
+		'safeName 截断长提示词',
+		zip.safeName('画一只在雨里打伞的鲸鱼并且要赛博朋克风格细节丰富', 'x', 'png').length <= 24 + 4,
+		zip.safeName('画一只在雨里打伞的鲸鱼并且要赛博朋克风格细节丰富', 'x', 'png'),
+	);
+	const used = new Set();
+	check(
+		'uniqueName 重名加序号（一个 zip 里两条同名会让解压工具打架）',
+		zip.uniqueName('a.png', used) === 'a.png' &&
+			zip.uniqueName('a.png', used) === 'a-2.png' &&
+			zip.uniqueName('a.png', used) === 'a-3.png',
+		[...used].join(','),
+	);
+}
+
+{
+	// 远程取图：宿主方法的返回值**装在信封里**（RemoteResult），必须先拆。
+	// 不拆的症状：宿主明明取到了图，页面说「取图失败」（P27 导出压缩包就这么炸的）。
+	const probeLib = await loadTsModule(resolve(root, 'src/client/shared/probe.ts'));
+
+	const envelope = (value) => ({ ok: true, value });
+	const okImage = { ok: true, message: '已取到图片（700 KB）', dataUrl: 'data:image/jpeg;base64,QUJD', mimeType: 'image/jpeg', name: 'a.jpg' };
+
+	check(
+		'信封成功分支：拆出 dataUrl / mimeType / name（**不是**读外层字段）',
+		(() => {
+			const got = probeLib.unwrapFetchedImage(envelope(okImage));
+			return got.ok === true && got.dataUrl === okImage.dataUrl && got.mimeType === 'image/jpeg' && got.name === 'a.jpg';
+		})(),
+		JSON.stringify(probeLib.unwrapFetchedImage(envelope(okImage))),
+	);
+	check(
+		'信封失败分支：带出 RemoteError 的 message（载体失败 ≠ 业务失败）',
+		(() => {
+			const got = probeLib.unwrapFetchedImage({ ok: false, error: { code: 'unmounted', message: '方法没挂上' } });
+			return got.ok === false && got.message === '方法没挂上';
+		})(),
+		JSON.stringify(probeLib.unwrapFetchedImage({ ok: false, error: { message: '方法没挂上' } })),
+	);
+	check(
+		'业务失败：宿主那句原因原样带出来（HTTP 403 / 太大 / 不是图片）',
+		(() => {
+			const got = probeLib.unwrapFetchedImage(envelope({ ok: false, message: '取图失败：HTTP 403' }));
+			return got.ok === false && got.message === '取图失败：HTTP 403';
+		})(),
+	);
+	check(
+		'裸值也认（万一以后有人把宿主方法直接挂上来，判断不分叉）',
+		(() => {
+			const got = probeLib.unwrapFetchedImage(okImage);
+			return got.ok === true && got.dataUrl === okImage.dataUrl;
+		})(),
+	);
+	check(
+		'形状不对时不炸、给一句可读的话（值缺失 / 不是对象）',
+		probeLib.unwrapFetchedImage(envelope(undefined)).ok === false &&
+			probeLib.unwrapFetchedImage(null).ok === false &&
+			probeLib.unwrapFetchedImage(envelope({ ok: true, message: 'ok' })).ok === false,
+	);
+
+	// 结构守卫：取字节的两个调用点都必须走 client/index 的包装（信封只在那里拆一次）。
+	// 这条能抓住的正是 P27 的真 bug —— 调用点自己读 remote 结果的字段。
+	// 两边走的方法**故意不同**：附件那条只收图（fetchImageViaHost），
+	// 导出那条还收视频（fetchMediaViaHost，见 host/probe.ts 的 fetchBytes）。
+	const callSites = [
+		['src/client/canvas/exportImages.ts', 'fetchMediaViaHost'],
+		['src/client/canvas/CanvasStage.tsx', 'fetchImageViaHost'],
+	];
+	for (const [rel, helper] of callSites) {
+		const source = await readFile(resolve(root, rel), 'utf8');
+		const direct = /probe\.(fetchImage|fetchMedia)\(/.test(source);
+		check(
+			`${rel} 走 ${helper}（不在调用点自己拆信封）`,
+			source.includes(`${helper}(`) && !direct,
+			direct ? '有直连 probe.* 的调用' : `没调用 ${helper}`,
+		);
+	}
+}
+
+// ─────────────────── P46：复合导出的计数文案 ───────────────────
+
+console.log('\nP46) 复合导出（图 + 视频）');
+
+{
+	// 导出的条目文案（点之前）与结论（点之后）要说同一句话 —— 判据抽成纯函数，
+	// 写歪的症状是「菜单说导出 2 张，结果导出了 3 项」。
+	const nodes = [
+		{ kind: 'image' },
+		{ kind: 'video' },
+		{ kind: 'image' },
+	];
+	check(
+		'mediaCounts 按节点种类数图与视频（文字节点不计）',
+		JSON.stringify(model.mediaCounts(nodes)) === '{"image":2,"video":1}' &&
+			JSON.stringify(model.mediaCounts([{ kind: 'text' }])) === '{"image":0,"video":0}',
+		JSON.stringify(model.mediaCounts(nodes)),
+	);
+	check(
+		'mediaCountsText 三种说法：只有图 / 只有视频 / 混在一起',
+		model.mediaCountsText({ image: 3, video: 0 }) === '3 张' &&
+			model.mediaCountsText({ image: 0, video: 2 }) === '2 个视频' &&
+			model.mediaCountsText({ image: 2, video: 1 }) === '2 图 + 1 视频',
+		`${model.mediaCountsText({ image: 3, video: 0 })} / ${model.mediaCountsText({ image: 0, video: 2 })} / ${model.mediaCountsText({ image: 2, video: 1 })}`,
+	);
+}
+
+// ─────────────────── P32：一键复制（图 + 文字） ───────────────────
+//
+// 这一节锁的是「复制（含图）」那三个纯函数与写剪贴板的两条通路。
+// 值得钉住的原因：拆块判据必须与本体气泡**完全一致**（界面上看得见图、
+// 复制出来却没有，是最难解释的一类 bug），而剪贴板那条路一旦退化成
+// 只写纯文本，用户拿到的是「看起来成功了、图没了」。
+
+console.log('\nP32) 一键复制（图 + 文字）');
+
+{
+	const copy = await loadTsModule(resolve(root, 'src/client/chat/messageCopy.ts'));
+
+	// ① 拆块：与本体 contentParts 同一条判据
+	const parts = copy.copyPartsOf([
+		{ type: 'text', text: '第一段' },
+		{ type: 'image', attachment: { attachmentId: 'sha256:aa', name: 'a.png' } },
+		{ type: 'text', text: '第二段' },
+		{ type: 'image' },
+		{ type: 'image', attachment: { name: '没有 id' } },
+		{ type: 'file', attachment: { name: 'x.pdf' } },
+		{ type: 'tool-result', content: [] },
+	]);
+	check(
+		'拆块：文字按顺序拼接、图片按顺序收集',
+		parts.text === '第一段第二段' && parts.images.length === 1 && parts.images[0].name === 'a.png',
+		JSON.stringify({ text: parts.text, images: parts.images.length }),
+	);
+	check(
+		'拆块：没有 attachmentId 的 image 块被丢掉（否则会拿一个取不到的句柄去取图）',
+		parts.images.length === 1,
+	);
+	check(
+		'拆块：文件附件只留名字；认不出的块进 rest（不静默丢）',
+		// `{type:'image'}`（没有 attachment）与 tool-result 都算「认不出」——
+		// 本体 contentParts 也是这么分的（它的 else 分支就是 rest）。
+		parts.fileNames.length === 1 && parts.fileNames[0] === 'x.pdf' && parts.rest.length === 2,
+		JSON.stringify({ files: parts.fileNames, rest: parts.rest.length }),
+	);
+	check(
+		'拆块：content 不是数组时给空结果（不炸）',
+		copy.copyPartsOf(undefined).text === '' && copy.copyPartsOf('nope').images.length === 0,
+	);
+
+	// ② 富文本：用户文字必须转义（这是唯一一个注入面）
+	const html = copy.buildCopyHtml('<b>hi</b>\n第二行', [{ dataUrl: 'data:image/png;base64,AAA', name: 'a&b.png' }], ['x.pdf']);
+	check(
+		'HTML：用户文字被转义、换行变 <br>',
+		html.includes('&lt;b&gt;hi&lt;/b&gt;<br>第二行') && !html.includes('<b>hi</b>'),
+		html,
+	);
+	check(
+		'HTML：图内联成 data: 进 <img>，附件名也带上',
+		html.includes('<img src="data:image/png;base64,AAA"') && html.includes('[附件] x.pdf'),
+		html,
+	);
+
+	// ③ 内联：一张失败不中断、peek 命中就不调异步、超上限的图不尝试
+	const seen = [];
+	const loader = Object.assign(async (attachment) => `blob:${String(attachment.attachmentId)}`, {
+		peek: (attachment) => (attachment.attachmentId === 'sha256:cached' ? 'blob:cached' : undefined),
+	});
+	globalThis.fetch = async (url) => {
+		seen.push(String(url));
+		if (String(url) === 'blob:sha256:bad') throw new Error('取不到');
+		// ⚠️ 替身必须给 `ok`：真实 Response 一定有它，而 `fetchAsDataUrl` 会先看它
+		// （少这一项时所有图都会被判成失败 —— 测试替身比被测代码更简单，是失真的一种）
+		return { ok: true, blob: async () => ({ size: 3, type: 'image/png' }) };
+	};
+	globalThis.FileReader = class {
+		/** @param {string} text - 造出来的内联数据。 */
+		constructor() {
+			this.result = 'data:image/png;base64,QUFB';
+		}
+		/** 触发一次成功的读取。 */
+		readAsDataURL() {
+			this.onload?.();
+		}
+	};
+	const inline = await copy.inlineImages(
+		[
+			{ attachment: { attachmentId: 'sha256:ok' }, name: 'ok.png' },
+			{ attachment: { attachmentId: 'sha256:bad' }, name: 'bad.png' },
+			{ attachment: { attachmentId: 'sha256:cached' }, name: 'cached.png' },
+		],
+		loader,
+	);
+	check(
+		'内联：成功的按顺序留下、失败的只计数（不中断整批）',
+		inline.images.length === 2 && inline.failed === 1 && inline.images[0].name === 'ok.png',
+		JSON.stringify({ got: inline.images.length, failed: inline.failed }),
+	);
+	check(
+		'内联：peek 命中时不走异步取 URL（缓存就是省这一次往返）',
+		seen.includes('blob:cached'),
+		JSON.stringify(seen),
+	);
+	check(
+		'内联：超过体积上限的图**不尝试**（只记账），不把页面卡死',
+		await copy
+			.inlineImages(
+				[
+					{ attachment: { attachmentId: 'sha256:ok' }, name: 'ok.png' },
+					{ attachment: { attachmentId: 'sha256:ok2' }, name: 'ok2.png' },
+				],
+				loader,
+				0,
+			)
+			.then((got) => got.images.length === 0 && got.skipped === 2 && got.failed === 0),
+	);
+
+	// ④ 写剪贴板：两条通路
+	//
+	// ⚠️ `globalThis.navigator` 在 Node 24 里是**只有 getter 的**内置属性，
+	// 直接赋值会抛 `Cannot set property navigator`，必须 defineProperty。
+	const writes = [];
+	const setGlobal = (name, value) => {
+		Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+	};
+	setGlobal(
+		'ClipboardItem',
+		class {
+			/** @param {Record<string, unknown>} types - 各类型的载荷。 */
+			constructor(types) {
+				this.types = types;
+			}
+		},
+	);
+	setGlobal('navigator', {
+		clipboard: {
+			write: async (items) => {
+				writes.push(items[0].types);
+			},
+			writeText: async (text) => {
+				writes.push({ text });
+			},
+		},
+	});
+	check(
+		'剪贴板：富文本写入成功时返回 null（没有失败说明）',
+		(await copy.writeClipboardRich('纯文本', '<div>富文本</div>')) === null,
+	);
+	check(
+		'剪贴板：一次写入里同时有 text/html 与 text/plain（图与字都带得走）',
+		writes.length === 1 && 'text/html' in writes[0] && 'text/plain' in writes[0],
+		JSON.stringify(Object.keys(writes[0] ?? {})),
+	);
+
+	writes.length = 0;
+	setGlobal('navigator', { clipboard: { writeText: async (text) => writes.push({ text }) } });
+	const degraded = await copy.writeClipboardRich('纯文本', '<div>富文本</div>');
+	check(
+		'剪贴板：没有 clipboard.write 时退回纯文本（至少文字不丢，且说明退化了）',
+		writes.length === 1 && writes[0].text === '纯文本' && typeof degraded === 'string',
+		JSON.stringify({ writes, degraded }),
+	);
+
+	// ④b 失败要**带真实原因**（上一版吞掉异常，用户只看到一句我猜的「浏览器不允许」）
+	writes.length = 0;
+	setGlobal('navigator', {
+		clipboard: {
+			write: async () => {
+				throw new Error('Support for multiple ClipboardItems is not implemented.');
+			},
+			writeText: async () => {
+				throw new Error('Document is not focused.');
+			},
+		},
+	});
+	const reason = await copy.writeClipboardRich('纯文本', '<div>富文本</div>');
+	check(
+		'剪贴板：失败时把真实异常带出来（不是「浏览器不允许」这种猜的文案）',
+		typeof reason === 'string' && reason.includes('Document is not focused'),
+		String(reason),
+	);
+	// 把替身换回「写得进去」：下面几节还要走成功的路（替身泄漏过一次就会一路红）
+	setGlobal('navigator', {
+		clipboard: {
+			write: async (items) => {
+				writes.push(items[0].types);
+			},
+			writeText: async (text) => {
+				writes.push({ text });
+			},
+		},
+	});
+
+	// ⑤ 整条消息：没图时不该报「取图失败」
+	const outcome = await copy.copyMessageWithImages(
+		{ text: '只有文字', images: [], fileNames: [], rest: [] },
+		undefined,
+	);
+	check(
+		'整条消息：纯文字消息复制成功，且不报图片相关的错',
+		outcome.ok === true && outcome.message.includes('已复制'),
+		JSON.stringify(outcome),
+	);
+	const empty = await copy.copyMessageWithImages({ text: '', images: [], fileNames: [], rest: [] }, undefined);
+	check('整条消息：空消息给出可读的拒绝，而不是静默成功', empty.ok === false, JSON.stringify(empty));
+
+	// ⑥ 「送到输入框」：DSH 那条路（**不经过剪贴板**）
+	//
+	// 判据来自用户实测 + 无头 Chrome 探针：DSH 的粘贴面只认文件 item，而 Chrome
+	// **不支持一次写多个 ClipboardItem**（`Support for multiple ClipboardItems is
+	// not implemented.`），系统剪贴板又只能放一张图 —— 所以 DSH 那条改成合成 drop。
+	// 这里钉的是「真的把图当成附件派发进输入框、文字也插进去了」。
+	const dropped = [];
+	const inserted = [];
+	const editor = {
+		isContentEditable: true,
+		focus: () => {},
+		// findComposer 用它挑「可见的那一份」（hero 与会话态会各留一棵 DOM）
+		getBoundingClientRect: () => ({ width: 100, height: 40, top: 0, left: 0 }),
+		dispatchEvent: (event) => {
+			dropped.push(event);
+			return true;
+		},
+	};
+	setGlobal('document', {
+		activeElement: editor,
+		execCommand: (name, _ui, text) => {
+			inserted.push({ name, text });
+			return true;
+		},
+		querySelectorAll: () => [editor],
+	});
+	setGlobal(
+		'DataTransfer',
+		class {
+			constructor() {
+				this.items = { add: () => {} };
+				this.files = [];
+				this.types = ['Files'];
+			}
+		},
+	);
+	setGlobal(
+		'DragEvent',
+		class {
+			constructor(type, init) {
+				this.type = type;
+				this.dataTransfer = init?.dataTransfer;
+			}
+		},
+	);
+	setGlobal(
+		'File',
+		class {
+			constructor(parts, name, opts) {
+				this.name = name;
+				this.type = opts?.type;
+				this.size = parts.reduce((sum, p) => sum + (p.size ?? p.length ?? 0), 0);
+			}
+		},
+	);
+	setGlobal('fetch', async () => ({ ok: true, blob: async () => new Blob([new Uint8Array([1, 2])], { type: 'image/png' }) }));
+	const sent = await copy.sendMessageToComposerOutcome(
+		{
+			text: '正文',
+			images: [
+				{ attachment: { attachmentId: 'sha256:ok' }, name: 'a.png' },
+				{ attachment: { attachmentId: 'sha256:ok2' }, name: '' },
+			],
+			fileNames: [],
+			rest: [],
+		},
+		loader,
+	);
+	check(
+		'送到输入框：两张图各派发一次合成 drop（**张数不限**，剪贴板那条只能带一张）',
+		dropped.length === 2 && dropped.every((event) => event.type === 'drop' && event.dataTransfer?.types.includes('Files')),
+		`drops=${String(dropped.length)}`,
+	);
+	check(
+		'送到输入框：文字插进了输入框（落在附件后面）',
+		inserted.length === 1 && inserted[0].text === '正文',
+		JSON.stringify(inserted),
+	);
+	check(
+		'送到输入框：结论如实报「送了几张图 + 文字」',
+		sent.ok === true && sent.message.includes('2 张图') && sent.message.includes('文字'),
+		sent.message,
+	);
+
+	const noImages = await copy.sendMessageToComposerOutcome({ text: '只有字', images: [], fileNames: [], rest: [] }, loader);
+	check(
+		'送到输入框：没图时照样能用（纯文字消息也送得进去）',
+		noImages.ok === true && noImages.message.includes('文字'),
+		noImages.message,
+	);
+
+	// ⑦ 结构守卫：影子席位必须带 priority -1
+	//
+	// 不带的话注册会**抛**（keyed 席位同 key 同优先级 = already has an entry），
+	// 那会让整个客户端插件的 apply 失败 —— 一条优先级数值值得钉一下。
+	const indexSource = await readFile(resolve(root, 'src/client/index.tsx'), 'utf8');
+	check(
+		'影子席位：conversation.chat.node 的 user 条目带 priority: -1',
+		/conversation\.chat\.node[\s\S]{0,200}?key:\s*'user'[\s\S]{0,80}?priority:\s*-1/.test(indexSource),
+		indexSource.includes("key: 'user'") ? '有 user 键但没有 priority: -1' : '没有 user 键',
+	);
 }
 
 // ─────────────────── 结果 ───────────────────

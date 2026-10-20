@@ -16,7 +16,7 @@
  */
 
 import type { ReactNode } from 'react';
-import { RiceBowlIcon } from '../icons';
+import { WhaleTailIcon } from '../icons';
 import {
 	parseMediaCallArgs,
 	readMediaPresentation,
@@ -88,7 +88,7 @@ export function MediaToolRow(props: ToolRowProps): ReactNode {
 		<div className="ffc-tool" data-state={state}>
 			<div className="ffc-tool-head">
 				<span className="ffc-tool-icon" aria-hidden="true">
-					<RiceBowlIcon size={14} />
+					<WhaleTailIcon size={14} generating={!settled} />
 				</span>
 				<span className="ffc-tool-title">{title}</span>
 				{meta?.model !== undefined && meta.model !== '' ? (
@@ -98,7 +98,9 @@ export function MediaToolRow(props: ToolRowProps): ReactNode {
 				) : null}
 				{meta?.usedReference === true ? (
 					<span className="ffc-tool-badge" title="这次生成带上了参考图（供应商是否采纳无法探测）">
-						参考图
+						{meta.referenceCount !== undefined && meta.referenceCount > 1
+							? `参考图 ${String(meta.referenceCount)} 张`
+							: '参考图'}
 					</span>
 				) : null}
 				<span className="ffc-tool-spacer" />
@@ -125,6 +127,14 @@ export function MediaToolRow(props: ToolRowProps): ReactNode {
 			{meta?.referenceDescription !== undefined ? (
 				<div className="ffc-tool-note" title={meta.referenceDescription}>
 					参考图：{meta.referenceDescription}
+				</div>
+			) : null}
+
+			{/* 留档失败要说出来：否则「配了目录却没生效」完全不可见，
+			    而下次图过期时用户会以为这个功能是坏的（P32） */}
+			{meta?.archiveError !== undefined ? (
+				<div className="ffc-tool-note" data-kind="error" title={meta.archiveError}>
+					本地留档失败：{meta.archiveError}
 				</div>
 			) : null}
 

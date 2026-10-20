@@ -28,6 +28,15 @@ export const MEDIA_COMMAND_NAME = 'generate';
 /** `presentationMeta` 里承载生成结果的那个键。 */
 export const MEDIA_META_KEY = 'fatfishCanvas';
 
+/**
+ * 本地留档结果的**公开地址前缀**（P32）。
+ *
+ * 两边必须写成同一个值：宿主按它注册取图路由（`host/archive.ts`），客户端按它
+ * 认出「这是本机留档的地址，可以当参考图 / 可以直接取字节」（见
+ * {@link isReferenceHandle}）。前缀与其它三个契约名字同理，放在共享模块里。
+ */
+export const MEDIA_ROUTE_PREFIX = '/ffc-media';
+
 /** 画布节点 id 前缀（`gen_<callId>`）。 */
 export const MEDIA_NODE_PREFIX = 'gen_';
 
@@ -46,8 +55,12 @@ export type MediaKind = 'image' | 'video';
 export interface MediaPresentation {
 	/** 媒体种类。 */
 	kind: MediaKind;
-	/** 可直接交给 `<img>` / `<video>` 的地址（http(s) 或 data:）。 */
+	/** 可直接交给 `<img>` / `<video>` 的地址（http(s)、同源相对路径或 data:）。 */
 	url: string;
+	/** 供应商回的原始地址（本地留档成功时才有；`url` 那时是本机路由）。 */
+	remoteUrl?: string;
+	/** 本地留档失败的原因（配了目录但没写成时才有）。 */
+	archiveError?: string;
 	/** 实际使用的模型。 */
 	model?: string;
 	/** 供应商 id。 */
@@ -64,6 +77,8 @@ export interface MediaPresentation {
 	mimeType?: string;
 	/** 这次生成是否带上了参考图（供应商**是否真的采纳**无法探测，这里只表示我们发出去了）。 */
 	usedReference?: boolean;
+	/** 带了几张参考图（`usedReference` 为真时才有；单张时宿主可能不写，按 1 理解）。 */
+	referenceCount?: number;
 	/** 视觉模型对参考图的描述（配了视觉模型、且当前模型看不见图时才有）。 */
 	referenceDescription?: string;
 }
@@ -76,6 +91,14 @@ export interface MediaCallArgs {
 	kind: MediaKind;
 	/** 画幅比例（未给时为 undefined）。 */
 	aspectRatio?: string;
+	/**
+	 * 参考图句柄（**按模型写的顺序**；`attached` 这个哨兵值原样保留）。
+	 *
+	 * 存的是句柄而不是解析后的地址：解析（读盘 / 读附件）只有宿主做得到，
+	 * 而解析结果往往是兆级 `data:` —— 把它抄进会话日志会把日志撑爆。
+	 * 用途是画布右键的「生成信息」（事后回看这次到底参考了哪几张图）。
+	 */
+	references?: string[];
 }
 
 // ─────────────────────────── 解析 ───────────────────────────
@@ -123,6 +146,8 @@ export function readMediaPresentation(meta: unknown): MediaPresentation | null {
 	if (typeof raw.url !== 'string' || raw.url === '') return null;
 
 	const out: MediaPresentation = { kind: raw.kind, url: raw.url };
+	if (typeof raw.remoteUrl === 'string' && raw.remoteUrl !== '') out.remoteUrl = raw.remoteUrl;
+	if (typeof raw.archiveError === 'string' && raw.archiveError !== '') out.archiveError = raw.archiveError;
 	if (typeof raw.model === 'string') out.model = raw.model;
 	if (typeof raw.providerId === 'string') out.providerId = raw.providerId;
 	if (typeof raw.prompt === 'string') out.prompt = raw.prompt;
@@ -131,6 +156,7 @@ export function readMediaPresentation(meta: unknown): MediaPresentation | null {
 	if (isFiniteNumber(raw.height) && raw.height > 0) out.height = raw.height;
 	if (typeof raw.mimeType === 'string') out.mimeType = raw.mimeType;
 	if (raw.usedReference === true) out.usedReference = true;
+	if (isFiniteNumber(raw.referenceCount) && raw.referenceCount > 0) out.referenceCount = raw.referenceCount;
 	if (typeof raw.referenceDescription === 'string' && raw.referenceDescription !== '') {
 		out.referenceDescription = raw.referenceDescription;
 	}
@@ -160,6 +186,16 @@ export function parseMediaCallArgs(raw: unknown): MediaCallArgs {
 		kind: isKind(o.kind) ? o.kind : 'image',
 	};
 	if (typeof o.aspectRatio === 'string' && o.aspectRatio !== '') out.aspectRatio = o.aspectRatio;
+
+	// `reference` 一张写字符串、多张写数组（与工具 schema 的 `oneOf` 对应）。
+	const rawRefs = Array.isArray(o.reference) ? o.reference : [o.reference];
+	const references: string[] = [];
+	for (const item of rawRefs) {
+		if (typeof item !== 'string') continue;
+		const text = item.trim();
+		if (text !== '') references.push(text);
+	}
+	if (references.length > 0) out.references = references;
 	return out;
 }
 
@@ -235,7 +271,28 @@ export function mediaCommandNodeId(commandId: string): string {
 export const GENERATE_USAGE =
 	'用法：/generate [--kind image|video] [--ratio 1:1|16:9|4:3|3:4|9:16] ' +
 	'[--provider 供应商 id] [--resolution 480p|1080p] [--duration 秒数] ' +
-	'[--ref 参考图地址] <提示词>（在输入框里附上图片时，那张图自动当参考图）';
+	'[--ref 参考图地址（可重复，按先后顺序都带上）] <提示词>' +
+	'（在输入框里附上图片时，那些图自动按顺序当参考图）';
+
+/**
+ * 一次生成最多带几张参考图。
+ *
+ * 上限是**为了报错可读**，不是协议限制：各家网关的张数上限并不统一（多图编辑类
+ * 常见 4–16 张），超了由供应商回 400 —— 而那条错误往往看不出是「张数太多」。
+ * 因此在这里挡住，并说清是哪一侧超了。
+ *
+ * ponytail: 一个全局常量，不分供应商、不可配。升级路径：做成供应商级字段
+ * （`maxReferenceImages`），真有人撞到再说。
+ */
+export const REFERENCE_MAX_COUNT = 8;
+
+/**
+ * 工具参数 `reference` 里的哨兵值：**用用户在这一轮消息里附的图**。
+ *
+ * 与宿主 `tool.ts` 的 `REFERENCE_ATTACHED` 必须是同一个字面量（那边是写给模型看的
+ * 写法，客户端只用来在「生成信息」里把它读成一句话）。测试钉住两者相等。
+ */
+export const REFERENCE_ATTACHED_MARKER = 'attached';
 
 /**
  * 命令行里能内联的**参考图地址**长度上限。
@@ -249,8 +306,10 @@ export const REFERENCE_MAX_INLINE = 8192;
 /**
  * 判断一个地址能否当作**参考图句柄**（进得了命令行，宿主那边也取得到内容）。
  *
- * 只有两种成立：`http(s):` 地址（宿主原样转给供应商，零下载）与足够小的
- * `data:` 内联地址。`blob:`（浏览器进程内的地址，宿主取不到）与相对路径一律不行 ——
+ * 三种成立：`http(s):` 地址（宿主原样转给供应商，零下载）、足够小的 `data:`
+ * 内联地址，以及**本机留档地址**（`/ffc-media/…`，宿主按同一个前缀把它映射回
+ * 归档目录里的文件 —— 这是留档之后最稳的参考图来源）。
+ * `blob:`（浏览器进程内的地址，宿主取不到）与其它相对路径一律不行 ——
  * 那种情况下宁可禁用入口，也不要发出一个必然失败的生成。
  * @param value - 候选地址（任意类型）。
  * @returns 能否当参考图。
@@ -259,6 +318,7 @@ export function isReferenceHandle(value: unknown): value is string {
 	if (typeof value !== 'string') return false;
 	const text = value.trim();
 	if (/^https?:\/\//i.test(text)) return true;
+	if (text.startsWith(`${MEDIA_ROUTE_PREFIX}/`)) return true;
 	return text.startsWith('data:') && text.length <= REFERENCE_MAX_INLINE;
 }
 
@@ -276,8 +336,11 @@ export interface GenerateCommandArgs {
 	duration?: number;
 	/** 点名供应商。 */
 	provider?: string;
-	/** 参考图地址（`http(s)` / `data:` / 本地路径 / 附件 id）。 */
-	reference?: string;
+	/**
+	 * 参考图地址（`http(s)` / `data:` / 本地路径 / 附件 id），**按顺序**。
+	 * `--ref` 可重复；只写一个时就是一个元素的数组。
+	 */
+	references?: string[];
 }
 
 /** 解析结果：要么是参数，要么是一句可读的错误（直接回给用户）。 */
@@ -371,7 +434,16 @@ export function parseGenerateLine(rawInput: unknown): GenerateCommandParse {
 			}
 			args.duration = seconds;
 		} else if (key === 'ref') {
-			args.reference = value;
+			// 可重复：多张参考图**按写的先后顺序**发出去（顺序对图生图是有意义的）
+			const list = args.references ?? [];
+			if (list.length >= REFERENCE_MAX_COUNT) {
+				return {
+					ok: false,
+					error: `一次最多带 ${String(REFERENCE_MAX_COUNT)} 张参考图（--ref 已经写了 ${String(list.length)} 个）。${GENERATE_USAGE}`,
+				};
+			}
+			list.push(value);
+			args.references = list;
 		} else {
 			args.provider = value;
 		}

@@ -6,7 +6,7 @@
  *   平移   Space + 拖拽 ／ 中键拖拽
  *   缩放   Ctrl(⌘) + 滚轮（以光标为锚点）／ 左下角 − + 与百分比按钮
  *   滚动   滚轮 = 纵向平移，Shift + 滚轮 = 横向平移（Excalidraw 同款）
- *   选择   单击选中 · Shift 单击加选/减选 · 空白处拖拽 = 框选
+ *   选择   单击选中 · Shift 单击加选/减选 · 空白处 Ctrl(⌘)/Shift + 拖拽 = 框选
  *   移动   拖拽节点（多选时整组移动）· 方向键微调 1px，Shift 为 10px
  *   删除   Delete / Backspace · Esc 取消选择 · Ctrl(⌘)+A 全选
  *
@@ -21,6 +21,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import {
 	boundsOf,
+	gridOf,
 	rectFromPoints,
 	rectsIntersect,
 	snapMove,
@@ -43,6 +44,7 @@ import {
 	setViewport,
 	subscribeNodeAdditions,
 	translateNodes,
+	undo,
 	useBoard,
 } from './store';
 import {
@@ -61,8 +63,8 @@ import {
 	queueFocus,
 } from './follow';
 import { getFollowNewNodes, useViewMode } from '../state';
-import { attachImageToComposer, insertIntoComposer, isComposerFocused, isEditableTarget } from '../dom';
-import { getProbeFace } from '../index';
+import { attachImageToComposer, fetchAsDataUrl, insertIntoComposer, isComposerFocused, isEditableTarget } from '../dom';
+import { fetchImageViaHost } from '../index';
 import { nodeClickIntent } from './clickintent';
 
 /**
@@ -96,27 +98,25 @@ async function sendImageToComposer(url: string): Promise<string> {
 			const done = await attach(url, 'canvas-image.png');
 			if (done !== null) return done;
 		}
+	} else if (url.startsWith('/')) {
+		// 同源相对地址 = 本机留档的图（P32）：直接取字节，不经过宿主
+		// （宿主那条路只认 http(s)）。
+		const got = await fetchAsDataUrl(url);
+		if (got !== null) {
+			const done = await attach(got.dataUrl, 'canvas-image.png');
+			if (done !== null) return done;
+		}
 	} else if (/^https?:\/\//i.test(url)) {
-		const probe = getProbeFace();
-		if (probe !== undefined) {
-			try {
-				const raw = (await probe.fetchImage(url)) as {
-					ok?: boolean;
-					message?: string;
-					dataUrl?: string;
-					name?: string;
-				};
-				if (raw !== undefined && raw.ok === true && typeof raw.dataUrl === 'string') {
-					const done = await attach(raw.dataUrl, raw.name ?? 'canvas-image.png');
-					if (done !== null) return done;
-				} else if (raw !== undefined && typeof raw.message === 'string') {
-					// 宿主明确说了取不到（太大 / 不是图片 / 连不上）：退化成地址并转述原因
-					if (insertIntoComposer(`${url}\n`)) return `${raw.message}（已插入图片地址）`;
-					return raw.message;
-				}
-			} catch {
-				/* 探针不可用：走下面的地址退路 */
-			}
+		// 信封由 fetchImageViaHost 拆开（这里**不要**自己读 remote 结果的字段）
+		const fetched = await fetchImageViaHost(url);
+		if (fetched.ok) {
+			const done = await attach(fetched.dataUrl, fetched.name);
+			if (done !== null) return done;
+		} else if (insertIntoComposer(`${url}\n`)) {
+			// 宿主明确说了取不到（太大 / 不是图片 / 连不上）：退化成地址并转述原因
+			return `${fetched.message}（已插入图片地址）`;
+		} else {
+			return fetched.message;
 		}
 	}
 
@@ -126,6 +126,31 @@ async function sendImageToComposer(url: string): Promise<string> {
 import { NodeCard } from './NodeCard';
 import { NodeMenu } from './NodeMenu';
 import { ZoomControls } from './ZoomControls';
+
+/**
+ * 从事件目标往上（走到视口为止）找第一个**自己能滚**的元素。
+ *
+ * 视口与浮层是 DOM 祖先关系（`.ffc-node-menu` 虽是 `position: fixed`，事件照样往上冒），
+ * 而滚轮的默认动作只有一处：视口的 `wheel` 监听里一 `preventDefault()`，
+ * 浮层内那个元素的**原生滚动**会被一起取消 —— 卡片里的长提示词永远滚不动，
+ * 画面反倒跟着缩放（P48 实测，机制见 NOTES §3.47）。
+ * @param target - 事件目标。
+ * @param viewport - 视口元素；走到它就停（视口自己永远算「画布的」）。
+ * @returns 会滚的那个元素；没有则为 `null`。
+ */
+function scrollableWithin(target: EventTarget | null, viewport: Element): Element | null {
+	let el = target instanceof Element ? target : null;
+	while (el !== null && el !== viewport) {
+		if (el.scrollHeight > el.clientHeight) {
+			// `overflow: visible` 的元素 `scrollHeight` 也会大于 `clientHeight`（内容溢出），
+			// 但它滚不动 —— 只认真正可滚的两种写法。
+			const overflowY = getComputedStyle(el).overflowY;
+			if (overflowY === 'auto' || overflowY === 'scroll') return el;
+		}
+		el = el.parentElement;
+	}
+	return null;
+}
 
 /** 当前正在进行的指针交互。 */
 type Interaction =
@@ -335,6 +360,10 @@ export function CanvasStage(): ReactNode {
 		if (el === null) return undefined;
 
 		const onWheel = (event: WheelEvent): void => {
+			// 浮层里能滚的那块（右键菜单的「生成信息」卡片）先吃这记滚轮：下面的
+			// preventDefault 会连它的原生滚动一起取消，长提示词就永远滚不到底。
+			if (scrollableWithin(event.target, el) !== null) return;
+
 			event.preventDefault();
 			noteUserInput();
 			setNodeMenu(null);
@@ -393,22 +422,27 @@ export function CanvasStage(): ReactNode {
 		(event: ReactPointerEvent<HTMLDivElement>) => {
 			const el = viewportRef.current;
 			if (el === null) return;
-			// 任何指针交互都先收起右键菜单（右键本身也会走到这里）
-			setNodeMenu(null);
 			setGuides([]);
-			// 只处理左键与中键
-			if (event.button !== 0 && event.button !== 1) return;
 
-			// 视口内的交互控件（缩放条按钮、播放按钮、链接…）自己处理指针，视口不得抢。
-			// 这是必须的一道闸：下面的 setPointerCapture 会把后续 pointerup 与
+			// 视口内的交互控件（缩放条按钮、播放按钮、链接、**浮层菜单**…）自己处理指针，
+			// 视口不得抢。这是必须的一道闸：下面的 setPointerCapture 会把后续 pointerup 与
 			// 随之而来的 click 全部改派给「捕获元素」，于是按钮的 onClick 永不触发。
 			const target = event.target;
-			if (
-				target instanceof Element &&
-				target.closest('button, a, input, select, textarea, [data-ffc-ui]') !== null
-			) {
-				return;
-			}
+			const control =
+				target instanceof Element
+					? target.closest('button, a, input, select, textarea, [data-ffc-ui], .ffc-menu')
+					: null;
+
+			// 收起右键菜单只对「不是控件」的按下做 —— 尤其**不能对菜单自己动手**：
+			// `<NodeMenu>` 是本视口的 DOM 后代，pointerdown 里把它卸载掉，随后的 click
+			// 就没有可派发的目标了 → 菜单里**每一项都点不动**，而 ↑↓ + Enter 却是好的
+			// （键盘不经过指针事件）。这个 bug 从 P5 活到 P27，因为 e2e 一直用合成 click
+			// 或键盘执行菜单项，从没真按过一次鼠标（NOTES §8.48）。
+			if (control === null) setNodeMenu(null);
+
+			// 只处理左键与中键（右键的收尾交给 contextmenu）
+			if (event.button !== 0 && event.button !== 1) return;
+			if (control !== null) return;
 
 			el.focus({ preventScroll: true });
 			noteUserInput();
@@ -416,9 +450,12 @@ export function CanvasStage(): ReactNode {
 			const point = screenOf(event.clientX, event.clientY);
 			event.currentTarget.setPointerCapture(event.pointerId);
 
-			// Shift + 左键 = 框选。
+			// Ctrl(⌘) / Shift + 左键 = 框选。
 			// 选择必须带修饰键，否则会与「拖拽 = 平移」这个主手势抢指针。
-			const boxSelect = event.button === 0 && event.shiftKey && !spaceHeld;
+			// 两个修饰键都认：Shift 是 P1 起的老习惯，Ctrl 是更主流的那一个
+			// （macOS 上 Ctrl + 左键会被系统当成右键，那条路由 contextmenu 兜住）。
+			const boxSelect =
+				event.button === 0 && (event.shiftKey || event.ctrlKey || event.metaKey) && !spaceHeld;
 			if (boxSelect) {
 				setInteraction({
 					kind: 'box',
@@ -626,6 +663,13 @@ export function CanvasStage(): ReactNode {
 				setSelection(boardRef.current.nodes.map((node) => node.id));
 				return;
 			}
+			// 撤回：删错了的那一下要能退回来。只做撤回、不做重做 —— Ctrl+Shift+Z
+			// 一并吃掉（没有重做栈，留着它什么都不做更让人困惑）。
+			if (mod && (e.key === 'z' || e.key === 'Z')) {
+				e.preventDefault();
+				undo();
+				return;
+			}
 			if (e.key === 'Delete' || e.key === 'Backspace') {
 				if (selection.length === 0) return;
 				e.preventDefault();
@@ -696,6 +740,8 @@ export function CanvasStage(): ReactNode {
 	const worldTransform = `translate(${String(-board.viewport.x * board.viewport.zoom)}px, ${String(
 		-board.viewport.y * board.viewport.zoom,
 	)}px) scale(${String(board.viewport.zoom)})`;
+	// 背景点阵与节点层共用同一个视口，因此平移/缩放时它一起走。
+	const grid = gridOf(board.viewport);
 
 	return (
 		<div
@@ -704,7 +750,12 @@ export function CanvasStage(): ReactNode {
 			tabIndex={0}
 			role="application"
 			aria-label="无限画布"
-			style={{ cursor }}
+			style={{
+				cursor,
+				backgroundSize: `${String(grid.size)}px ${String(grid.size)}px`,
+				backgroundPosition: `${String(grid.x)}px ${String(grid.y)}px`,
+				'--ffc-dot': `${String(grid.dot)}px`,
+			}}
 			data-interaction={interaction.kind}
 			data-anim={animating ? 'true' : undefined}
 			data-node-count={String(board.nodes.length)}
@@ -770,7 +821,7 @@ export function CanvasStage(): ReactNode {
 				<div className="ffc-placeholder">
 					<span className="ffc-placeholder-title">画布已就绪</span>
 					<span className="ffc-placeholder-hint">
-						拖拽平移 · 滚轮缩放 · Shift + 拖拽框选 · 点节点选中、拖动可移动。
+						拖拽平移 · 滚轮缩放 · Ctrl/Shift + 拖拽框选 · 点节点选中、拖动可移动。
 						生成结果会作为节点落到这里。
 					</span>
 					{/* 空态是唯一「用户还没东西可点」的时刻，正好用来教右键菜单 */}

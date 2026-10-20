@@ -11,16 +11,18 @@
  * `ingested` 是 P3 生成落图的**幂等记账**（已落到画布上的工具调用 id）。
  * 它必须持久化，否则重载后会话快照的历史重放会把用户删掉的节点又造回来。
  *
- * **作用域（P7）**：画布可以按会话隔离 —— `setBoardScope(sessionId)` 之后，
- * 读写的是 `fatfish-canvas:board:<sessionId>` 这个键，记账账本也随之独立。
- * 默认（`null`）仍是所有会话共用一块画布。策略（偏好 × 当前会话）在
- * `canvas/scope.ts`，本模块只负责「换键不丢东西」这件事。
+ * **作用域**：画布按**工作区**（会话的 cwd）分隔 —— `setBoardScope(<工作区路径>)` 之后，
+ * 读写的是 `fatfish-canvas:board:<工作区路径>` 这个键，记账账本也随之独立。
+ * 默认（`null`）是所有工作区共用一块画布，那块是「全部内容」的备份。
+ * 策略（偏好 × 当前会话所在的工作区）在 `canvas/scope.ts`，本模块只负责
+ * 「换键不丢东西」（`setBoardScope`）与「把共用那块按工作区拆开」（`rehomeSharedBoard`）。
  *
  * @module fatfish-canvas/client/canvas/store
  */
 
 import { useEffect, useState } from 'react';
 import {
+	boundsOf,
 	clampZoom,
 	DEFAULT_VIEWPORT,
 	makeNodeId,
@@ -33,7 +35,8 @@ import {
 const BOARD_KEY = 'fatfish-canvas:board';
 
 /**
- * 画布作用域：`null` = 所有会话共用一块画布；字符串 = 该会话自己的画布。
+ * 画布作用域：`null` = 所有工作区共用一块画布；字符串 = 那个工作区自己的画布
+ * （存的是工作区路径，就是会话的 cwd）。
  *
  * 刻意用**裸字符串**而不是 `{ kind, sessionId }` 对象：作用域的唯一用途就是
  * 选一个存储键，多一层包装只会让比较与序列化都变啰嗦。
@@ -105,6 +108,10 @@ function reviveNode(raw: unknown): CanvasNode | null {
 		...(typeof o.title === 'string' ? { title: o.title } : {}),
 		...(typeof o.prompt === 'string' ? { prompt: o.prompt } : {}),
 		...(typeof o.model === 'string' ? { model: o.model } : {}),
+		// 参考图句柄是「事后回看」用的，坏数据不该让整块画布退回空盘 —— 逐项过滤即可。
+		...(Array.isArray(o.references)
+			? { references: o.references.filter((item): item is string => typeof item === 'string' && item !== '') }
+			: {}),
 		...(typeof o.error === 'string' ? { error: o.error } : {}),
 		createdAt: isFiniteNumber(o.createdAt) ? o.createdAt : Date.now(),
 		...(typeof o.sessionId === 'string' ? { sessionId: o.sessionId } : {}),
@@ -160,15 +167,6 @@ function load(key: string): BoardState {
 /** 当前作用域与它对应的存储键（两者永远一起变）。 */
 let scopeKey: BoardScope = null;
 let storageKey = BOARD_KEY;
-/** 当前作用域是否已经有持久化数据（决定「采用当前画布」与否）。 */
-function hasStored(key: string): boolean {
-	if (typeof window === 'undefined') return false;
-	try {
-		return window.localStorage.getItem(key) !== null;
-	} catch {
-		return false;
-	}
-}
 
 let state: BoardState = typeof window === 'undefined' ? EMPTY : load(storageKey);
 const listeners = new Set<() => void>();
@@ -178,21 +176,26 @@ const additionListeners = new Set<(created: readonly CanvasNode[]) => void>();
 /** 持久化写盘句柄（去抖）。 */
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function persistNow(): void {
+/** 把一块画布写进指定键（持久化只落节点、视口与记账）。 */
+function writeBoard(key: string, board: Pick<BoardState, 'nodes' | 'viewport' | 'ingested'>): void {
 	if (typeof window === 'undefined') return;
 	try {
 		window.localStorage.setItem(
-			storageKey,
+			key,
 			JSON.stringify({
 				version: BOARD_VERSION,
-				nodes: state.nodes,
-				viewport: state.viewport,
-				ingested: state.ingested,
+				nodes: board.nodes,
+				viewport: board.viewport,
+				ingested: board.ingested,
 			}),
 		);
 	} catch {
 		// 配额耗尽 / 隐私模式：持久化失败不影响本次会话的内存状态。
 	}
+}
+
+function persistNow(): void {
+	writeBoard(storageKey, state);
 }
 
 /** 去抖持久化：拖拽节点时每帧都会改状态，不能每帧写盘。 */
@@ -205,7 +208,57 @@ function schedulePersist(): void {
 	}, 400);
 }
 
+// ─────────────────────────── 撤销 ───────────────────────────
+
+/**
+ * 撤销栈。
+ *
+ * **快照式**，而不是给每个动作写一遍逆运算：store 已经把全部节点变更收敛到
+ * `commit()` 这一个口子，分流只要几行；逆运算则要给增删改移各写一份，还得自己
+ * 还原 z / 顺序 / 落图记账 —— 那才是真正会写错的地方。
+ *
+ * 快照是**浅**的（节点对象按引用共享，store 从不原地改节点），50 步也就几百个
+ * 引用，不吃内存。
+ */
+const UNDO_LIMIT = 50;
+
+/** 同一批节点的连续微调并成一步的时间窗（拖拽每帧都在 patchNodes）。 */
+const UNDO_MERGE_MS = 600;
+
+/** 撤销栈：每项是「那次改动**之前**」的整份状态。 */
+let past: BoardState[] = [];
+
+/** 上一次记历史的时刻（只用于时间窗合并）。 */
+let lastPushAt = 0;
+
+/** 两批节点的 id 集合是否一致（一致 = 只是字段微调，可以并成一步）。 */
+function sameNodeIds(a: readonly CanvasNode[], b: readonly CanvasNode[]): boolean {
+	if (a.length !== b.length) return false;
+	const ids = new Set(a.map((node) => node.id));
+	return b.every((node) => ids.has(node.id));
+}
+
+/**
+ * 把「改动前」的状态记一步。
+ *
+ * 合并判据是 **id 集合没变**，而不只是看时间：拖拽（每帧 patchNodes）与方向键
+ * 连按当然要并成一步，但「600 毫秒内连删两个节点」是两件事 —— 撤一步只该回来
+ * 一个。增删改（节点集合本身变了）一律各记一步。
+ * @param nextNodes - 本次提交后的节点表。
+ */
+function pushHistory(nextNodes: readonly CanvasNode[]): void {
+	const merge = Date.now() - lastPushAt < UNDO_MERGE_MS && sameNodeIds(state.nodes, nextNodes);
+	if (!merge) {
+		past.push(state);
+		if (past.length > UNDO_LIMIT) past.shift();
+	}
+	lastPushAt = Date.now();
+}
+
 function commit(next: BoardState): void {
+	// 只有**节点表**换过引用才记历史：视口与选择集都是 `...state` 展开，`nodes`
+	// 引用原样保留（见下面各动作），所以这一行就是零成本的判别式。
+	if (next.nodes !== state.nodes) pushHistory(next.nodes);
 	state = next;
 	for (const fn of listeners) fn();
 	schedulePersist();
@@ -278,6 +331,11 @@ export function useSelection(): readonly string[] {
 	return useStoreValue(() => state.selection);
 }
 
+/** 订阅「还有没有可撤回的步骤」（工具条撤销按钮的禁用态）。 */
+export function useCanUndo(): boolean {
+	return useStoreValue(canUndo);
+}
+
 // ─────────────────────────── 作用域 ───────────────────────────
 
 /** 当前作用域（`null` = 所有会话共用一块画布）。 */
@@ -291,34 +349,102 @@ export function getBoardKey(): string {
 }
 
 /**
- * 切换画布作用域（P7：画布按会话隔离）。
+ * 切换画布作用域（画布按工作区分隔）。
  *
  * 三条不变量：
  * 1. **不丢东西**：先把当前画布落盘到**旧键**，再读新键。
- * 2. **`adopt` 只在「新键从没写过」时生效**：用户刚打开隔离开关时，
- *    手上的画布应该跟着自己走，而不是当场变空。
- * 3. **切走再切回要还原**：每个作用域的画布与记账账本各自独立持久化，
- *    A 会话 → B 会话 → A 会话 之后 A 的画布和它的 `ingested` 都还在，
+ * 2. **切走再切回要还原**：每个作用域的画布与记账账本各自独立持久化，
+ *    工作区 A → B → A 之后 A 的画布和它的 `ingested` 都还在，
  *    因此 A 的历史生成不会被重放成新节点。
- *
- * ⚠️ `adopt` 必须由调用方按「从共用切进隔离」判定，**不能**无条件传 true：
- * 会话 A → 会话 B 时若 B 的键恰好为空，无条件采用会把 A 的画布抄进 B 里。
+ * 3. **不抄送**：换到另一个工作区时绝不把上一个工作区的节点带过去 ——
+ *    「一个工作区一块」的全部意义就在这里。从共用那块切进某个工作区时
+ *    手上该看到什么，由 `rehomeSharedBoard` 先按会话分好，不由这里兜底。
  * @param next - 目标作用域。
- * @param options - `adopt`：新键为空时把当前画布整体带过去。
  */
-export function setBoardScope(next: BoardScope, options: { adopt?: boolean } = {}): void {
+export function setBoardScope(next: BoardScope): void {
 	const nextKey = boardKeyFor(next);
 	if (next === scopeKey && nextKey === storageKey) return;
 
 	flushPersist(); // 当前画布先落到旧键
-	const carry = options.adopt === true && !hasStored(nextKey) && state.nodes.length > 0;
 
 	scopeKey = next;
 	storageKey = nextKey;
 	// 选择集是瞬时视图状态：跨画布留着只会指向不存在的节点。
-	state = carry ? { ...state, selection: [] } : load(nextKey);
-	if (carry) persistNow(); // 采用过来的画布立刻成为新键的内容
+	state = load(nextKey);
+	// ⚠️ 撤销栈必须跟着清空：留着它，在工作区 B 按一下 Ctrl+Z 就会把工作区 A 的
+	// 节点搬进来 —— 那正好是「一个工作区一块画布」要挡住的事（数据串味，不只是显示问题）。
+	past = [];
+	lastPushAt = 0;
 	for (const fn of listeners) fn();
+}
+
+/** 拆到空画布上时，视口给包围盒留的边距（世界像素）。 */
+const REHOME_MARGIN = 40;
+
+/**
+ * 把「共用那块」按工作区拆开（一个工作区一块画布）。
+ *
+ * 为什么要拆而不是整块抄过去：共用那块是**所有项目**混在一起的一堆节点，
+ * 整块抄进当前工作区等于把别的项目也搬来了 —— 那正是这次要修掉的毛病。
+ * 每个节点上都记着它是哪个会话生成的，而工作区只有调用方查得到（会话列表），
+ * 所以映射从参数进来。
+ *
+ * 四条规则：
+ * 1. **认不出来的留在原地**（没有 `sessionId`、或那个会话已经不在列表里）：
+ *    宁可让它留在共用那块（用户点「共用画布」还看得到），也不猜一个工作区。
+ * 2. **按 id 去重**：同一个节点不会因为拆两遍而变成两个（幂等，可以在每次
+ *    「共用 → 按工作区」时都跑一遍）。
+ * 3. **记账账本一起带过去**：否则刚生成过的节点会被「最近结果补落」重放回来
+ *    （`ingested` 随作用域独立，见模块头）。
+ * 4. **共用那块一个字节都不动**：它是备份，拆过的东西仍然全在那里。
+ * @param workspaceOf - 节点 → 工作区路径；`null` = 认不出来。
+ * @returns 拆走 / 留下的节点数（日志与断言用）。
+ */
+export function rehomeSharedBoard(
+	workspaceOf: (node: CanvasNode) => string | null,
+): { moved: number; kept: number } {
+	if (typeof window === 'undefined') return { moved: 0, kept: 0 };
+	flushPersist(); // 手上这块可能正是共用那块，且还有没落盘的改动
+	const shared = load(BOARD_KEY);
+	if (shared.nodes.length === 0) return { moved: 0, kept: 0 };
+
+	const groups = new Map<string, CanvasNode[]>();
+	let kept = 0;
+	for (const node of shared.nodes) {
+		const workspace = workspaceOf(node);
+		if (workspace === null || workspace === '') {
+			kept += 1;
+			continue;
+		}
+		const list = groups.get(workspace);
+		if (list === undefined) groups.set(workspace, [node]);
+		else list.push(node);
+	}
+
+	let moved = 0;
+	for (const [workspace, nodes] of groups) {
+		const key = boardKeyFor(workspace);
+		const board = load(key);
+		const known = new Set(board.nodes.map((node) => node.id));
+		const fresh = nodes.filter((node) => !known.has(node.id));
+		if (fresh.length === 0) continue;
+
+		const base = topZ(board.nodes);
+		const placed = fresh.map((node, index) => ({ ...node, z: base + 1 + index }));
+		const box = boundsOf(placed);
+		writeBoard(key, {
+			nodes: [...board.nodes, ...placed].sort((a, b) => a.z - b.z),
+			// 拆到一块**空**画布上时视口对准这批节点的包围盒：否则默认视口停在
+			// 世界原点，而这批节点可能落在几千像素外 —— 用户看到的就是「画布是空的」。
+			viewport:
+				board.nodes.length === 0 && box !== null
+					? { x: box.x - REHOME_MARGIN, y: box.y - REHOME_MARGIN, zoom: 1 }
+					: board.viewport,
+			ingested: [...new Set([...board.ingested, ...shared.ingested])],
+		});
+		moved += placed.length;
+	}
+	return { moved, kept };
 }
 
 // ─────────────────────────── 动作 ───────────────────────────
@@ -498,6 +624,31 @@ export function clearBoard(): void {
 	// 刻意**保留 ingested**：清空画布之后，刚生成过的那几张图不应该立刻
 	// 又从会话快照里被重放回来。下一次生成照常落图。
 	commit({ ...state, nodes: [], viewport: DEFAULT_VIEWPORT, selection: [] });
+}
+
+/**
+ * 撤回一步：把栈顶那份「改动前」的快照放回去。
+ *
+ * 刻意**不走 `commit()`** —— 那样会把当前状态先记成一步历史，等于一边撤回一边
+ * 攒新的可撤回步骤，连按 Ctrl+Z 就会在原地来回跳。这里与 `setBoardScope` 一样
+ * 直接换状态并广播。
+ *
+ * 还原的是整份快照（含视口），因此撤掉删除时视野会回到那个节点还在的地方。
+ * @returns 是否真的撤回了一步（栈空时为 false）。
+ */
+export function undo(): boolean {
+	const previous = past.pop();
+	if (previous === undefined) return false;
+	lastPushAt = 0; // 撤回之后的第一个动作必须自己开一步，不能并进栈顶
+	state = previous;
+	for (const fn of listeners) fn();
+	schedulePersist();
+	return true;
+}
+
+/** 现在有没有可撤回的步骤。 */
+export function canUndo(): boolean {
+	return past.length > 0;
 }
 
 /**

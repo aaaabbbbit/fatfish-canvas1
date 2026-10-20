@@ -145,24 +145,86 @@ export function attachImageToComposer(dataUrl: string, name: string): AttachOutc
 }
 
 /**
- * 把 data URL 还原成 `File`。
- * @param dataUrl - 内联数据地址。
- * @param name - 文件名。
- * @returns 文件；格式不认识时为 null。
+ * 取一个**同源可显示地址**的字节。
+ *
+ * 三个调用点都要它：画布点图送进聊天框（本机留档的图是同源地址，不必绕宿主）、
+ * 聊天消息的两种复制（富文本要 data URL、附件模式要 Blob）。共用一份实现，
+ * 免得几处的失败判据各写一套。
+ * @param url - `blob:` 或同源相对/绝对地址。
+ * @returns 字节；取不到时为 null。
  */
-function dataUrlToFile(dataUrl: string, name: string): File | null {
-	const comma = dataUrl.indexOf(',');
-	if (comma < 0) return null;
-	const header = dataUrl.slice(0, comma);
-	const payload = dataUrl.slice(comma + 1);
-	if (!/^data:image\//i.test(header)) return null;
-	const mime = header.slice(5).split(';')[0] ?? 'image/png';
+export async function fetchBlob(url: string): Promise<Blob | null> {
 	try {
-		const binary = atob(payload);
-		const bytes = new Uint8Array(binary.length);
-		for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-		return new File([bytes], name === '' ? 'canvas-image.png' : name, { type: mime });
+		const response = await fetch(url);
+		if (!response.ok) return null;
+		return await response.blob();
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * 把一个 Blob 读成 data URL。
+ * @param blob - 字节。
+ * @returns 内联地址；读不了时为 null。
+ */
+export function blobToDataUrl(blob: Blob): Promise<string | null> {
+	return new Promise<string | null>((resolve) => {
+		const reader = new FileReader();
+		reader.onload = () => {
+			const text = typeof reader.result === 'string' ? reader.result : '';
+			resolve(text.startsWith('data:') ? text : null);
+		};
+		reader.onerror = () => {
+			resolve(null);
+		};
+		reader.readAsDataURL(blob);
+	});
+}
+
+/**
+ * 取一个同源地址并转成 data URL。
+ * @param url - `blob:` 或同源相对/绝对地址。
+ * @returns 内联数据与 MIME；取不到时为 null。
+ */
+export async function fetchAsDataUrl(url: string): Promise<{ dataUrl: string; mime: string } | null> {
+	const blob = await fetchBlob(url);
+	if (blob === null) return null;
+	const dataUrl = await blobToDataUrl(blob);
+	if (dataUrl === null) return null;
+	return { dataUrl, mime: blob.type === '' ? 'image/png' : blob.type };
+}
+
+/**
+ * 把 data URL 还原成 `Blob`。
+ * @param dataUrl - 内联数据地址。
+ * @returns 字节；格式不认识时为 null。
+ */
+export function dataUrlToBlob(dataUrl: string): Blob | null {
+	const comma = dataUrl.indexOf(',');
+	if (comma < 0) return null;
+	const header = dataUrl.slice(0, comma);
+	if (!/^data:[a-z]+\//i.test(header)) return null;
+	const mime = header.slice(5).split(';')[0] ?? 'image/png';
+	try {
+		const binary = atob(dataUrl.slice(comma + 1));
+		const bytes = new Uint8Array(binary.length);
+		for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+		return new Blob([bytes], { type: mime });
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 把 data URL 还原成 `File`。
+ * @param dataUrl - 内联数据地址。
+ * @param name - 文件名。
+ * @returns 文件；不是图片或格式不认识时为 null。
+ */
+function dataUrlToFile(dataUrl: string, name: string): File | null {
+	if (!/^data:image\//i.test(dataUrl)) return null;
+	const blob = dataUrlToBlob(dataUrl);
+	if (blob === null) return null;
+	return new File([blob], name === '' ? 'canvas-image.png' : name, { type: blob.type });
 }

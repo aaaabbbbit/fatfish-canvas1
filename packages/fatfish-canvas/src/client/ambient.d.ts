@@ -137,6 +137,7 @@ declare module 'react/jsx-runtime' {
 		interface FfcEventProps {
 			onClick?: FfcHandler;
 			onDoubleClick?: FfcHandler;
+			onMouseDown?: FfcHandler;
 			onContextMenu?: FfcHandler;
 			onPointerDown?: FfcHandler;
 			onPointerMove?: FfcHandler;
@@ -213,6 +214,14 @@ declare module '@deepseek-ai/cordis' {
 		reflect: { provide(name: string, value: unknown): () => void };
 		/** 插槽注册表（由 dsh-client-runtime 提供）。 */
 		slots: DshSlots;
+		/**
+		 * 本插件自己的 fiber。
+		 *
+		 * Loader 的行挂在 `fiber.entry` 上，因此 `fiber.entry?.options.id` 就是
+		 * 本行的 **Loader entry id**（= 设置分节的键）。宿主侧用它写回配置，
+		 * 行被改名也跟得上。
+		 */
+		fiber: { entry?: { options: { id?: string } } };
 		/** 视图模式切换时需要协同的面板动作（由 ui-layout 提供）。 */
 		layout: DshLayout;
 		/** 用户设置服务（@deepseek-ai/dsh-settings 提供）。 */
@@ -221,8 +230,14 @@ declare module '@deepseek-ai/cordis' {
 		tools: DshTools;
 		/** 直达命令注册表（@deepseek-ai/dsh-commands 提供）。 */
 		commands: DshCommands;
-		/** 设置传输层（@deepseek-ai/dsh-client-ui-settings 提供）。 */
-		settingsScope: DshClientSettingsScopeHost;
+		/**
+		 * 设置表单（@deepseek-ai/dsh-client-ui-settings 提供）。
+		 *
+		 * 0.2.0 起客户端读设置**只有这一条路**：按插件自己的 Loader entry id
+		 * 取那份表单，读值走 `getSnapshot()` / `subscribe()`，写回走
+		 * `set()` / `unset()` / `mutate()`（旧的 `settingsScope` 服务没有了）。
+		 */
+		configForms: DshClientConfigFormsHost;
 		/** 会话服务（dsh-client-runtime 提供）。 */
 		sessions: DshSessions;
 		/** 远程调用面（dsh-api-gateway 提供）：客户端调宿主服务就靠它。 */
@@ -234,29 +249,93 @@ declare module '@deepseek-ai/cordis' {
 		 * 客户端也有同名服务，但客户端半边不注册清单（它挂的是 $mount 贡献）。
 		 */
 		typert: { register(manifest: unknown): unknown };
+		/** HTTP 路由注册表（宿主侧，@deepseek-ai/dsh-host-webserver 提供）。 */
+		webServer: DshWebServer;
+		/** 浏览器连接的鉴权面（宿主侧，@deepseek-ai/dsh-client-connection 提供）。 */
+		connection: DshConnection;
 	}
 	export class Service {
 		protected constructor(ctx: Context);
 	}
 }
 
-// ─────────────── 客户端设置传输层（ui-settings 提供） ───────────────
+// ─────────────── 宿主 HTTP 面（P32 的本地留档路由） ───────────────
 
-/** `ctx.settingsScope` 在本插件用到的那一面。 */
-interface DshClientSettingsScopeHost {
-	/**
-	 * 把一个 namespace 绑成按命名空间的 scope。
-	 * @param spec - namespace 名与可选解码器。
-	 * @returns 该 namespace 的 scope。
-	 */
-	bind<T>(spec: {
-		namespace: string;
-		decode?: (section: unknown) => T | undefined;
-	}): DshClientSettingsScope<T>;
+/** 路由收到的请求（只声明本插件用到的那一面）。 */
+interface DshHttpRequest {
+	/** 请求地址（含查询串）。 */
+	url?: string;
+	/** 方法。 */
+	method?: string;
+	/** 请求头。 */
+	headers: Record<string, string | string[] | undefined>;
 }
 
-/** 一个 namespace 的客户端同步快照。 */
-interface DshClientSettingsSnapshot<T> {
+/** 路由的响应（只声明本插件用到的那一面）。 */
+interface DshHttpResponse {
+	/** 状态码。 */
+	statusCode: number;
+	/**
+	 * 设一个响应头。
+	 * @param name - 头名。
+	 * @param value - 头值。
+	 */
+	setHeader(name: string, value: string | number): void;
+	/**
+	 * 结束响应。
+	 * @param body - 正文（省略 = 空）。
+	 */
+	end(body?: Uint8Array | string): void;
+}
+
+/** `ctx.webServer` 在本插件用到的那一面。 */
+interface DshWebServer {
+	/**
+	 * 注册一条命名路由。
+	 * @param route - 种类（`exact` / `prefix`）、路径与处理器。
+	 * @returns 注销函数。
+	 */
+	register(route: {
+		kind: 'exact' | 'prefix';
+		path: string;
+		handler: (req: DshHttpRequest, res: DshHttpResponse) => void | Promise<void>;
+	}): () => void;
+	/** 监听端口。 */
+	readonly port: number | undefined;
+	/** 绑定地址。 */
+	readonly host: string;
+}
+
+/** `ctx.connection` 在本插件用到的那一面。 */
+interface DshConnection {
+	/**
+	 * 判定一个请求该不该被拒（Host/Origin 栅栏 + 会话 cookie）。
+	 * @param request - 请求。
+	 * @returns 拒绝时给状态码（401 / 403）；放行时 undefined。
+	 */
+	requestRejection(request: DshHttpRequest): number | undefined;
+}
+
+// ─────────────── 客户端设置表单（ui-settings 提供） ───────────────
+
+/**
+ * `ctx.configForms` 在本插件用到的那一面。
+ *
+ * 键是**宿主插件的 Loader entry id**（本插件 = `fatfish-canvas`）。同一个 id
+ * 上拿到的是同一份表单实例（provider 自己按 id 缓存），因此两处 `get` 可以
+ * 共用一份读/写状态。
+ */
+interface DshClientConfigFormsHost {
+	/**
+	 * 取某个宿主插件条目的表单。
+	 * @param entryId - 唯一的宿主插件 entry id。
+	 * @returns 该条目的表单。
+	 */
+	get<T>(entryId: string): DshClientConfigForm<T>;
+}
+
+/** 一个 entry 的客户端同步快照。 */
+interface DshClientConfigSnapshot<T> {
 	/** `loading` → 尚未拿到第一份分节；`ready` → 有值；`unavailable` → 读不到设置。 */
 	status: 'loading' | 'ready' | 'unavailable';
 	/** 最后一次被接受的、经 schema 解析的分节。 */
@@ -273,23 +352,31 @@ interface DshClientSettingsSnapshot<T> {
 	mode: 'host' | 'memory';
 }
 
-/** 一个 namespace 的客户端 scope。 */
-interface DshClientSettingsScope<T> {
+/**
+ * 一个 entry 的客户端表单。
+ *
+ * 本插件只声明自己用到的那一面：读（`getSnapshot` / `subscribe`）与单字段写
+ * （`set` / `unset`）。嵌套叶子的写回走宿主写入面 `remote.settings.mutate`
+ * （见下面的 DshRemoteSettings），因为那一条能带 revision 并报出可读错误。
+ */
+interface DshClientConfigForm<T> {
 	/** 当前快照（引用稳定，变化时才替换）。 */
-	getSnapshot(): DshClientSettingsSnapshot<T>;
+	getSnapshot(): DshClientConfigSnapshot<T>;
 	/** 订阅快照替换。 */
 	subscribe(listener: () => void): () => void;
 	/**
 	 * 写一个**顶层标量字段**（底层是单条 `set` 路径 op，因此不会碰到别的字段）。
 	 * @param field - 字段名。
 	 * @param value - 新值。
+	 * @returns Host 是否接受（**拒绝时返回 false，不抛**）。
 	 */
-	set(field: string, value: unknown): Promise<void>;
+	set(field: string, value: unknown): Promise<boolean>;
 	/**
 	 * 清除一个字段，使其重新继承组合层 / schema 默认。
 	 * @param field - 字段名。
+	 * @returns Host 是否接受（**拒绝时返回 false，不抛**）。
 	 */
-	unset(field: string): Promise<void>;
+	unset(field: string): Promise<boolean>;
 }
 
 // ─────────────── 宿主服务面（dsh-settings / dsh-tools） ───────────────
@@ -302,28 +389,22 @@ interface DshClientSettingsScope<T> {
 /** settings 服务在本插件用到的那一面。 */
 interface DshSettings {
 	/**
-	 * 注册一个 namespace 并拿到 owner scope。
-	 * @param ns - 小写 kebab-case 的 namespace 名。
-	 * @param schema - schemastery schema。
-	 * @param options - 组合 base 层与生效时机。
-	 * @returns owner scope。
+	 * 声明本插件的设置呈现策略。
+	 *
+	 * `{ auto: false }` = 不要自动生成设置页面（本插件自己注册了
+	 * `settings.section`）。策略挂在 `owner` 指名的 fiber 上。
+	 * @param presentation - 策略。
+	 * @param owner - 策略归属的 fiber（传本插件自己的 `ctx.fiber`）。
+	 * @returns 注销函数。
 	 */
-	register<T>(
-		ns: string,
-		schema: unknown,
-		options?: {
-			base?: Partial<T>;
-			applies?: 'live' | 'restart';
-			validate?: (value: T) => void;
-		},
-	): DshSettingsScope<T>;
+	configure(presentation: { auto?: boolean }, owner?: unknown): () => void;
 	/**
 	 * 对**用户层**应用一批深路径 op（`set` / `unset`）。
 	 *
-	 * 这是唯一能写嵌套叶子、也是唯一能删字段的写入口：owner scope 的
+	 * 这是唯一能写嵌套叶子、也是唯一能删字段的写入口：整体替换式的
 	 * `update` 只做浅合并、删不掉东西，而 `unset` 正是**迁移旧字段**必需的
 	 * （残留的不明字段不会被脱敏，会被原样下发到浏览器）。
-	 * @param ns - namespace 名。
+	 * @param ns - profile entry id（= 本插件的 Loader entry id）。
 	 * @param ops - 路径 op 列表。
 	 * @param expectedRevision - 并发栅栏（可选）。
 	 */
@@ -332,18 +413,6 @@ interface DshSettings {
 		ops: readonly { op: 'set' | 'unset'; path: string[]; value?: unknown }[],
 		expectedRevision?: number,
 	): Promise<unknown>;
-}
-
-/** 一个 namespace 的 owner scope。 */
-interface DshSettingsScope<T> {
-	/** 读取解析值（schema 默认 → 组合 base → 用户层）。 */
-	get(): T;
-	/** 观察已提交的变化。 */
-	watch(callback: (next: T, prev: T) => void | Promise<void>): () => void;
-	/** 把局部 patch 合并进用户层并持久化。 */
-	update(patch: object): Promise<void>;
-	/** 整体替换用户层。 */
-	replace(section: object): Promise<void>;
 }
 
 // ─────────── 远程调用面（P9：设置写入 / 密钥 / 宿主探测） ───────────
@@ -367,7 +436,7 @@ type DshRemoteResult<T> = { ok: true; value: T } | { ok: false; error: { code: s
 interface DshSettingsPathOp {
 	/** `set` 写入 / `unset` 清除。 */
 	op: 'set' | 'unset';
-	/** 从 namespace 根算起的路径。 */
+	/** 从分节根算起的路径。 */
 	path: string[];
 	/** `set` 的值。 */
 	value?: unknown;
@@ -376,8 +445,8 @@ interface DshSettingsPathOp {
 /** `remote.settings` 在本插件用到的那一面。 */
 interface DshRemoteSettings {
 	/**
-	 * 对某个 namespace 的用户层应用路径 op。
-	 * @param ns - namespace 名。
+	 * 对某个插件条目的**用户层**应用路径 op。
+	 * @param ns - profile entry id（= 本插件的 Loader entry id）。
 	 * @param ops - 路径 op，按顺序应用。
 	 * @param expectedRevision - 读到的 revision；`undefined` = 不做并发栅栏。
 	 * @returns 写入后的脱敏视图；冲突时 `error.code === 'settings/conflict'`。
@@ -499,6 +568,14 @@ interface DshSlotRegistration {
 	/** 导航次序（`settings.section` 用）。 */
 	order?: number;
 	/**
+	 * 同席位的**顶替**手段（P32）：注册表按 priority **升序**排，keyed / single
+	 * 席位同 key（同 id）只取第一个，因此更小的值 = 盖住别人的条目。
+	 * 注册表自己的报错文案原话：`register at a different priority to shadow it
+	 * (lowest renders)`。不写就是 0 —— 与本体撞车时会直接抛
+	 * 「already has an entry for key …」。
+	 */
+	priority?: number;
+	/**
 	 * 导航标题 / 无障碍标签。`settings.section` 用**纯字符串**（已实测：写成
 	 * locale key 时条目注册成功但导航里不出现）；列表席位允许惰性求值。
 	 */
@@ -549,10 +626,38 @@ interface DshObservableSnapshot<T> {
 	subscribe(fn: () => void): () => void;
 }
 
-/** 会话列表 store 里本插件读取的那一面。 */
+/**
+ * 会话列表 store 里本插件读取的那一面。
+ *
+ * ⚠️ **这里没有 `current`** —— 曾经有（`current: string | undefined`），而那是个
+ * 凭空的假设：真实的 `SessionListState`（dsh-api-session-controller 0.2.0-rc.2）
+ * 只有 `ids` / `byId` / `phase` / `projectionsBySession`，当前选择体现在**行的
+ * 本地引用计数**上（`retainedBy.mainView > 0` 的就是主视图正看着的那个会话，
+ * `dsh-client-ui-session` 判定「谁是主会话」用的也是这条规则）。
+ * 代价是落图整条线静默失效：读到 `undefined` → 一个节点都不落、记账不写、不报错。
+ */
 interface DshSessionListState {
-	/** 当前选中的会话 id（无会话时为 undefined）。 */
-	current: string | undefined;
+	/** 主机列表顺序的行 id。 */
+	readonly ids: readonly string[];
+	/** id → 行。 */
+	readonly byId: Readonly<Record<string, DshSessionSummary>>;
+}
+
+/** 列表行里本插件读取的那一面。 */
+interface DshSessionSummary {
+	/** 会话 id。 */
+	readonly id: string;
+	/**
+	 * 会话的工作目录（= 工作区路径）。
+	 *
+	 * **画布作用域就挂在它上面**：同一个 `cwd` 的会话共用一块画布（一个工作区
+	 * 一块）。真机上它是会话头部里那个已校验的绝对路径（`SessionHeader.cwd`），
+	 * 会话列表 RPC 会把它带出来；老会话没有这一段时为 undefined，
+	 * 那时画布退回「共用那块」（见 `canvas/scope.ts`）。
+	 */
+	readonly cwd?: string | undefined;
+	/** 各来源的本地引用计数；`mainView` 即「正被主视图持有」。 */
+	readonly retainedBy?: Readonly<Record<string, number>> | undefined;
 }
 
 /**
@@ -620,21 +725,22 @@ interface DshSessions {
 declare module '@deepseek-ai/dsh-client-ui-primitives' {
 	import type { ReactNode } from 'react';
 
-	/** 主题快捷方式（P0 未使用，保留给后续阶段）。 */
-	export const Button: (props: Record<string, unknown>) => ReactNode;
-	export const Menu: (props: Record<string, unknown>) => ReactNode;
-	export const Tooltip: (props: Record<string, unknown>) => ReactNode;
-	export const Pill: (props: Record<string, unknown>) => ReactNode;
-	export const Toast: (props: Record<string, unknown>) => ReactNode;
-	export const IconCloseOutline16: (props: Record<string, unknown>) => ReactNode;
-	export const IconPlusOutline16: (props: Record<string, unknown>) => ReactNode;
-	export const IconSparkle16: (props: Record<string, unknown>) => ReactNode;
-	export const IconFullscreenOutline16: (props: Record<string, unknown>) => ReactNode;
 	/**
 	 * 官方菜单在用的那两个图标（P17 起）：本体的模型菜单用的就是它们，
 	 * 照用才能让插件的菜单与本体「同一个质感」（自绘的勾与箭头总有细微差别）。
+	 *
+	 * ⚠️ 名字必须与**真机装的那版 dsh** 一致（这里是 0.2.0-rc.2：`Regular` / `Medium`
+	 * 两档，默认 16px，`size` 可覆盖）。写错名字 tsc **不会报**（这个 ambient 声明
+	 * 就是它看到的全部），而浏览器里那个导出是 `undefined` → React #130
+	 * 「Element type is invalid」→ 整个席位崩掉、界面直接不见（见 NOTES §8.59）。
+	 * `build.mjs` 现在会在构建期拿真机的导出名核对。
 	 */
-	export const IconChevronDownOutline14: (props: Record<string, unknown>) => ReactNode;
-	export const IconCheckOutline16: (props: Record<string, unknown>) => ReactNode;
+	export const IconChevronDownOutlineRegular: (props: Record<string, unknown>) => ReactNode;
+	export const IconCheckOutlineRegular: (props: Record<string, unknown>) => ReactNode;
+	/**
+	 * 本体那条「复制」按钮用的就是它（P32 起影子消息行也照用）：
+	 * 用户要求「复制含图的按钮按原版的复制按钮来」—— 自己画一个总差一点。
+	 */
+	export const IconCopyOutlineRegular: (props: Record<string, unknown>) => ReactNode;
 	export const writeClipboard: (text: string) => Promise<void>;
 }

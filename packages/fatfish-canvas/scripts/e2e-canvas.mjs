@@ -296,6 +296,52 @@ try {
 	s = JSON.parse(await evaluate(browser.cdp, PROBE));
 	check('框选命中节点', s.nodes.some((n) => n.selected === true), JSON.stringify(s.status));
 
+	// ─────────── 7b. Ctrl + 拖拽 = 框选（同一个手势，另一个更顺手的修饰键） ───────────
+	console.log('\n7b) Ctrl + 拖拽框选');
+	// 先点空白清掉选择，否则「命中」可能是上一段留下的
+	await click(browser.cdp, emptyPoint(s.vp).x, emptyPoint(s.vp).y);
+	await sleep(80);
+	s = JSON.parse(await evaluate(browser.cdp, PROBE));
+	const ctrlFrom = { x: s.vp.x + 6, y: s.vp.y + 6 };
+	const ctrlTo = screenOfWorld(s, s.nodes[0].left + 240 + 20, s.nodes[0].top + 160 + 20);
+	await browser.cdp.send('Input.dispatchMouseEvent', {
+		type: 'mousePressed',
+		x: ctrlFrom.x,
+		y: ctrlFrom.y,
+		button: 'left',
+		buttons: 1,
+		clickCount: 1,
+		modifiers: 2, // Ctrl
+	});
+	for (let i = 1; i <= 6; i += 1) {
+		const t = i / 6;
+		await browser.cdp.send('Input.dispatchMouseEvent', {
+			type: 'mouseMoved',
+			x: Math.round(ctrlFrom.x + (ctrlTo.x - ctrlFrom.x) * t),
+			y: Math.round(ctrlFrom.y + (ctrlTo.y - ctrlFrom.y) * t),
+			button: 'left',
+			buttons: 1,
+			modifiers: 2,
+		});
+		await sleep(15);
+	}
+	check(
+		'Ctrl + 拖拽也出现选框（不是去平移画布）',
+		(await evaluate(browser.cdp, "document.querySelectorAll('.ffc-marquee').length")) === 1,
+	);
+	await browser.cdp.send('Input.dispatchMouseEvent', {
+		type: 'mouseReleased',
+		x: ctrlTo.x,
+		y: ctrlTo.y,
+		button: 'left',
+		buttons: 0,
+		clickCount: 1,
+		modifiers: 2,
+	});
+	await sleep(120);
+	s = JSON.parse(await evaluate(browser.cdp, PROBE));
+	check('Ctrl 框选命中节点', s.nodes.some((n) => n.selected === true), JSON.stringify(s.status));
+
 	// ─────────── 8. 键位：Delete 删除选中 ───────────
 	console.log('\n8) 键盘：Delete 删除选中节点');
 	// 先点一下画布让视口获得焦点（快捷键刻意绑在画布元素上，不监听 window）
@@ -318,6 +364,29 @@ try {
 	await sleep(200);
 	s = JSON.parse(await evaluate(browser.cdp, PROBE));
 	check('Delete 删除了选中节点', s.nodes.length === 0, `剩余 ${String(s.nodes.length)}`);
+
+	// ─────────── 8b. 键位：Ctrl + Z 撤回 ───────────
+	console.log('\n8b) 键盘：Ctrl + Z 撤回删除');
+	// modifiers: 2 = Ctrl。焦点还在视口上（上一步刚点过、Delete 不移动焦点）。
+	await browser.cdp.send('Input.dispatchKeyEvent', {
+		type: 'keyDown',
+		key: 'z',
+		code: 'KeyZ',
+		modifiers: 2,
+		windowsVirtualKeyCode: 90,
+		nativeVirtualKeyCode: 90,
+	});
+	await browser.cdp.send('Input.dispatchKeyEvent', {
+		type: 'keyUp',
+		key: 'z',
+		code: 'KeyZ',
+		modifiers: 2,
+		windowsVirtualKeyCode: 90,
+		nativeVirtualKeyCode: 90,
+	});
+	await sleep(200);
+	s = JSON.parse(await evaluate(browser.cdp, PROBE));
+	check('Ctrl+Z 把删掉的节点撤回来', s.nodes.length === 1, `剩余 ${String(s.nodes.length)}`);
 } catch (error) {
 	check('测试过程中未抛错', false, error instanceof Error ? error.message : String(error));
 } finally {

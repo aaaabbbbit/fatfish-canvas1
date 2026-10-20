@@ -25,6 +25,23 @@ declare module 'node:fs/promises' {
 	 * @returns 文件字节。
 	 */
 	export function readFile(path: string, options?: { signal?: AbortSignal }): Promise<Uint8Array>;
+	/**
+	 * 建目录（归档留档时按日期建子目录）。
+	 * @param path - 路径。
+	 * @param options - `recursive` 建整条链且已存在不报错。
+	 */
+	export function mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
+	/**
+	 * 写一个文件（归档留档写字节）。
+	 * @param path - 路径。
+	 * @param data - 字节。
+	 * @param options - 取消信号。
+	 */
+	export function writeFile(
+		path: string,
+		data: Uint8Array,
+		options?: { signal?: AbortSignal },
+	): Promise<void>;
 }
 
 declare module 'node:path' {
@@ -46,6 +63,10 @@ declare module 'node:path' {
 	 * @returns 绝对路径。
 	 */
 	export function resolve(...parts: string[]): string;
+	/**
+	 * 本平台的分隔符（归档路由的越界检查要用它拼前缀）。
+	 */
+	export const sep: string;
 }
 
 declare module 'node:url' {

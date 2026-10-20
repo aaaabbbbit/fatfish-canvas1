@@ -12,12 +12,14 @@
  *   跟焦   新节点自动带进视野的开关（偏好持久化）
  *   面板   清空画布 · 重置宽度 · 宽度读数
  *   模式   纯画布开关（P10：从「视图」菜单里独立出来，单独一格）
- *   作用域 顶栏那枚「共用画布 / 本会话画布」读数**本身就是开关**（P10，
+ *          返回聊天（P49：画布**自己**的出口 —— 右上角那枚鲸鱼尾巴住在
+ *          会话作用域席位里，没有当前会话时它不存在，见 EntryButton 文件头）
+ *   作用域 顶栏那枚「共用画布 / 本工作区画布」读数**本身就是开关**（P10，
  *          原来这项在「视图」菜单里）—— 读数与开关是同一件事的两面。
  *
  * 标题旁两个读数回答「我现在看的是哪块画布、上面有什么」：节点/选中数，
- * 以及**作用域**（共用一块 / 本会话画布，P7）。后者很重要 ——
- * 按会话隔离打开后，画布内容会随会话切换而变化，不写明白就成了灵异事件。
+ * 以及**作用域**（所有工作区共用一块 / 本工作区一块）。后者很重要 ——
+ * 画布内容会随所在工作区切换而变化，不写明白就成了灵异事件。
  *
  * 所有按钮都带 `title` 与 `aria-label`，并且**都在 `.ffc-toolbar` 里带
  * `data-ffc-ui`** —— 画布视口靠这个属性判断「这个指针事件是给控件的」，
@@ -28,11 +30,19 @@
 
 import { useCallback, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
-import { ExpandIcon, FitIcon, RiceBowlIcon, SelectAllIcon, TargetIcon, TrashIcon } from './icons';
+import { ExpandIcon, FitIcon, SelectAllIcon, TargetIcon, TrashIcon, WhaleTailIcon } from './icons';
+import { VIEW_SHORTCUT_LABEL } from './shortcut';
 import { CanvasStage } from './canvas/CanvasStage';
 import { fitAll } from './canvas/actions';
 import { useBoardScope } from './canvas/scope';
-import { clearBoard, removeNodes, setSelection, useBoard } from './canvas/store';
+import {
+	clearBoard,
+	removeNodes,
+	setSelection,
+	undo,
+	useBoard,
+	useCanUndo,
+} from './canvas/store';
 import {
 	CANVAS_MAX,
 	CANVAS_MIN,
@@ -58,6 +68,7 @@ export function CanvasPanel(): ReactNode {
 	const width = useCanvasWidth();
 	const follow = useFollowNewNodes();
 	const board = useBoard();
+	const undoable = useCanUndo();
 	const scope = useBoardScope();
 	const [dragging, setDragging] = useState(false);
 	const widthRef = useRef(width);
@@ -95,7 +106,7 @@ export function CanvasPanel(): ReactNode {
 		<div className="ffc-panel" role="region" aria-label="肥鱼画布">
 			<div className="ffc-toolbar" data-ffc-ui="toolbar">
 				<span className="ffc-toolbar-brand">
-					<RiceBowlIcon size={17} />
+					<WhaleTailIcon size={17} />
 				</span>
 				{/* 标题可以在窄画布下被截断（CSS 里 min-width:0 + 省略号），
 				    按钮一律 flex:none —— 宁可少显示两个字，也不能把控件挤变形 */}
@@ -109,18 +120,20 @@ export function CanvasPanel(): ReactNode {
 				<button
 					type="button"
 					className="ffc-badge ffc-badge-btn"
-					data-ffc-scope={scope.scope === null ? 'shared' : 'session'}
-					aria-pressed={scope.mode === 'session'}
+					data-ffc-scope={scope.scope === null ? 'shared' : 'workspace'}
+					data-ffc-scope-path={scope.workspace ?? ''}
+					aria-pressed={scope.mode === 'workspace'}
 					title={
-						scope.mode === 'session'
-							? '画布按会话隔离：当前已开启（点击改为所有会话共用一块）'
-							: '画布按会话隔离：当前共用一块（点击改为每个会话各自一块）'
+						scope.mode === 'workspace'
+							? `画布按工作区分：当前是${scope.workspace === null ? '待会话' : scope.workspace}` +
+								'（点击改为所有工作区共用一块）'
+							: '画布按工作区分：当前所有工作区共用一块（点击改为每个工作区各自一块）'
 					}
 					onClick={() => {
 						toggleBoardScopeMode();
 					}}
 				>
-					{scope.scope === null ? '共用画布' : '本会话画布'}
+					{scope.scope === null ? '共用画布' : '本工作区画布'}
 				</button>
 
 				{/* 生成模型选择**不在这里**（P17 第二版）：它搬去了 composer 工具行，
@@ -153,6 +166,17 @@ export function CanvasPanel(): ReactNode {
 					}}
 				>
 					<TrashIcon size={15} />
+				</button>
+
+				<button
+					type="button"
+					className="ffc-tbtn"
+					title="撤回上一步（Ctrl/⌘ + Z）"
+					aria-label="撤回上一步"
+					disabled={!undoable}
+					onClick={undo}
+				>
+					撤销
 				</button>
 
 				{/* ── 视图 ── */}
@@ -222,8 +246,9 @@ export function CanvasPanel(): ReactNode {
 				) : null}
 
 				{/* ── 纯画布模式（P10：从「视图」菜单里独立出来，单独放在顶栏） ──
-				    它是纯画布模式下**唯一**能点的出口（那种模式没有聊天列，也就没有
-				    右上角的米饭碗），所以必须常驻顶栏、且状态可读（aria-pressed）。 */}
+				    它是纯画布模式下**画布自己**的出口之一（那种模式没有聊天列，也就没有
+				    右上角的鲸鱼尾巴），所以必须常驻顶栏、且状态可读（aria-pressed）。
+				    旁边那格「返回聊天」（P49）是另一个：它直接回聊天，这一格只回并排画布。 */}
 				<button
 					type="button"
 					className="ffc-tbtn"
@@ -241,6 +266,25 @@ export function CanvasPanel(): ReactNode {
 				>
 					<ExpandIcon size={15} />
 					纯画布
+				</button>
+
+				{/* ── 返回聊天（P49）──
+				    右上角那枚鲸鱼尾巴住在 `conversation.session.header.utilities`，
+				    那是**会话作用域**席位：没有当前会话（欢迎页）时整行都不存在。
+				    而画布模式是**记住的**（刷新会直接落回画布），于是那种情况下界面上
+				    一个出口都没有 —— 快捷键又在输入框里让路（欢迎页的 composer 会抢焦点）。
+				    因此出口必须跟着**画布本身**走：面板在，它就在。
+				    与旁边那格「纯画布」同一条道理，只是它回的是聊天而不是并排画布。 */}
+				<button
+					type="button"
+					className="ffc-tbtn"
+					title={`返回聊天界面（${VIEW_SHORTCUT_LABEL} 快速切换）`}
+					aria-label="返回聊天界面"
+					onClick={() => {
+						setMode('chat');
+					}}
+				>
+					返回聊天
 				</button>
 			</div>
 

@@ -22,6 +22,8 @@
 
 import { readFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
+import { archivePathOf, expandHome } from './archive';
+import { MEDIA_ROUTE_PREFIX } from '../client/shared/media';
 
 /** 一个持久附件引用里本模块用到的字段（`dsh-attachment` 的 `ImageAttachmentRef`）。 */
 export interface MediaAttachmentRef {
@@ -41,6 +43,14 @@ export type ReadAttachment = (
 export interface ReferenceDeps {
 	/** 附件读取面（缺席时附件形式的参考图会明确报错）。 */
 	readAttachment?: ReadAttachment;
+	/**
+	 * 本地留档目录（P32）。
+	 *
+	 * 留档之后的画布节点地址是 `/ffc-media/…`（见 host/archive.ts），它既是
+	 * 浏览器地址、也是**最稳的参考图句柄**（本地文件不会过期）。缺席时那种
+	 * 句柄会明确报错，而不是当成一个不存在的相对路径去读盘。
+	 */
+	archiveDir?: () => string;
 	/** 诊断日志。 */
 	log: (message: string) => void;
 }
@@ -110,8 +120,24 @@ export async function resolveReference(
 		return readAttachmentRef(attachmentRefOf(text), deps, signal);
 	}
 
-	// 其余一律当文件路径。相对路径按宿主进程的工作目录（= 会话工作区）解析。
-	const path = resolvePath(text);
+	// 本机留档地址（P32）：映射回归档目录里的文件，再按文件读字节。
+	// 这一条让「拿刚出的一张图当下一张的参考图」不必再经过会过期的远端地址。
+	let path: string;
+	if (text.startsWith(`${MEDIA_ROUTE_PREFIX}/`)) {
+		const dir = (deps.archiveDir?.() ?? '').trim();
+		if (dir === '') {
+			throw new Error(
+				'这张图是本机留档的地址，但当前没有配置留档目录（设置 → 图像 / 视频模型 → 本地留档），读不到它的字节。',
+			);
+		}
+		const mapped = archivePathOf(expandHome(dir), text);
+		if (mapped === null) throw new Error(`这个留档地址不在留档目录里：${text}`);
+		path = mapped;
+	} else {
+		// 其余一律当文件路径。相对路径按宿主进程的工作目录（= 会话工作区）解析。
+		path = resolvePath(text);
+	}
+
 	let bytes: Uint8Array;
 	try {
 		bytes = await readFile(path, signal === undefined ? undefined : { signal });
@@ -121,6 +147,33 @@ export async function resolveReference(
 	}
 	deps.log(`参考图取自本地文件 ${path}（${String(bytes.byteLength)} 字节）`);
 	return toDataUrl(bytes);
+}
+
+/**
+ * 解析**一串**参考图句柄（多图编辑 / 多张参考图的入口）。
+ *
+ * 顺序就是请求里的顺序 —— 对图生图来说「哪张是主体、哪张是背景」靠的就是它，
+ * 因此这里**逐个取、按原顺序收集**（`http(s)` 地址是原样透传、不下载，真正的
+ * 读盘只发生在附件与本地文件上，逐个取的开销可以忽略）。
+ *
+ * 一张失败就整次失败（见文件头那条硬规矩）：静默少一张比报错更糟 ——
+ * 用户以为三张参考图都生效了，实际只发了两张。
+ * @param handles - 句柄列表（字符串或持久附件引用，可混着来）。
+ * @param deps - 依赖（附件读取面与日志）。
+ * @param signal - 取消信号。
+ * @returns 可直接放进请求体的地址列表（顺序与入参一致）。
+ * @throws 任何一张取不到时。
+ */
+export async function resolveReferences(
+	handles: readonly (string | MediaAttachmentRef)[],
+	deps: ReferenceDeps,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const out: string[] = [];
+	for (const handle of handles) {
+		out.push(await resolveReference(handle, deps, signal));
+	}
+	return out;
 }
 
 /**

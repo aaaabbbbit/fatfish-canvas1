@@ -159,6 +159,13 @@ export interface SettledResult {
 	isError: boolean;
 	/** 失败原因（失败时）。 */
 	error: string;
+	/**
+	 * 这次调用带的参考图句柄（参数头落在窗口外时缺席）。
+	 *
+	 * 结果的 `meta` 里**没有**参考图地址（只有张数），因此事后回看「参考了哪几张」
+	 * 只能从这里来；`bridge` 现在会把 `tool/call` 的原文一起折进 `call`。
+	 */
+	references?: string[];
 }
 
 /**
@@ -178,6 +185,7 @@ export function settledMediaResults(snapshot: ConversationLike): SettledResult[]
 		if (typeof node.callId !== 'string' || node.callId === '') continue;
 
 		const text = textOfContent(node.content);
+		const args = parseMediaCallArgs(node.call?.argsRaw);
 		out.push({
 			callId: node.callId,
 			seq: typeof node.seq === 'number' ? node.seq : 0,
@@ -185,6 +193,7 @@ export function settledMediaResults(snapshot: ConversationLike): SettledResult[]
 			meta,
 			isError: node.isError === true || meta === null,
 			error: text === '' ? '生成失败（宿主没有给出原因）' : text,
+			...(args.references === undefined ? {} : { references: args.references }),
 		});
 	}
 	return out;
@@ -337,7 +346,7 @@ function placeAmong(placed: readonly CanvasNode[], size: { w: number; h: number 
  * 先跑工具，再跑命令；第二步重新读 board，因此**不会**把第一步刚落的节点
  * 再落一遍（`ingested` 已经记下了）。
  * @param snapshot - 会话快照。
- * @param sessionId - 会话 id（写到节点上，便于以后按会话隔离画布）。
+ * @param sessionId - 会话 id（写到节点上：画布按工作区拆分时要靠它认领节点）。
  * @param options - `baselineSeq`（首次观察该会话时的最大 seq）与 `now`。
  * @returns 本次同步报告（两条入口的合计）。
  */
@@ -360,7 +369,7 @@ export function syncConversation(
  *
  * 这是本模块**唯一**有副作用的函数：其余部分都是纯函数，可脱离浏览器单测。
  * @param snapshot - 会话快照。
- * @param sessionId - 会话 id（写到节点上，便于以后按会话隔离画布）。
+ * @param sessionId - 会话 id（写到节点上：画布按工作区拆分时要靠它认领节点）。
  * @param options - `baselineSeq`（首次观察该会话时的最大 seq）与 `now`。
  * @returns 本次同步报告。
  */
@@ -397,6 +406,8 @@ function syncToolResults(
 			...at,
 			title: args.prompt === '' ? '生成中' : args.prompt,
 			...(args.prompt === '' ? {} : { prompt: args.prompt }),
+			// 参考图在此刻**唯一**看得到（结果到达时参数头已经不在手上了）
+			...(args.references === undefined ? {} : { references: args.references }),
 			...(sessionId === undefined ? {} : { sessionId }),
 		};
 		seeds.push(seed);
@@ -419,6 +430,7 @@ function syncToolResults(
 					...((result.meta?.prompt ?? '') === '' ? {} : { prompt: result.meta?.prompt as string }),
 					...((result.meta?.prompt ?? '') === '' ? {} : { title: result.meta?.prompt as string }),
 					...((result.meta?.model ?? '') === '' ? {} : { model: result.meta?.model as string }),
+					...(result.references === undefined ? {} : { references: result.references }),
 				};
 		if (result.isError) failed += 1;
 
@@ -451,6 +463,7 @@ function syncToolResults(
 			...((result.meta?.url ?? '') === '' ? {} : { src: result.meta?.url as string }),
 			...((result.meta?.prompt ?? '') === '' ? {} : { prompt: result.meta?.prompt as string, title: result.meta?.prompt as string }),
 			...((result.meta?.model ?? '') === '' ? {} : { model: result.meta?.model as string }),
+			...(result.references === undefined ? {} : { references: result.references }),
 			...(sessionId === undefined ? {} : { sessionId }),
 		};
 		seeds.push(seed);
@@ -504,14 +517,22 @@ export function syncCommands(
 	const patches = new Map<string, Partial<Omit<CanvasNode, 'id'>>>();
 	let failed = 0;
 
-	/** 命令行原文 → 提示词与形状（解析失败时退回一个安全的默认值）。 */
-	const shapeOf = (args: string): { prompt: string; kind: NodeKind; size: { w: number; h: number } } => {
+	/** 命令行原文 → 提示词、形状与参考图（解析失败时退回一个安全的默认值）。 */
+	const shapeOf = (args: string): {
+		prompt: string;
+		kind: NodeKind;
+		size: { w: number; h: number };
+		references?: string[];
+	} => {
 		const parsed = parseGenerateLine(args);
 		if (!parsed.ok) return { prompt: '', kind: 'image', size: mediaNodeSize({ kind: 'image' }) };
 		return {
 			prompt: parsed.args.prompt,
 			kind: parsed.args.kind as NodeKind,
 			size: mediaNodeSize({ kind: parsed.args.kind, aspectRatio: parsed.args.aspectRatio }),
+			// 命令行原文**一直在**（命令节点自带 args），因此命令这条路的参考图
+			// 连「页面是事后才打开的」也照样记得下来。
+			...(parsed.args.references === undefined ? {} : { references: parsed.args.references }),
 		};
 	};
 
@@ -529,6 +550,7 @@ export function syncCommands(
 			...at,
 			title: shape.prompt === '' ? '生成中' : shape.prompt,
 			...(shape.prompt === '' ? {} : { prompt: shape.prompt }),
+			...(shape.references === undefined ? {} : { references: shape.references }),
 			...(sessionId === undefined ? {} : { sessionId }),
 		};
 		seeds.push(seed);
@@ -547,6 +569,7 @@ export function syncCommands(
 					status: 'ready',
 					src: command.url ?? '',
 					...((shape.prompt === '' ? {} : { prompt: shape.prompt, title: shape.prompt })),
+					...(shape.references === undefined ? {} : { references: shape.references }),
 				}
 			: { status: 'failed', error: command.error };
 		if (!command.ok) failed += 1;
@@ -569,6 +592,7 @@ export function syncCommands(
 			...at,
 			...(command.ok ? { src: command.url ?? '' } : { error: command.error }),
 			...(shape.prompt === '' ? {} : { prompt: shape.prompt, title: shape.prompt }),
+			...(shape.references === undefined ? {} : { references: shape.references }),
 			...(sessionId === undefined ? {} : { sessionId }),
 		};
 		seeds.push(seed);
@@ -586,13 +610,29 @@ export function syncCommands(
 
 /**
  * 判断节点是否已经处于目标形状（逐字段比较，避免无谓的 store 提交）。
+ *
+ * ⚠️ **数组字段要按值比**：`references` 这种字段每次解析都会给出一个**新数组**，
+ * 用 `===` 比就永远是「有变化」—— 于是每来一次会话快照都提交一次（流式输出期间
+ * 每秒好几次），而画布上什么都没变。这里只做一层浅比较：句柄是字符串，
+ * 顺序也是语义的一部分（先主体、后背景），逐项相等就算相等。
  * @param node - 当前节点。
  * @param patch - 目标字段。
  * @returns 是否完全一致。
  */
 function sameFields(node: CanvasNode, patch: Partial<Omit<CanvasNode, 'id'>>): boolean {
 	const current = node as unknown as Record<string, unknown>;
-	return Object.entries(patch).every(([key, value]) => current[key] === value);
+	return Object.entries(patch).every(([key, value]) => {
+		const now = current[key];
+		if (Array.isArray(value) || Array.isArray(now)) {
+			return (
+				Array.isArray(value) &&
+				Array.isArray(now) &&
+				value.length === now.length &&
+				value.every((item, index) => item === now[index])
+			);
+		}
+		return now === value;
+	});
 }
 
 /**

@@ -20,7 +20,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PACKAGE_ROOT, RESET_BOARD_PREFS, seedBoardExpression, evaluate, launch, sleep } from './lib/cdp.mjs';
+import { PACKAGE_ROOT, PIN_SHARED_BOARD, seedBoardExpression, evaluate, launch, sleep } from './lib/cdp.mjs';
 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 
@@ -221,7 +221,7 @@ try {
 				JSON.stringify({ version: 2, nodes: [], viewport: { x: 0, y: 0, zoom: 1 } }),
 			)};
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'canvas');
-			${RESET_BOARD_PREFS}
+			${PIN_SHARED_BOARD}
 			return true;
 		})()`,
 	);

@@ -13,9 +13,11 @@
  * @module fatfish-canvas/host/generate
  */
 
+import { archiveGeneration, expandHome } from './archive';
 import { describeImage, generate } from './providers';
-import { resolveReference, type MediaAttachmentRef, type ReadAttachment } from './reference';
+import { resolveReferences, type MediaAttachmentRef, type ReadAttachment } from './reference';
 import type { SessionLike } from './session-images';
+import { coerceParam } from '../client/shared/modelPresets';
 import { findVisionModel, isUsable, pickModel, type MediaKind, type ResolvedModel } from './schema';
 
 /** 一次生成的请求（工具参数与命令参数都收敛到这里）。 */
@@ -36,11 +38,12 @@ export interface GenerationRequest {
 	/** 视频时长（秒）。 */
 	duration?: number;
 	/**
-	 * 参考图句柄（可选）：`http(s)` 地址、`data:` 地址、会话附件引用、或本地文件路径。
-	 * 模型看不见图片内容，它只负责把用户给的地址抄进来（见 host/reference.ts）；
-	 * 命令面带附件时递的是**持久附件引用对象**（原样透传，不重拼）。
+	 * 参考图句柄（可选，**按顺序**）：`http(s)` 地址、`data:` 地址、会话附件引用、
+	 * 或本地文件路径。模型看不见图片内容，它只负责把用户给的地址抄进来
+	 * （见 host/reference.ts）；命令面带附件时递的是**持久附件引用对象**
+	 * （原样透传，不重拼）。多张参考图 = 多个元素，顺序会原样进请求体。
 	 */
-	reference?: string | MediaAttachmentRef;
+	references?: readonly (string | MediaAttachmentRef)[];
 	/**
 	 * 是否请**视觉模型**把参考图读成一段文字、注入提示词（可选）。
 	 *
@@ -49,12 +52,29 @@ export interface GenerationRequest {
 	 * 文字版本，否则它连图里有什么都不知道。没有配置视觉模型时这一项是空操作。
 	 */
 	describeReference?: boolean;
+	/**
+	 * 这次生成要**临时覆盖**的模型参数（模型在调用工具时给的）。
+	 *
+	 * 键必须在这个模型的声明范围内（预置 + 设置页里写的那些），否则整项被忽略
+	 * 并随结果回一句「忽略了哪些键」—— 见 `filterParams`。
+	 */
+	params?: Record<string, unknown>;
 }
 
 /** 归一化后的生成结果。 */
 export interface GenerationValue {
 	kind: MediaKind;
+	/**
+	 * 客户端应当使用的地址。
+	 *
+	 * **留档成功时是本地路由**（`/ffc-media/…`，不会过期）；没配留档目录、
+	 * 或这次留档失败时，就是供应商回的那个地址。
+	 */
 	url: string;
+	/** 供应商回的原始地址（只有留档成功时才有 —— 留着备查与排障）。 */
+	remoteUrl?: string;
+	/** 这次留档失败的原因（配了目录但没写成时才出现，随工具回执给用户看）。 */
+	archiveError?: string;
 	model: string;
 	providerId: string;
 	prompt: string;
@@ -64,8 +84,17 @@ export interface GenerationValue {
 	mimeType?: string;
 	/** 这次生成是否带上了参考图（只表示**发出去了**，供应商有没有采纳探测不到）。 */
 	usedReference?: boolean;
+	/** 带了几张参考图（与 `usedReference` 一起出现，供工具回执与聊天行显示）。 */
+	referenceCount?: number;
 	/** 视觉模型对参考图的描述（`describeReference` 生效时才有）。 */
 	referenceDescription?: string;
+	/**
+	 * 被忽略掉的调用参数（键不在这个模型的声明范围内，或值收敛不了）。
+	 *
+	 * 回给模型自己：它才知道「我要求的那个参数没生效」，而不是默默出一张
+	 * 不符合要求的图。
+	 */
+	ignoredParams?: string[];
 }
 
 /** 管线依赖。 */
@@ -87,6 +116,12 @@ export interface GenerationDeps {
 	 * 而不是静默出一张无关的图。
 	 */
 	readAttachment?: ReadAttachment;
+	/**
+	 * 生成结果的**本地留档目录**（P32）；空 = 不留档。
+	 *
+	 * 函数整个缺席时同样按「不留档」处理（裁剪过的组合里没有设置页）。
+	 */
+	getArchiveDir?: () => string;
 	/**
 	 * 当前这条路由**看不看得见图**（决定「自动套用用户附的图」该不该发生）。
 	 *
@@ -140,29 +175,38 @@ export async function runGeneration(
 	// 多大（等待中的占位节点与出图后的节点形状必须一致，否则会跳）。
 	const aspectRatio = request.aspectRatio ?? (request.kind === 'video' ? '16:9' : '1:1');
 
-	// 参考图句柄 → 供应商认的地址。取不到就**抛错**（绝不静默降级成纯文生图）。
-	const rawReference = request.reference;
-	const reference =
-		rawReference === undefined || (typeof rawReference === 'string' && rawReference.trim() === '')
-			? undefined
-			: await resolveReference(
-					rawReference,
+	// 参考图句柄 → 供应商认的地址（**按顺序**，多张就是多个）。取不到就**抛错**
+	// （绝不静默降级成纯文生图，也绝不静默少发一张）。
+	const requested = (request.references ?? []).filter(
+		(handle) => !(typeof handle === 'string' && handle.trim() === ''),
+	);
+	const references =
+		requested.length === 0
+			? []
+			: await resolveReferences(
+					requested,
 					{
 						...(deps.readAttachment === undefined ? {} : { readAttachment: deps.readAttachment }),
+						// 留档地址（`/ffc-media/…`）当参考图时要映射回归档目录里的文件
+						...(deps.getArchiveDir === undefined ? {} : { archiveDir: deps.getArchiveDir }),
 						log: deps.log,
 					},
 					signal,
 				);
 
-	deps.log(`${request.kind} via ${model.ref}${reference === undefined ? '' : '（带参考图）'}`);
+	const count = references.length;
+	deps.log(`${request.kind} via ${model.ref}${count === 0 ? '' : `（带 ${String(count)} 张参考图）`}`);
 
 	// 看不见图的模型（文本模型）需要一个文字版的参考图：请视觉模型读一遍，
 	// 拼进提示词前面，同时随结果回给模型自己（见 GenerationValue.referenceDescription）。
 	const description =
-		reference === undefined || request.describeReference !== true
+		count === 0 || request.describeReference !== true
 			? undefined
-			: await describeReference(deps, request.prompt, reference, signal);
+			: await describeReference(deps, request.prompt, references, signal);
 	const prompt = description === undefined ? request.prompt : `${REFERENCE_PROMPT_PREFIX}${description}\n\n${request.prompt}`;
+
+	// 调用时传的参数：按这个模型的声明过滤（键不认识 / 值收敛不了就记进 ignored）
+	const callParams = filterParams(model, request.params);
 
 	const result = await generate(
 		model,
@@ -171,15 +215,54 @@ export async function runGeneration(
 			aspectRatio,
 			resolution: request.resolution,
 			duration: request.duration,
-			...(reference === undefined ? {} : { reference }),
+			...(count === 0 ? {} : { references }),
+			...(callParams.params === undefined ? {} : { params: callParams.params }),
 		},
 		signal,
 		deps.getTimeoutMs(),
 	);
 
+	// ── 本地留档（P32） ──
+	//
+	// 供应商（尤其转中站）回的是**会过期的签名地址**，这是「图放久了加载不出来」
+	// 的根因。配了目录就把字节抓下来写盘，结果地址换成同源的本机路由。
+	//
+	// 三条刻意的选择：
+	//   1. **等它写完再返回**。这些字节浏览器要显示时反正也得下载一遍；让宿主
+	//      下完再本地供图，比「先给一个会死的地址、之后再补」简单得多。
+	//   2. **失败绝不打断生成**：图已经出来了，写不进盘只是「这次没留档」，
+	//      原因随结果回给用户（见 GenerationValue.archiveError）。
+	//   3. **视频也留**：视频地址同样会过期，而且丢一个更贵。
+	const archiveDir = (deps.getArchiveDir?.() ?? '').trim();
+	let url = result.url;
+	let remoteUrl: string | undefined;
+	let archiveError: string | undefined;
+	if (archiveDir !== '') {
+		const archived = await archiveGeneration(
+			expandHome(archiveDir),
+			{
+				url: result.url,
+				kind: result.kind,
+				...(result.mimeType === undefined ? {} : { mimeType: result.mimeType }),
+				model: result.model,
+			},
+			signal,
+		);
+		if (archived.ok) {
+			url = archived.url;
+			remoteUrl = result.url;
+			deps.log(`已留档 ${archived.rel}（${(archived.bytes / 1024).toFixed(0)} KB）`);
+		} else {
+			archiveError = archived.error;
+			deps.log(`留档失败（结果仍指向远端地址）：${archived.error}`);
+		}
+	}
+
 	return {
 		kind: result.kind,
-		url: result.url,
+		url,
+		...(remoteUrl === undefined ? {} : { remoteUrl }),
+		...(archiveError === undefined ? {} : { archiveError }),
 		model: result.model,
 		providerId: result.providerId,
 		prompt: result.prompt,
@@ -187,10 +270,49 @@ export async function runGeneration(
 		...(result.width !== undefined ? { width: result.width } : {}),
 		...(result.height !== undefined ? { height: result.height } : {}),
 		...(result.mimeType !== undefined ? { mimeType: result.mimeType } : {}),
-		// 只回一个布尔：参考图地址本身可能是兆级的 data:，决不能再进会话事件
-		...(reference === undefined ? {} : { usedReference: true }),
+		// 只回张数：参考图地址本身可能是兆级的 data:，决不能再进会话事件
+		...(count === 0 ? {} : { usedReference: true, referenceCount: count }),
 		...(description === undefined ? {} : { referenceDescription: description }),
+		...(callParams.ignored.length === 0 ? {} : { ignoredParams: callParams.ignored }),
 	};
+}
+
+/**
+ * 按模型的声明过滤调用时传的参数（纯函数）。
+ *
+ * **不抛错**：一个没声明过的键不该让整次生成失败 —— 但也不能悄悄丢掉，
+ * 因此把它记进 `ignored`，由结果文本回给模型自己（见 host/tool.ts）。
+ *
+ * **质量档不在这条路上**：它归聊天栏那格的档位 chip 管（`defaultTiers`），
+ * 所以模型传 `quality` 时忽略，并附一句「在哪选」—— 模型才有话可回用户，
+ * 而不是默默按用户没选的那一档出图。
+ * @param model - 已解析的模型（带这个家族的声明）。
+ * @param raw - 模型给的参数。
+ * @returns 要展开进请求体的值（一个都没有时缺席），以及被忽略的键（带原因）。
+ */
+function filterParams(
+	model: ResolvedModel,
+	raw: Record<string, unknown> | undefined,
+): { params?: Record<string, string | number | boolean>; ignored: string[] } {
+	const entries = Object.entries(raw ?? {});
+	if (entries.length === 0) return { ignored: [] };
+	const params: Record<string, string | number | boolean> = {};
+	const ignored: string[] = [];
+	for (const [key, value] of entries) {
+		if (key === model.axis?.param) {
+			ignored.push(`${key}（质量档在聊天栏那格里选）`);
+			continue;
+		}
+		const spec = model.paramSpecs.find((entry) => entry.key === key);
+		// 声明过的键才收（值只做类型收敛：闭集是设置页的下拉，不是校验器）
+		const coerced = spec === undefined ? undefined : coerceParam(spec, value);
+		if (coerced === undefined) {
+			ignored.push(key);
+			continue;
+		}
+		params[key] = coerced;
+	}
+	return { params, ignored };
 }
 
 /** 注入参考图描述时，加在提示词前面的那行说明。 */
@@ -204,14 +326,14 @@ const REFERENCE_PROMPT_PREFIX = '参考图内容：';
  * 的行为比没有这个功能更糟。
  * @param deps - 管线依赖。
  * @param prompt - 用户提示词（给视觉模型当语言与意图的线索）。
- * @param reference - 已解析的参考图地址。
+ * @param references - 已解析的参考图地址（**按顺序**，一次调用里全给它）。
  * @param signal - 取消信号。
  * @returns 描述文字；没配视觉模型或调用失败时 undefined。
  */
 async function describeReference(
 	deps: GenerationDeps,
 	prompt: string,
-	reference: string,
+	references: readonly string[],
 	signal?: AbortSignal,
 ): Promise<string | undefined> {
 	let vision: ResolvedModel | undefined;
@@ -227,8 +349,8 @@ async function describeReference(
 	}
 
 	try {
-		const description = await describeImage(vision, { reference, prompt }, signal);
-		deps.log(`参考图描述来自 ${vision.ref}（${String(description.length)} 字）`);
+		const description = await describeImage(vision, { references, prompt }, signal, deps.getTimeoutMs());
+		deps.log(`参考图描述来自 ${vision.ref}（${String(description.length)} 字，${String(references.length)} 张图）`);
 		return description;
 	} catch (error) {
 		deps.log(`参考图描述失败（继续生成）：${error instanceof Error ? error.message : String(error)}`);

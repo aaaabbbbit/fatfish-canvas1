@@ -5,8 +5,8 @@
  * 需要一个模块级共享源，因此这里用极小的外部 store + `useSyncExternalStore`，
  * 不引第三方状态库。
  *
- * 同一份 store 还装着画布的两个偏好：跟焦开关（P4）与**画布作用域**（P7，
- * 共用一块 ⟷ 每个会话一块）。它们都是「用户想要什么」这一层，不碰画布数据本身
+ * 同一份 store 还装着画布的两个偏好：跟焦开关（P4）与**画布作用域**
+ * （一个工作区一块 ⟷ 全部共用一块）。它们都是「用户想要什么」这一层，不碰画布数据本身
  * —— 数据在 `canvas/store.ts`，两者的接合点在 `canvas/scope.ts`。
  *
  * 副作用集中在 `apply mode` 一处：
@@ -30,11 +30,11 @@ const MODE_KEY = 'fatfish-canvas:view-mode';
 const LAST_CANVAS_KEY = 'fatfish-canvas:last-canvas-mode';
 const FOLLOW_KEY = 'fatfish-canvas:follow-new';
 const WIDTH_KEY = 'fatfish-canvas:canvas-width';
-/** 画布作用域偏好（P7）：所有会话共用一块，还是每个会话一块。 */
+/** 画布作用域偏好：所有工作区共用一块，还是每个工作区一块。 */
 const SCOPE_KEY = 'fatfish-canvas:board-scope';
 
 /** 画布作用域偏好。 */
-export type BoardScopeMode = 'shared' | 'session';
+export type BoardScopeMode = 'shared' | 'workspace';
 
 /** 画布宽度契约范围（px）——与 CSS 的 --ffc-canvas-min 保持一致。 */
 export const CANVAS_MIN = 360;
@@ -92,16 +92,22 @@ function readFollow(): boolean {
 }
 
 /**
- * 画布作用域偏好：读不到时默认**共用一块画布**。
+ * 画布作用域偏好：读不到时默认**按工作区**（一个工作区一块画布）。
  *
- * 默认值必须是老的（全局）行为：升级插件的人不该发现自己的画布莫名其妙空了，
- * 隔离是用户显式打开的开关（视图菜单里）。
+ * 默认值变过一次：P7 时是「所有会话共用一块」，因为那时 `session` 是显式开关，
+ * 升级不能改变已有行为。改成按工作区分之后，默认值**必须**跟着变 ——
+ * 用户要的就是「进哪个项目的对话就看哪个项目的画布」，默认关着的开关等于没改。
+ * 老数据的两条都要认：
+ *   - `session`（P7 的每个会话一块）：按**同样的意图、更粗的粒度**读作 `workspace`。
+ *     那次隔离的初衷就是「别把项目 A 的图混进项目 B」，而按会话分只会让人
+ *     每开一个新对话就以为画布丢了。
+ *   - `shared` 原样保留（用户显式选过「全部共用一块」）。
  */
 function readScopeMode(): BoardScopeMode {
 	try {
-		return window.localStorage.getItem(SCOPE_KEY) === 'session' ? 'session' : 'shared';
+		return window.localStorage.getItem(SCOPE_KEY) === 'shared' ? 'shared' : 'workspace';
 	} catch {
-		return 'shared';
+		return 'workspace';
 	}
 }
 
@@ -119,7 +125,7 @@ let mode: ViewMode = typeof window === 'undefined' ? 'chat' : readMode();
 let lastCanvasMode: CanvasMode =
 	typeof window === 'undefined' ? 'canvas' : readLastCanvasMode();
 let follow: boolean = typeof window === 'undefined' ? true : readFollow();
-let scopeMode: BoardScopeMode = typeof window === 'undefined' ? 'shared' : readScopeMode();
+let scopeMode: BoardScopeMode = typeof window === 'undefined' ? 'workspace' : readScopeMode();
 let width: string = typeof window === 'undefined' ? `${String(CANVAS_DEFAULT_PCT)}%` : readWidth();
 
 const listeners = new Set<() => void>();
@@ -281,10 +287,10 @@ export function toggleFollowNewNodes(): boolean {
 }
 
 /**
- * 画布作用域偏好（P7）。
+ * 画布作用域偏好。
  *
  * 这里只存「用户想要哪种」；**真正换画布**由 `canvas/scope.ts` 拿它
- * 结合当前会话 id 去调 `store.setBoardScope`（偏好自己不知道会话是谁）。
+ * 结合当前会话所在的工作区去调 `store.setBoardScope`（偏好自己不知道会话是谁）。
  */
 export function getBoardScopeMode(): BoardScopeMode {
 	return scopeMode;
@@ -292,7 +298,7 @@ export function getBoardScopeMode(): BoardScopeMode {
 
 /**
  * 设置作用域偏好。
- * @param next - `shared` 所有会话共用一块画布；`session` 每个会话一块。
+ * @param next - `shared` 所有工作区共用一块画布；`workspace` 每个工作区一块。
  */
 export function setBoardScopeMode(next: BoardScopeMode): void {
 	if (scopeMode === next) return;
@@ -303,7 +309,7 @@ export function setBoardScopeMode(next: BoardScopeMode): void {
 
 /** 翻转作用域偏好。 */
 export function toggleBoardScopeMode(): BoardScopeMode {
-	setBoardScopeMode(scopeMode === 'session' ? 'shared' : 'session');
+	setBoardScopeMode(scopeMode === 'shared' ? 'workspace' : 'shared');
 	return scopeMode;
 }
 

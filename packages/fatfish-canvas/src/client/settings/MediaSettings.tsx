@@ -17,7 +17,7 @@
  * 浏览器读不到值，整体回写会把密钥抹掉。P9 把密钥搬进凭据库（设置里只留
  * 引用名 `apiKeyEnv`），脱敏视图与真实视图一致，于是可以放心写嵌套结构：
  *
- *   settings.mutate({ ns, ops: [{ op:'set', path:['providers', id, 'baseURL'], value }] })
+ *   settings.mutate({ ns: <Loader entry id>, ops: [{ op:'set', path:['providers', id, 'baseURL'], value }] })
  *
  * 随之而来的三条实现约束（都在下面照着做了）：
  *
@@ -42,12 +42,16 @@ import {
 	isValidProviderId,
 	modelKeyRef,
 	modelRef,
+	parseTierAxis,
 	providerKeyRef,
+	tierLabel,
 	type MediaKind,
 	type ModelKind,
 	type ProviderPreset,
+	type TierAxis,
 } from '../shared/catalog';
-import { mutateSettings } from './models';
+import { CommonModels } from './CommonModels';
+import { familyRows, mutateSettings, parseTierDraft, tierDraftOf } from './models';
 import { clampToViewport, useMenuDismiss, useMenuFocus, useMenuNav } from '../menu';
 
 /** 一个模型的配置（与宿主 schema 同形）。 */
@@ -56,6 +60,8 @@ interface ModelProfile {
 	kind: ModelKind;
 	apiKeyEnv?: string;
 	label?: string;
+	/** 质量轴声明（可选）：家族级，同一个词干的兄弟共用。 */
+	tiers?: TierAxis;
 }
 
 /** 一个供应商的配置（与宿主 schema 同形）。 */
@@ -66,7 +72,7 @@ interface ProviderProfile {
 	models: ModelProfile[];
 }
 
-/** namespace 的解析值。 */
+/** 设置分节的解析值。 */
 interface MediaValue {
 	providers?: Record<string, ProviderProfile>;
 	defaultImage?: string;
@@ -115,8 +121,8 @@ export interface MediaSettingsProbe {
 
 /** 组件属性（由 apply 的 inject 面注入）。 */
 export interface MediaSettingsProps {
-	/** 已绑定的 namespace scope（读解析值 / 订阅变化）。 */
-	scope: DshClientSettingsScope<MediaValue>;
+	/** 本 entry 的设置表单（读解析值 / 订阅变化）。 */
+	scope: DshClientConfigForm<MediaValue>;
 	/**
 	 * 宿主写入面（`remote.settings` / `remote.credentials`）。
 	 *
@@ -141,14 +147,17 @@ type PathOp = { op: 'set' | 'unset'; path: string[]; value?: unknown };
 
 /** 模型行的内联编辑器状态。 */
 interface RowEditor {
-	/** 是新增还是重命名。 */
-	mode: 'add' | 'rename';
-	/** 原名（重命名时用）。 */
+	/** 是新增、重命名，还是配档位参数。 */
+	mode: 'add' | 'rename' | 'tiers';
+	/** 原名（重命名 / 配档位时用）。 */
 	original: string;
 	/** 正在输入的 id。 */
 	id: string;
 	/** 正在选的种类。 */
 	kind: ModelKind;
+	/** 只给 `mode: 'tiers'` 用：参数名与取值原文（`low=低, high=高`）。 */
+	tiersParam?: string;
+	tiersValues?: string;
 }
 
 /** 一张卡片的临时状态（UI 态，不进设置）。 */
@@ -179,7 +188,7 @@ const EMPTY_CARD: CardState = {
 
 /**
  * 取配置里的供应商表。
- * @param value - namespace 解析值。
+ * @param value - 设置分节的解析值。
  * @returns 供应商字典（永远是对象）。
  */
 function providersOf(value: MediaValue | undefined): Record<string, ProviderProfile> {
@@ -278,6 +287,10 @@ function modelActions(model: ModelProfile): readonly { id: string; label: string
 			: [{ id: 'clear-key', label: '清除单独密钥（改回继承）' }],
 		{ id: 'rename', label: '重命名模型…' },
 		{ id: 'kind', label: '切换种类（图像 → 视频 → 视觉）' },
+		{
+			id: 'tiers',
+			label: parseTierAxis(model.tiers) === undefined ? '配档位参数…（低/高这种）' : '修改档位参数…',
+		},
 		{ id: 'default-image', label: '设为默认图像模型' },
 		{ id: 'default-video', label: '设为默认视频模型' },
 		{ id: 'default-vision', label: '设为默认视觉模型' },
@@ -401,6 +414,8 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 	const [configured, setConfigured] = useState<ReadonlySet<string>>(new Set());
 	/** 是否已经问过凭据状态。 */
 	const [keysKnown, setKeysKnown] = useState(false);
+	/** 「常用模型」那一块的一次失败说明（成功不写在这里：成功自己会刷新界面）。 */
+	const [commonNote, setCommonNote] = useState('');
 
 	const value = snapshot.value;
 	const providers = providersOf(value);
@@ -555,12 +570,8 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 					{
 						op: 'set',
 						path: [FIELD_PROVIDERS, id, 'models'],
-						value: models.map((model) => ({
-							id: model.id,
-							kind: model.kind,
-							apiKeyEnv: model.apiKeyEnv ?? '',
-							label: model.label ?? '',
-						})),
+						// 统一走 cleanModel：多一个字段就多一处「改一半漏一处」的机会
+						value: models.map((model) => cleanModel(model)),
 					},
 				]);
 				return message;
@@ -595,7 +606,7 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 				}
 				await refreshKeys([...allRefs, ref]);
 				patchCard(id, { keyTarget: null, keyDraft: '' });
-				return `密钥已保存到凭据库（${ref}），不会写进 settings.yaml`;
+				return `密钥已保存到凭据库（${ref}），不会写进设置文档`;
 			});
 		},
 		[allRefs, api, patchCard, refreshKeys, run],
@@ -728,6 +739,22 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 					);
 					return;
 				}
+				case 'tiers': {
+					// 声明挂在**家族**上（同一词干的兄弟共用），因此配一次就够 ——
+					// 预填现存的声明，改的就是它
+					const axis = parseTierAxis(model.tiers);
+					patchCard(providerId, {
+						rowEditor: {
+							mode: 'tiers',
+							original: model.id,
+							id: model.id,
+							kind: model.kind,
+							tiersParam: axis?.param ?? 'quality',
+							tiersValues: tierDraftOf(axis),
+						},
+					});
+					return;
+				}
 				case 'default-image':
 					setDefault('image', modelRef(providerId, model.id));
 					return;
@@ -782,7 +809,7 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 				<b>视觉模型</b>是可选的：文本模型看不见参考图时，由它把图读成一段文字，
 				注入生成提示词并回给模型（相当于给文本模型配一双眼睛）。
 				<br />
-				<b>密钥只进 DSH 凭据库</b>（也可用同名环境变量提供）：不写进 settings.yaml，
+				<b>密钥只进 DSH 凭据库</b>（也可用同名环境变量提供）：不写进设置文档，
 				也不会下发给浏览器。
 			</div>
 			{!writable ? (
@@ -1039,6 +1066,7 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 						<div className="ffc-set-models">
 							{models.map((model) => {
 								const keyState = keyStateOf(profile, model, configured, keysKnown);
+								const modelAxis = parseTierAxis(model.tiers);
 								const editing = state.rowEditor?.mode === 'rename' && state.rowEditor.original === model.id;
 								if (editing && state.rowEditor !== null) {
 									return (
@@ -1105,6 +1133,103 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 										</div>
 									);
 								}
+								const tierEditing = state.rowEditor?.mode === 'tiers' && state.rowEditor.original === model.id;
+								if (tierEditing && state.rowEditor !== null) {
+									return (
+										// `data-editing='true'` 沿用重命名那套高亮；`data-editing-mode` 让测试能区分两种编辑器
+										<div
+											className="ffc-set-model"
+											key={model.id}
+											data-model={model.id}
+											data-editing="true"
+											data-editing-mode="tiers"
+										>
+											<input
+												className="ffc-set-input ffc-set-tiersparam"
+												type="text"
+												spellCheck={false}
+												data-field="tier-param"
+												placeholder="参数名"
+												title="请求体里的参数名，例如 quality"
+												value={state.rowEditor.tiersParam ?? ''}
+												onChange={(event) => {
+													patchCard(providerId, {
+														rowEditor: { ...state.rowEditor!, tiersParam: (event.target as HTMLInputElement).value },
+													});
+												}}
+											/>
+											<input
+												className="ffc-set-input"
+												type="text"
+												spellCheck={false}
+												data-field="tier-values"
+												placeholder="取值，如 low=低, high=高"
+												title="逗号分隔的取值；用 = 给中文展示名。挂在这个家族上（同一个词干的所有模型共用）"
+												value={state.rowEditor.tiersValues ?? ''}
+												onChange={(event) => {
+													patchCard(providerId, {
+														rowEditor: { ...state.rowEditor!, tiersValues: (event.target as HTMLInputElement).value },
+													});
+												}}
+											/>
+											<button
+												type="button"
+												className="ffc-tbtn"
+												data-action="commit-tiers"
+												onClick={() => {
+													const next = state.rowEditor;
+													if (next === null) return;
+													const parsed = parseTierDraft(next.tiersParam ?? '', next.tiersValues ?? '');
+													if (parsed.axis === undefined) {
+														// 就地报错（别写进去再静默失效：那正是最难查的一种失败）
+														patchCard(providerId, { message: { kind: 'error', text: parsed.error } });
+														return;
+													}
+													writeModels(
+														providerId,
+														models.map((candidate) =>
+															candidate.id === model.id ? { ...candidate, tiers: parsed.axis } : candidate,
+														),
+														`${model.id} 的档位参数已保存（${parsed.axis.param}：${parsed.axis.values.join('/')}）`,
+													);
+													patchCard(providerId, { rowEditor: null });
+												}}
+											>
+												确定
+											</button>
+											{parseTierAxis(model.tiers) === undefined ? null : (
+												<button
+													type="button"
+													className="ffc-tbtn"
+													data-action="clear-tiers"
+													title="清掉这个家族的档位参数（选择器里就不再出现这一排）"
+													onClick={() => {
+														writeModels(
+															providerId,
+															models.map((candidate) =>
+																candidate.id === model.id ? { ...candidate, tiers: undefined } : candidate,
+															),
+															`已清除 ${model.id} 的档位参数`,
+														);
+														patchCard(providerId, { rowEditor: null });
+													}}
+												>
+													清除
+												</button>
+											)}
+											<button
+												type="button"
+												className="ffc-tbtn"
+												data-action="cancel-model"
+												onClick={() => {
+													patchCard(providerId, { rowEditor: null });
+												}}
+											>
+												取消
+											</button>
+										</div>
+									);
+								}
 								return (
 									<div
 										className="ffc-set-model"
@@ -1123,6 +1248,17 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 										<span className="ffc-set-modelid" title={model.id}>
 											{model.id}
 										</span>
+										{/* 声明过档位参数的模型在这里留个记号：否则「配置完之后自动多出一排档位」
+										    在设置页里是看不见的 */}
+										{modelAxis === undefined ? null : (
+											<span
+												className="ffc-set-tierstate"
+												data-tier-param={modelAxis.param}
+												title={`档位参数 ${modelAxis.param}：${modelAxis.values.map((value) => tierLabel(value, modelAxis)).join(' / ')}（挂在这个家族上，同一个词干的所有模型共用）`}
+											>
+												档位 {modelAxis.values.map((value) => tierLabel(value, modelAxis)).join('/')}
+											</span>
+										)}
 										<span className="ffc-spacer" />
 										<span className="ffc-set-keystate" data-own={keyState.own ? 'true' : 'false'}>
 											{keyState.text}
@@ -1303,6 +1439,20 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 				);
 			})}
 
+			{/* ── 常用模型（按家族一行：勾选 / 质量参数 / 其他参数） ── */}
+			<CommonModels
+				providers={providers}
+				rows={familyRows(value)}
+				writable={writable}
+				onWriteModels={writeModels}
+				onError={setCommonNote}
+			/>
+			{commonNote === '' ? null : (
+				<div className="ffc-set-msg" data-kind="error" role="alert">
+					{commonNote}
+				</div>
+			)}
+
 			{/* ── 默认模型 ── */}
 			<div className="ffc-set-group">默认模型</div>
 			<div className="ffc-set-card">
@@ -1364,10 +1514,21 @@ export function MediaSettings({ scope, api, getProbe }: MediaSettingsProps): Rea
 }
 
 /**
- * 把一个模型收敛成 host schema 认识的形状（四个字段，顺序稳定）。
+ * 把一个模型收敛成 host schema 认识的形状（顺序稳定）。
+ *
+ * **唯一的写出口**：新增 / 重命名 / 配密钥 / 配档位都从这里过。加字段时只改这里，
+ * 不会出现「有的路径带着新字段、有的路径把它抹掉」那种最难查的半截状态。
  * @param model - 模型配置。
- * @returns 干净的四字段对象。
+ * @returns 干净的模型对象。
  */
 function cleanModel(model: ModelProfile): ModelProfile {
-	return { id: model.id, kind: model.kind, apiKeyEnv: model.apiKeyEnv ?? '', label: model.label ?? '' };
+	const axis = parseTierAxis(model.tiers);
+	return {
+		id: model.id,
+		kind: model.kind,
+		apiKeyEnv: model.apiKeyEnv ?? '',
+		label: model.label ?? '',
+		// 解析不动的声明当作没配：免得把 `{param:'',values:[]}` 这类空壳写进每一行
+		...(axis === undefined ? {} : { tiers: axis }),
+	};
 }

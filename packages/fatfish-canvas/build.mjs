@@ -95,6 +95,65 @@ function transpile(source, fileName, overrides = {}) {
 	return result.outputText;
 }
 
+// ─────────────────── 模板串承载文件的守卫（NOTES §8.12） ───────────────────
+
+/**
+ * 「整张内容住在一个模板串里」的源文件 → 那个模板串的起始标记。
+ * 加别的同类文件时在这里加一行即可。
+ */
+const TEMPLATE_ONLY_SOURCES = new Map([[resolve(CLIENT_SRC, 'styles.ts'), 'export const CSS = ']]);
+
+/**
+ * 模板串内部**不许出现反引号**的守卫。
+ *
+ * 为什么值得单独一条：CSS / SVG 注释里混进一个反引号会**提前结束模板串**，而
+ * TypeScript 报的是 `',' expected` / `Invalid character` 这类**不指向行号**的错
+ * （这个坑已经踩过四次）。判据很机械 —— 起始行之后、`;` 收尾行之前不得有反引号 ——
+ * 就在构建期判掉，并把**行号**点出来。
+ *
+ * 刻意**不数全文的反引号**：这类文件的 TS 头注释里本来就有反引号（`data-ffc-frame`
+ * 之类），数总数会把合法写法误判成错误。
+ * @param fileName - 报错文案里用的相对路径。
+ * @param source - 源码文本。
+ * @param marker - 模板串起始行的前缀（如 `export const CSS = `）。
+ */
+function assertTemplateClean(fileName, source, marker) {
+	const lines = source.split('\n');
+	const startAt = lines.findIndex(
+		(line) => line.startsWith(marker) && line.trimEnd().endsWith('`'),
+	);
+	if (startAt === -1) {
+		throw new Error(
+			`build.mjs: ${fileName} 里找不到 "${marker}\`" —— 守卫失效了（模板串的形状变了），` +
+				`请同步更新 build.mjs 的 TEMPLATE_ONLY_SOURCES。`,
+		);
+	}
+
+	const bad = [];
+	let endAt = -1;
+	for (let i = startAt + 1; i < lines.length; i += 1) {
+		const line = lines[i];
+		if (line.trim() === '`;') {
+			endAt = i;
+			break;
+		}
+		const count = (line.match(/`/g) ?? []).length;
+		if (count > 0) bad.push(`${String(i + 1)} 行×${String(count)}`);
+	}
+	if (endAt === -1) {
+		throw new Error(
+			`build.mjs: ${fileName} 的模板串没有正常收尾（应为单独一行 "\`;"）—— ` +
+				`多半是中间混进了反引号，把模板串提前结束了。`,
+		);
+	}
+	if (bad.length === 0) return;
+	throw new Error(
+		`build.mjs: ${fileName} 的模板串里混进了反引号（共 ${String(bad.length)} 处）：${bad.join('，')}\n` +
+			`  CSS / SVG 注释都不需要反引号 —— 它会提前结束模板串，TS 报的错不指向行号` +
+			`（见 NOTES.md §8.12）。`,
+	);
+}
+
 // ─────────────────────────── 宿主半边 ───────────────────────────
 
 /**
@@ -286,8 +345,98 @@ async function collectClientGraph() {
 	return modules;
 }
 
-/** 运行时内部模块注册表（产物的一部分；刻意写成 ES5 风格以最大化兼容）。 */
-const RUNTIME = `
+// ────────────── 统一基座导出的守卫（NOTES §8.59） ──────────────
+
+/** 匹配 `import { A, B as C } from '…'`（负向先行断言跳过 `import type …`）。 */
+const NAMED_IMPORT_RE = /\bimport\s+(?!type\b)\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
+
+/**
+ * 本机 dsh 安装目录 —— 「统一基座」那些包的真身。
+ * @returns 绝对路径；拿不到时 null（守卫自动跳过）。
+ */
+function dshInstallRoot() {
+	const appData = process.env.APPDATA;
+	return appData === undefined ? null : resolve(appData, 'npm/node_modules/@deepseek-ai/dsh');
+}
+
+/**
+ * 读一个基座包**真实**导出的名字。
+ *
+ * 只认产物末尾那种平铺的 `export { … }` 清单（primitives 就是这个形状）；
+ * 读不出来（react 那种 CJS 包装、没装这个包）返回 null = 这个包跳过校验。
+ * @param dshRoot - dsh 安装目录。
+ * @param spec - 基座词条（如 `@deepseek-ai/dsh-client-ui-primitives`）。
+ * @returns 名字集合或 null。
+ */
+async function realExportsOf(dshRoot, spec) {
+	const dir = resolve(dshRoot, 'node_modules', spec);
+	let entry = resolve(dir, 'lib/index.js');
+	try {
+		const manifest = JSON.parse(await readFile(resolve(dir, 'package.json'), 'utf8'));
+		if (typeof manifest.main === 'string') entry = resolve(dir, manifest.main);
+	} catch {
+		return null;
+	}
+	let text;
+	try {
+		text = await readFile(entry, 'utf8');
+	} catch {
+		return null;
+	}
+	const at = text.lastIndexOf('\nexport {');
+	if (at < 0) return null;
+	const end = text.indexOf('}', at);
+	if (end < 0) return null;
+	return new Set(
+		text
+			.slice(at + '\nexport {'.length, end)
+			.split(',')
+			.map((name) => name.trim())
+			.filter((name) => name !== ''),
+	);
+}
+
+/**
+ * 构建期守卫：**真机那版 dsh 里没有的名字，构建期就报出来**。
+ *
+ * 为什么值得一条守卫：`src/client/ambient.d.ts` 是**手写**的，tsc 看到的只有它。
+ * 手写的名字与真机不一致时 tsc 全绿，而浏览器里那个导出是 `undefined`
+ * → React #130「Element type is invalid」把**整个席位**打崩 —— 界面直接不见，
+ * 看着像「插槽注册没生效」（P33 实测：聊天栏那格 + 用户消息一起消失，
+ * 而真因只是 DSH 升级把 `IconCheckOutline16` 改名叫 `IconCheckOutlineRegular`）。
+ * @param graph - `collectClientGraph()` 的结果。
+ */
+async function assertBaseExports(graph) {
+	const dshRoot = dshInstallRoot();
+	if (dshRoot === null) {
+		console.log(`[${PLUGIN_ID}] 跳过统一基座导出守卫（找不到本机 dsh 安装目录）`);
+		return;
+	}
+	const checked = new Map();
+	const missing = [];
+	for (const { source, absPath } of graph.values()) {
+		for (const match of source.matchAll(NAMED_IMPORT_RE)) {
+			const spec = match[2];
+			if (spec === undefined || !BASE_MODULES.has(spec)) continue;
+			if (!checked.has(spec)) checked.set(spec, await realExportsOf(dshRoot, spec));
+			const names = checked.get(spec);
+			if (names === null || names === undefined) continue;
+			for (const raw of (match[1] ?? '').split(',')) {
+				const name = (raw.split(/\s+as\s+/)[0] ?? '').trim();
+				if (name === '' || name.startsWith('type ')) continue;
+				if (!names.has(name)) missing.push(`${relative(root, absPath)}：${name}（来自 ${spec}）`);
+			}
+		}
+	}
+	if (missing.length === 0) return;
+	throw new Error(
+		`build.mjs: 统一基座里没有这些导出（真机 ${dshRoot}）：\n  ${missing.join('\n  ')}\n` +
+			`  它们在浏览器里是 undefined → React #130 会把整个席位打崩（NOTES.md §8.59）：\n` +
+			`  先照真机改名字（图标是 Regular / Medium 两档），再同步 src/client/ambient.d.ts。`,
+	);
+}
+
+/** 运行时内部模块注册表（产物的一部分；刻意写成 ES5 风格以最大化兼容）。 */const RUNTIME = `
 var __ffcMods = {};
 var __ffcCache = {};
 function __ffcDefine(id, fn) { __ffcMods[id] = fn; }
@@ -319,10 +468,13 @@ function __ffcLoad(id) {
 
 async function buildClient() {
 	const graph = await collectClientGraph();
+	await assertBaseExports(graph);
 	const entryId = moduleIdOf(CLIENT_ENTRY);
 
 	const parts = [RUNTIME];
 	for (const [id, { source, absPath }] of graph) {
+		const marker = TEMPLATE_ONLY_SOURCES.get(absPath);
+		if (marker !== undefined) assertTemplateClean(relative(root, absPath), source, marker);
 		const js = transpile(source, relative(root, absPath));
 		parts.push(
 			`__ffcDefine(${JSON.stringify(id)}, function (module, exports, require) {\n${js}\n});`,

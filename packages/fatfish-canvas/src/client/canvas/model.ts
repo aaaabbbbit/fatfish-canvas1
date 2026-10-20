@@ -14,6 +14,8 @@
  * @module fatfish-canvas/client/canvas/model
  */
 
+import { isReferenceHandle, REFERENCE_ATTACHED_MARKER } from '../shared/media';
+
 /** 节点承载的媒体种类。P2/P3 会真正产生 image / video。 */
 export type NodeKind = 'image' | 'video' | 'text';
 
@@ -48,6 +50,13 @@ export interface CanvasNode {
 	prompt?: string;
 	/** 生成用的模型标识。 */
 	model?: string;
+	/**
+	 * 生成时用的**参考图句柄**（按当时写的顺序；可能是地址、会话附件 id 或 `attached`）。
+	 *
+	 * 只在「当时看得到调用参数」时才记得下来（见 canvas/ingest.ts）—— 历史节点上缺席是
+	 * 正常的，信息面板会照实说「没有记录」，而不是猜一个。
+	 */
+	references?: readonly string[];
 	/** 失败原因（status === 'failed' 时）。 */
 	error?: string;
 	/** 创建时间戳（毫秒）。 */
@@ -232,6 +241,48 @@ export function rectToScreen(rect: Rect, viewport: Viewport): Rect {
 /** 把一个值夹到 [min, max]。 */
 export function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));
+}
+
+// ─────────────────────── 背景点阵（跟视口走） ───────────────────────
+
+/** 点阵的基准间距（**世界**坐标 px）。CSS 里的 `background-size` 默认值必须与它一致。 */
+export const GRID_STEP = 24;
+
+/** 点阵在屏幕上的最小间距：比它更密就整格翻倍（否则缩到 10% 时会糊成一片灰）。 */
+const GRID_MIN_SCREEN_PX = 12;
+
+/** 点阵在屏幕上的取值（直接喂给 `.ffc-viewport` 的内联样式）。 */
+export interface GridStyle {
+	/** 屏幕上的一格边长（px）。 */
+	size: number;
+	/** 背景原点（= 世界原点在屏幕上的位置，因此点阵与节点永远对得上）。 */
+	x: number;
+	y: number;
+	/** 一个点的半径（px）。 */
+	dot: number;
+}
+
+/**
+ * 由视口算出背景点阵该怎么画。
+ *
+ * 点阵是**世界的一部分**：平移/缩放时它必须跟着走，否则用户会觉得「动的是节点、
+ * 背景钉在屏幕上」。做法与节点层同一套公式 —— 背景原点取世界原点在屏幕上的位置，
+ * 一格 = `GRID_STEP` 世界像素 × zoom。翻倍只翻 2 的幂，因此点始终落在世界坐标的
+ * 整格上，与节点不会错位。
+ * @param viewport - 当前视口。
+ * @returns 内联样式用的四个数。
+ */
+export function gridOf(viewport: Viewport): GridStyle {
+	let step = GRID_STEP;
+	while (step * viewport.zoom < GRID_MIN_SCREEN_PX) step *= 2;
+	const origin = toScreen({ x: 0, y: 0 }, viewport);
+	return {
+		size: step * viewport.zoom,
+		x: origin.x,
+		y: origin.y,
+		// 点也跟着缩放，但两头夹住：太小看不见，太大就成了麻子。
+		dot: clamp(viewport.zoom, 0.5, 2),
+	};
 }
 
 // ─────────────────────── 生成结果的自动落位 ───────────────────────
@@ -498,4 +549,77 @@ export function nodeRatio(node: { w: number; h: number }): string | undefined {
 	const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
 	const g = gcd(w, h);
 	return `${String(w / g)}:${String(h / g)}`;
+}
+
+/** 一张参考图在「生成信息」面板里的样子。 */
+export interface ReferenceView {
+	/** 原样的句柄（能直接渲染时它同时就是 `<img src>`）。 */
+	handle: string;
+	/** 能不能直接当 `<img src>` 显示（判据 = 共享模块的 `isReferenceHandle`）。 */
+	loadable: boolean;
+	/** 说明这句话是什么；地址本身已经说明一切时为 undefined。 */
+	note?: string;
+}
+
+/**
+ * 把节点上的参考图句柄分成「能直接看图的」与「只能看文字说明的」。
+ *
+ * 句柄**不都是地址**：`attached` 是「用户当时附在消息里的图」、`sha256:…` 是会话附件、
+ * 本地路径是宿主盘上的文件 —— 三种都只有宿主取得到字节，浏览器里没有任何 src 可指。
+ * 那种情况说清它是什么，而不是渲染一个永远裂掉的图。
+ * @param references - 节点上的参考图句柄（缺席 = 当时没记下来）。
+ * @returns 按原顺序的视图（空句柄已剔除）。
+ */
+export function referenceViews(references: readonly string[] | undefined): ReferenceView[] {
+	const out: ReferenceView[] = [];
+	for (const raw of references ?? []) {
+		const handle = raw.trim();
+		if (handle === '') continue;
+		const note =
+			handle === REFERENCE_ATTACHED_MARKER
+				? '你当时附在这一轮消息里的图（地址没有记录）'
+				: handle.startsWith('sha256:') || handle.startsWith('attachment:')
+					? '会话附件（地址没有记录）'
+					: undefined;
+		out.push(note === undefined ? { handle, loadable: isReferenceHandle(handle) } : { handle, loadable: false, note });
+	}
+	return out;
+}
+
+/** 一组节点（或一批导出的文件）里图 / 视频各有多少。 */
+export interface MediaCounts {
+	/** 图片个数。 */
+	image: number;
+	/** 视频个数。 */
+	video: number;
+}
+
+/**
+ * 数一组节点里的图与视频。
+ *
+ * 导出是**复合**的（图与视频一起走），所以「导出了些什么」这件事在两处要说
+ * 同一句话：右键菜单的条目文案（点之前）与导出结论（点之后）。两份数分开写
+ * 迟早会漂移，因此判据留在这里。
+ * @param nodes - 节点（通常已经筛掉没有地址的）。
+ * @returns 两种媒体的个数。
+ */
+export function mediaCounts(nodes: readonly { kind: NodeKind }[]): MediaCounts {
+	let image = 0;
+	let video = 0;
+	for (const node of nodes) {
+		if (node.kind === 'video') video += 1;
+		else if (node.kind === 'image') image += 1;
+	}
+	return { image, video };
+}
+
+/**
+ * 把个数说成一句短语（`3 张` / `2 个视频` / `2 图 + 1 视频`）。
+ * @param counts - 两种媒体的个数。
+ * @returns 短语（可嵌进「导出压缩包（…）」或「已导出 …」）。
+ */
+export function mediaCountsText(counts: MediaCounts): string {
+	if (counts.video === 0) return `${String(counts.image)} 张`;
+	if (counts.image === 0) return `${String(counts.video)} 个视频`;
+	return `${String(counts.image)} 图 + ${String(counts.video)} 视频`;
 }

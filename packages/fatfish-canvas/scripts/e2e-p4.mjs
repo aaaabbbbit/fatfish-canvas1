@@ -25,7 +25,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PACKAGE_ROOT, RESET_BOARD_PREFS, seedBoardExpression, click, evaluate, launch, sleep } from './lib/cdp.mjs';
+import { PACKAGE_ROOT, PIN_SHARED_BOARD, seedBoardExpression, click, evaluate, launch, sleep } from './lib/cdp.mjs';
 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 const SHOT = resolve(PACKAGE_ROOT, 'lib/e2e-p4.png');
@@ -196,7 +196,7 @@ try {
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'canvas');
 			window.localStorage.setItem('fatfish-canvas:canvas-width', '40%');
 			window.localStorage.removeItem('fatfish-canvas:follow-new');
-			${RESET_BOARD_PREFS}
+			${PIN_SHARED_BOARD}
 			return true;
 		})()`,
 	);
@@ -303,14 +303,14 @@ try {
 
 	// 作用域开关：原来在菜单里，现在就是顶栏那枚读数
 	check(
-		'作用域读数是可点的按钮，初始未按下（默认共用一块）',
+		'作用域读数是可点的按钮，初始未按下（本套件把作用域钉在共用那块上）',
 		s.scopeBtnCenter !== null && s.scopeBtnPressed === 'false' && s.scopeBtnHit === true,
 		`rect=${JSON.stringify(s.scopeBtn)} pressed=${String(s.scopeBtnPressed)} 文本=${String(s.scopeBtnText)}`,
 	);
 	await click(browser.cdp, s.scopeBtnCenter.x, s.scopeBtnCenter.y);
 	await sleep(520);
 	s = await read();
-	check('点作用域读数 → 打开按会话隔离（偏好写盘）', s.storage.scope === 'session', String(s.storage.scope));
+	check('点作用域读数 → 打开按工作区分隔（偏好写盘）', s.storage.scope === 'workspace', String(s.storage.scope));
 	check(
 		'开关是双向的：按钮按下态与读数文本都跟着变',
 		s.scopeBtnPressed === 'true',
@@ -319,7 +319,7 @@ try {
 	await click(browser.cdp, s.scopeBtnCenter.x, s.scopeBtnCenter.y);
 	await sleep(520);
 	s = await read();
-	check('再点一次关掉隔离（不给后面留下会换画布键的残留偏好）', s.storage.scope === 'shared', String(s.storage.scope));
+	check('再点一次切回共用（不给后面留下会换画布键的残留偏好）', s.storage.scope === 'shared', String(s.storage.scope));
 
 	// ── 3. 纯画布模式 ──
 	console.log('\n3) 纯画布模式');

@@ -13,7 +13,9 @@
  *      文字与 aria-label 跟着换（图标始终是米饭碗）——没有菜单、没有第二层。
  *   3. **顶栏**：「视图」菜单整块移除（不再有视图模式 / 画布宽度选择），
  *      纯画布独立成一个按钮；窄画布（40%）下顶栏不溢出、控件不被压扁；
- *      纯画布模式里它是唯一出口，必须还点得到。
+ *      纯画布模式里它是唯一出口，必须还点得到。**P49 起顶栏还常驻一格
+ *      「返回聊天」**：入口住在会话作用域席位里，欢迎页整行不存在，那一格
+ *      就是那时唯一的出口（真鼠标点一次，第 7 节）。
  *
  * 用法（需放宽沙箱：无头 Chrome 要创建命名管道）：
  *   node scripts/e2e-entry.mjs
@@ -21,7 +23,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PACKAGE_ROOT, RESET_BOARD_PREFS, click, evaluate, launch, sleep } from './lib/cdp.mjs';
+import { PACKAGE_ROOT, PIN_SHARED_BOARD, click, evaluate, launch, sleep } from './lib/cdp.mjs';
 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 const SHOT = resolve(PACKAGE_ROOT, 'lib/e2e-entry.png');
@@ -74,6 +76,9 @@ const PROBE = `(() => {
   const bar = q('.ffc-toolbar');
   const barRect = rect(bar);
   const onlyBtn = qa('.ffc-toolbar button').find((b) => b.getAttribute('aria-label') === '纯画布模式') ?? null;
+  // P49：顶栏那格「返回聊天」—— 没有当前会话（欢迎页）时右上角那枚入口不存在，
+  // 它就是唯一的出口，所以它必须在、必须点得到。
+  const backBtn = qa('.ffc-toolbar button').find((b) => b.getAttribute('aria-label') === '返回聊天界面') ?? null;
   const scopeBtn = q('[data-ffc-scope]');
 
   return JSON.stringify({
@@ -102,8 +107,34 @@ const PROBE = `(() => {
     onlyBtnCenter: center(onlyBtn),
     onlyBtnPressed: onlyBtn ? onlyBtn.getAttribute('aria-pressed') : null,
     onlyBtnHit: hit(onlyBtn),
+    backBtn: rect(backBtn),
+    backBtnCenter: center(backBtn),
+    backBtnHit: hit(backBtn),
+    backBtnText: text(backBtn),
     scopeBtnTag: scopeBtn ? scopeBtn.tagName.toLowerCase() : null,
     scopeBtnPressed: scopeBtn ? scopeBtn.getAttribute('aria-pressed') : null,
+    // 图标事实：入口里那枚鲸鱼尾巴（静止 = 实心；悬停 = 换成会摇的 APNG 遮罩）。
+    // 状态判据是**动图那枚的 display**（静止 none / 摇 block）—— 不能再比遮罩字符串
+    // 长度：遮罩一直挂在动图那枚身上，两种状态下长度一样。
+    whale: (() => {
+      const el = visibles('.ffc-entry .ffc-whale')[0];
+      if (el === undefined) return null;
+      const still = el.querySelector('.ffc-whale-still');
+      const anim = el.querySelector('.ffc-whale-anim');
+      const path = still ? still.querySelector('path') : null;
+      const r = el.getBoundingClientRect();
+      return {
+        box: { w: Math.round(r.width), h: Math.round(r.height) },
+        rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+        stillDisplay: still ? getComputedStyle(still).display : null,
+        animDisplay: anim ? getComputedStyle(anim).display : null,
+        animMaskLen: anim ? (getComputedStyle(anim).maskImage || '').length : 0,
+        // 填充色 / 描边色 = currentColor 落到的具体色值，应当与按钮的 color 一致（跟主题）
+        fill: path ? getComputedStyle(path).fill : null,
+        stroke: path ? getComputedStyle(path).stroke : null,
+        entryColor: getComputedStyle(el.closest('.ffc-entry') || el).color,
+      };
+    })(),
     padWidth: q('[class*="composer"] .ffc-entry') ? rect(q('[class*="composer"] .ffc-entry')) : null,
     toolbar: bar ? { w: Math.round(barRect.w), right: barRect.right, overflow: bar.scrollWidth > bar.clientWidth + 1, clipped: Array.from(bar.children).filter((el) => el.scrollWidth > el.clientWidth + 1).map((el) => cls(el).split(/\\s+/)[0]) } : null,
     panel: rect(q('.ffc-panel')),
@@ -154,7 +185,7 @@ try {
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'chat');
 			window.localStorage.setItem('fatfish-canvas:canvas-width', '40%');
 			window.localStorage.setItem('fatfish-canvas:last-canvas-mode', 'canvas');
-			${RESET_BOARD_PREFS}
+			${PIN_SHARED_BOARD}
 			return true;
 		})()`,
 	);
@@ -208,7 +239,7 @@ try {
 		`${String(s.entryLabel)} / ${String(s.entryTitle)}`,
 	);
 	check(
-		'入口只有米饭碗图形（没有「画布 / 聊天」任何字样）',
+		'入口只有鲸鱼尾巴图形（没有「画布 / 聊天」任何字样）',
 		s.entryText === '',
 		`textContent=${JSON.stringify(s.entryText)}`,
 	);
@@ -258,8 +289,8 @@ try {
 		JSON.stringify(s.toolbar),
 	);
 
-	// ── 4. 纯画布：顶栏那格是唯一出口，必须还点得到 ──
-	console.log('\n4) 纯画布模式：顶栏的「纯画布」按钮是唯一出口');
+	// ── 4. 纯画布：顶栏那两格是出口，必须还点得到 ──
+	console.log('\n4) 纯画布模式：顶栏的「纯画布」与「返回聊天」是出口');
 	const onlyCenter = s.onlyBtnCenter;
 	await click(browser.cdp, onlyCenter.x, onlyCenter.y);
 	await sleep(900);
@@ -276,6 +307,13 @@ try {
 		'纯画布下「纯画布」按钮仍在且可命中（白屏 bug 的回归守卫）',
 		s.onlyBtn !== null && s.onlyBtnHit === true && s.onlyBtnPressed === 'true',
 		`hit=${String(s.onlyBtnHit)} pressed=${String(s.onlyBtnPressed)} center=${JSON.stringify(s.onlyBtnCenter)}`,
+	);
+	// P49：这里就是用户报的那个状态 —— 入口按钮看不见（没有会话头部）。
+	// 出口必须跟着画布自己走，所以顶栏这一格在纯画布下也要在、也要点得到。
+	check(
+		'入口按钮看不见时，顶栏「返回聊天」仍在且可命中（这就是那个「退不出去」的回归守卫）',
+		s.backBtn !== null && s.backBtnHit === true,
+		`rect=${JSON.stringify(s.backBtn)} hit=${String(s.backBtnHit)} text=${JSON.stringify(s.backBtnText)}`,
 	);
 	check(
 		'纯画布下顶栏同样不溢出',
@@ -307,6 +345,94 @@ try {
 		'回到聊天后入口位置仍然没变',
 		s.entry !== null && Math.abs(s.entry.x - chatEntry.x) <= DRIFT_TOLERANCE && Math.abs(s.entry.y - chatEntry.y) <= DRIFT_TOLERANCE,
 		`${JSON.stringify(s.entry)} vs ${JSON.stringify(chatEntry)}`,
+	);
+
+	// ── 6. 图标：鲸鱼尾巴（静止 ⟷ 悬停摇尾巴） ──
+	console.log('\n6) 图标是 DSH 原生那枚鲸鱼尾巴（颜色跟主题；放上去才摇）');
+
+	// 先把指针挪开：上一节刚在入口上点过一下，指针还停在它身上，
+	// 那会让下面「静止态」的断言读到悬停态（假红）。
+	await browser.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 20, y: 400, buttons: 0 });
+	await sleep(300);
+	s = await read();
+	const idleIcon = s.whale;
+	check(
+		'入口里是鲸鱼尾巴（ffc-whale），且是 17×17 的正方（老位图是 1152:976，会在这里露馅）',
+		idleIcon !== null && idleIcon.box.w === 17 && idleIcon.box.h === 17,
+		JSON.stringify(idleIcon),
+	);
+	check(
+		'颜色走 currentColor：填充与描边都 = 按钮的 color（浅色主题下才会是深色，写死白色就瞎了）',
+		idleIcon !== null &&
+			idleIcon.fill !== null &&
+			idleIcon.fill === idleIcon.entryColor &&
+			idleIcon.stroke === idleIcon.entryColor,
+		`fill ${String(idleIcon?.fill)} / stroke ${String(idleIcon?.stroke)} vs color ${String(idleIcon?.entryColor)}`,
+	);
+	check(
+		'没碰它的时候是静止态：实心那枚在、会摇的那枚 display:none',
+		idleIcon !== null && idleIcon.stillDisplay !== 'none' && idleIcon.animDisplay === 'none',
+		`still ${String(idleIcon?.stillDisplay)} / anim ${String(idleIcon?.animDisplay)}`,
+	);
+
+	// 悬停：只移动指针，**不点击** —— 用户要的就是这一条
+	await browser.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: s.entryCenter.x, y: s.entryCenter.y, buttons: 0 });
+	await sleep(400);
+	s = await read();
+	const hoverIcon = s.whale;
+	check(
+		'鼠标放上去（不点击）就换成会摇的那枚（实心动画的遮罩）',
+		hoverIcon !== null && hoverIcon.animDisplay === 'block' && hoverIcon.animMaskLen > 5000,
+		`anim ${String(hoverIcon?.animDisplay)} / 遮罩 ${String(hoverIcon?.animMaskLen)} 字符`,
+	);
+	check(
+		'悬停时静止那枚让位（两枚都画就是重影）',
+		hoverIcon !== null && hoverIcon.stillDisplay === 'none',
+		String(hoverIcon?.stillDisplay),
+	);
+	const wagFrames = [];
+	if (hoverIcon !== null) {
+		for (let i = 0; i < 5; i += 1) {
+			const shot = await browser.cdp.send('Page.captureScreenshot', {
+				format: 'png',
+				clip: { x: hoverIcon.rect.x, y: hoverIcon.rect.y, width: hoverIcon.rect.w, height: hoverIcon.rect.h, scale: 2 },
+			});
+			wagFrames.push(Buffer.from(shot.data, 'base64').toString('base64'));
+			await sleep(120);
+		}
+	}
+	check(
+		'悬停时它真的在摇（真实时钟下 5 张截图里不止一种画面）',
+		new Set(wagFrames).size >= 2,
+		`不同帧 ${String(new Set(wagFrames).size)}/5`,
+	);
+
+	// 指针移开：回到静止态（不然它会在没人看的时候一直摇）
+	await browser.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 20, y: 400, buttons: 0 });
+	await sleep(300);
+	s = await read();
+	check(
+		'指针移开后回到静止态（实心那枚回来、动图那枚收掉）',
+		s.whale !== null && s.whale.animDisplay === 'none' && s.whale.stillDisplay !== 'none',
+		`anim ${String(s.whale?.animDisplay)} / still ${String(s.whale?.stillDisplay)}`,
+	);
+
+	// ── 7. P49：顶栏那格「返回聊天」真鼠标点一次 ──
+	// 它是「入口按钮不存在时」的出口（那个席位是会话作用域，欢迎页整行不渲染），
+	// 因此必须能被真鼠标点到 —— 冒烟测试只调了 onClick，那是替身，不是浏览器。
+	console.log('\n7) 顶栏「返回聊天」：真鼠标点一次就回聊天');
+	await click(browser.cdp, s.entryCenter.x, s.entryCenter.y);
+	await sleep(900);
+	s = await read();
+	check('（就位）从聊天进了并排画布', s.mode === 'canvas', String(s.mode));
+	await click(browser.cdp, s.backBtnCenter.x, s.backBtnCenter.y);
+	await sleep(900);
+	s = await read();
+	check('点顶栏「返回聊天」→ 回到聊天模式', s.mode === 'chat', String(s.mode));
+	check(
+		'回到聊天后那一格随画布面板一起收起（它属于画布，不属于聊天）',
+		s.backBtn === null,
+		JSON.stringify(s.backBtn),
 	);
 
 	const shot = await browser.cdp.send('Page.captureScreenshot', { format: 'png' });

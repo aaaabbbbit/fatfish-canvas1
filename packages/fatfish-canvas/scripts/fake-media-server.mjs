@@ -13,19 +13,23 @@
  *   POST /v1/videos/generations   → 直接出片（返回 404 时插件会去轮询，这里不考）
  *   GET  /v1/models               → OpenAI 形状的模型列表（P9 的探测用；校验 --key）
  *
- * 用法（配合 settings.yaml / 设置页里的 media-generation 分节）：
+ * 用法（配合设置页，或在 profile patch 那一行的 `config:` 里直接写）：
  *   node scripts/fake-media-server.mjs --port 8791 --delay 2500 --key sk-local-fake
  *
- * settings.yaml 里 P9 的新形状长这样（密钥也可以直接写进凭据库）：
- *   media-generation:
- *     providers:
- *       local:
- *         baseURL: http://127.0.0.1:8791/v1
- *         apiKeyEnv: FFC_LOCAL_API_KEY
- *         models:
- *           - id: fake-image-1
- *             kind: image
- *     defaultImage: local::fake-image-1
+ * P9 的新形状长这样（密钥也可以直接写进凭据库）。0.2.0 起设置分节按 **Loader
+ * entry id** 寻址，因此它是那一行的 `config:`，不再是 `settings.yaml` 里的
+ * 自定义 namespace：
+ *   - id: fatfish-canvas
+ *     name: fatfish-canvas
+ *     config:
+ *       providers:
+ *         local:
+ *           baseURL: http://127.0.0.1:8791/v1
+ *           apiKeyEnv: FFC_LOCAL_API_KEY
+ *           models:
+ *             - id: fake-image-1
+ *               kind: image
+ *       defaultImage: local::fake-image-1
  *
  * ⚠️ 只用于本地验证：图是现画的，除了（可选的）密钥之外什么都不校验。
  */

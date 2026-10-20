@@ -38,8 +38,8 @@ import type { MediaAttachmentRef } from './reference';
 
 /** 命令的输入提示（composer 在用户敲下 `/generate ` 之后显示）。 */
 const INPUT_HINT =
-	'提示词，前面可加 --video / --ratio 16:9 / --duration 5 / --ref 参考图地址 等参数；' +
-	'在输入框里附一张图 = 用它当参考图';
+	'提示词，前面可加 --video / --ratio 16:9 / --duration 5 / --ref 参考图地址（可重复）等参数；' +
+	'在输入框里附上图片时，那些图按顺序自动当参考图';
 
 /** 命令调用里本模块用到的部分（附件是图片块）。 */
 interface GenerateInvocation {
@@ -52,21 +52,22 @@ interface GenerateInvocation {
 }
 
 /**
- * 从附件里挑出第一张图片，作为参考图句柄。
+ * 从附件里挑出**所有**图片，按贴进来的顺序当参考图。
  *
  * 只认图片块：命令行这里能拿到的还有普通文件（`FileBlock`），那些不是参考图。
  * 递出去的是**附件自己的持久引用**（不重拼一个残缺对象）—— 附件服务要拿它
  * 去核对记录的字节数与尺寸，拼出来的引用会被判成无效。
  * @param invocation - 命令调用。
- * @returns 附件引用；没有图片附件时 undefined。
+ * @returns 附件引用列表（按顺序）；没有图片附件时是空数组。
  */
-function referenceFromAttachments(invocation: GenerateInvocation): MediaAttachmentRef | undefined {
+function referencesFromAttachments(invocation: GenerateInvocation): MediaAttachmentRef[] {
+	const out: MediaAttachmentRef[] = [];
 	for (const block of invocation.attachments ?? []) {
 		if (block.type !== 'image') continue;
 		const ref = block.attachment;
-		if (ref !== undefined && typeof ref.attachmentId === 'string' && ref.attachmentId !== '') return ref;
+		if (ref !== undefined && typeof ref.attachmentId === 'string' && ref.attachmentId !== '') out.push(ref);
 	}
-	return undefined;
+	return out;
 }
 
 /**
@@ -81,7 +82,7 @@ export function createGenerateCommand(deps: GenerationDeps): Record<string, unkn
 	return {
 		name: MEDIA_COMMAND_NAME,
 		description: '不经过模型直接生成图像或视频（结果同样落到左侧画布上）',
-		// `attachments: true` = 允许带附件调用；附带的那张图自动当参考图
+		// `attachments: true` = 允许带附件调用；附带的那些图自动按顺序当参考图
 		input: { hint: INPUT_HINT, attachments: true },
 		// 参数就是载荷本身，保留在会话日志里便于回溯「这一张是怎么来的」
 		recordInput: true,
@@ -97,13 +98,16 @@ export function createGenerateCommand(deps: GenerationDeps): Record<string, unkn
 			const parsed = parseGenerateLine(invocation.rawInput);
 			if (!parsed.ok) return { kind: 'error', text: parsed.error };
 
-			// 显式 `--ref` 优先：用户写下来的地址比「顺手附上的那张图」更明确
-			const reference = parsed.args.reference ?? referenceFromAttachments(invocation);
+			// 显式 `--ref` 优先：用户写下来的地址比「顺手附上的那些图」更明确
+			// （两条都给了就用 `--ref`，不混着来 —— 混着来没人说得清顺序）
+			const attached = referencesFromAttachments(invocation);
+			const references =
+				parsed.args.references ?? (attached.length === 0 ? undefined : attached);
 
 			try {
 				const value = await runGeneration(
 					deps,
-					{ ...parsed.args, ...(reference === undefined ? {} : { reference }) },
+					{ ...parsed.args, ...(references === undefined ? {} : { references }) },
 					invocation.signal,
 				);
 				return { kind: 'success', text: formatCommandResult(value) };

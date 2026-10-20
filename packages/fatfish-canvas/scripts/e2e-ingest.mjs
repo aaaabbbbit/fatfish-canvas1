@@ -43,7 +43,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { PACKAGE_ROOT, RESET_BOARD_PREFS, click, drag, evaluate, launch, seedBoardExpression, sleep } from './lib/cdp.mjs';
+import { PACKAGE_ROOT, PIN_SHARED_BOARD, click, drag, evaluate, launch, seedBoardExpression, sleep } from './lib/cdp.mjs';
 
 const URL_TARGET = process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080/';
 
@@ -81,7 +81,7 @@ const PROBE = `(() => {
   return JSON.stringify({
     mode: document.body.dataset.ffcMode ?? null,
     hasPanel: !!document.querySelector('.ffc-panel'),
-    hasComposer: !!document.querySelector('textarea'),
+    hasComposer: !!document.querySelector('textarea, [contenteditable="true"]'),
     // 会话身份：落图链路的第一段失败几乎都是「探针没打开那个会话」
     sessionSeed: (() => { try { return window.localStorage.getItem('dsh.sessions.current'); } catch (e) { return null; } })(),
     chatToolCalls: qa('[data-chat-call-id]').length,
@@ -145,10 +145,11 @@ const PROBE = `(() => {
  * @returns 是否发出了提示词。
  */
 async function sendPrompt(cdp) {
+	// composer 元素随本体版本变过（textarea → contenteditable DIV，P44 实测）：两种都收
 	const focused = await evaluate(
 		cdp,
 		`(() => {
-			const box = document.querySelector('textarea');
+			const box = document.querySelector('textarea, [contenteditable="true"]');
 			if (!box) return false;
 			box.focus();
 			return document.activeElement === box;
@@ -158,7 +159,10 @@ async function sendPrompt(cdp) {
 
 	await cdp.send('Input.insertText', { text: PROMPT });
 	await sleep(200);
-	const typed = await evaluate(cdp, "document.querySelector('textarea') ? document.querySelector('textarea').value : ''");
+	const typed = await evaluate(
+		cdp,
+		"(() => { const el = document.querySelector('textarea, [contenteditable=\"true\"]'); return el ? (el.value ?? el.textContent) : ''; })()",
+	);
 	if (typeof typed !== 'string' || !typed.includes('media_generate')) return false;
 
 	const at = JSON.parse(
@@ -195,7 +199,7 @@ try {
 			window.localStorage.setItem('fatfish-canvas:view-mode', 'canvas');
 			// 跟焦必须显式打开：探针 profile 是复用的，上一次 e2e 可能把它关掉了
 			window.localStorage.setItem('fatfish-canvas:follow-new', 'on');
-			${RESET_BOARD_PREFS}
+			${PIN_SHARED_BOARD}
 			// 种空画布但**保住账本**（见 cdp.mjs）：否则「最近结果补落」会先把旧节点
 			// 造回来，后面「起点无节点 / 只多一个节点」这类断言全乱
 			${seedBoardExpression(

@@ -1,14 +1,23 @@
 /**
  * 肥鱼画布图标。
  *
- * DSH 的 primitives 里没有「图像 / 画布 / 米饭」这类图标（已核实其 116 个导出），
- * 因此这里自绘内联 SVG。图标一律用 `currentColor`，跟随宿主主题与 hover 态；
- * 需要「挖空」的地方用 `--ffc-grain`（由使用处设成自身底色），保证浅深主题都成立。
+ * 两个来源：
+ *   1. **鲸鱼尾巴**（`WhaleTailIcon`）—— **从 DSH 原生那一枚来的**：静止态是原生那条
+ *      路径（`WHALE_TAIL_PATH`），能动时是一张 28×28 / 60 帧 APNG 遮罩（都在
+ *      `generated/whale.ts`，由 `scripts/make-whale.mjs` 从原生客户端产物里抽 / 推）。
+ *      姿态与节奏**逐帧照抄原生**；两处**填成实心**是我们加的 —— 用户要「实心纯色」，
+ *      而原生两半都是发丝线（静止态 `fill="currentColor"` + 同色描边，动图逐帧填面，
+ *      见 `scripts/lib/whale-solid.mjs`）。填的是同一条 d / 同 60 帧，外形与动效不变。
+ *      颜色一律 `currentColor`（原生就是），所以浅色 / 深色主题都看得见。
+ *   2. 其余小图标（勾选 / 垃圾桶 / 缩放…）—— 自绘内联 SVG，一律 `currentColor`，
+ *      跟随宿主主题与 hover 态。需要「挖空」的地方用 `--ffc-grain`
+ *      （由使用处设成自身底色），保证浅深主题都成立。
  *
  * @module fatfish-canvas/client/icons
  */
 
 import type { ReactNode } from 'react';
+import { WHALE_TAIL_PATH } from './generated/whale';
 
 /** 图标公共属性。 */
 export interface IconProps {
@@ -18,47 +27,94 @@ export interface IconProps {
 	className?: string;
 }
 
+/** 图标公共属性 + 本图独有的「正在摇尾巴」开关。 */
+export interface WhaleTailIconProps extends IconProps {
+	/**
+	 * 生成中：一直摇尾巴（静止态是那枚实心的，不会动）。
+	 *
+	 * 入口那枚刻意**不用**它：悬停由 CSS 负责（`.ffc-entry:hover .ffc-whale`），
+	 * 这样「鼠标放上去就动、不用点」是纯样式事实，不必给按钮加状态。
+	 *
+	 * 尺寸不再分档（旧的米饭碗动图按 24px 卡过一道）：APNG 是 CSS 里的
+	 * **一份**资源，14px 那枚也摇得起，不必省。
+	 */
+	generating?: boolean;
+}
+
 /**
- * 极简白米饭碗 —— 视图切换按钮的标志。
+ * 鲸鱼尾巴（内联标记）。
  *
- * 结构（三笔，全部 24×24 网格）：
- *   1. 米饭：高出碗沿的实心圆顶（`a` 半圆，sweep=1 向上鼓）
- *   2. 米粒纹理：三道短竖笔，用 `--ffc-grain` 挖出米粒分界
- *   3. 碗身：碗沿到碗底的收口曲线，描边 + 极淡填充
- * 顺序刻意是「先饭、后碗」，让碗沿压在米饭根部 —— 侧面视角下这才读作
- * 「碗里盛满了饭」，而不是饭浮在碗上面。
- * @param props - 图标属性。
- * @returns 内联 SVG。
+ * 结构照抄原生（两个元素、两层状态），造型 / 颜色 / 状态全在 styles.ts：
+ *   - `.ffc-whale-still` 实心矢量 —— 静止态（14/17px 下也清晰、满不透明度）
+ *   - `.ffc-whale-anim`  实心动画的遮罩 —— 「生成中」或入口悬停时盖在上面
+ * 这里只决定三件事：
+ *   ① 边长（原生图形是正方的，所以宽高都给）
+ *   ② 额外类名
+ *   ③ `data-ffc-generating`（styles.ts 按它把静止态换成会摇的那枚）
+ *
+ * @param props - 图标属性 + 生成中开关。
+ * @returns 内联标记（外层 span + 实心 SVG + 动图 span）。
  */
-export function RiceBowlIcon({ size = 20, className }: IconProps): ReactNode {
+export function whaleTailHtml({
+	size = 20,
+	className,
+	generating = false,
+}: WhaleTailIconProps = {}): string {
+	const cls = className === undefined ? 'ffc-whale' : `ffc-whale ${className}`;
+	return (
+		`<span class="${cls}" style="width:${String(size)}px;height:${String(size)}px"` +
+		(generating ? ' data-ffc-generating="true"' : '') +
+		' aria-hidden="true">' +
+		// 静止态：原生那条 d，**填成实心**（fill 与 stroke 都走 currentColor，跟主题）。
+		// 那条同色描边是特意留的：悬停换成动图时轮廓线位置不变，只有内部空掉。
+		'<svg class="ffc-whale-still" width="100%" height="100%" viewBox="0 0 16 16" fill="currentColor"' +
+		` aria-hidden="true"><path d="${WHALE_TAIL_PATH}" stroke="currentColor" stroke-width="1"></path></svg>` +
+		// 摇尾巴：**实心**动画那枚（原生 60 帧推导来的，默认 display:none，见 styles.ts）
+		'<span class="ffc-whale-anim"></span>' +
+		'</span>'
+	);
+}
+
+/**
+ * {@link whaleTailHtml} 的 React 壳。
+ *
+ * 用 `dangerouslySetInnerHTML` 是有意的：字符串出口让「预览 / 断言脚本看到的那份」
+ * 与「组件渲染的那份」是同一个东西（`npm run preview:icon`、`test-icon.mjs`）。
+ * 内容是自己拼的常量，没有外部输入。
+ * @param props - 图标属性 + 生成中开关。
+ * @returns 内联图形元素。
+ */
+export function WhaleTailIcon(props: WhaleTailIconProps): ReactNode {
+	return <span dangerouslySetInnerHTML={{ __html: whaleTailHtml(props) }} />;
+}
+
+/**
+ * 送进输入框：一支向下的箭头落进托盘。
+ *
+ * 语义刻意选「向下」：输入框在这条消息**下方**，「送进去」= 往下落到那一格里。
+ * 刻意不用 ui-primitives 的 `IconSendOutlineRegular`（纸飞机）—— 那个读作「发送消息」，
+ * 而这一步只把内容放进输入框、并不发送。
+ */
+export function SendToComposerIcon({ size = 16, className }: IconProps): ReactNode {
 	return (
 		<svg
 			width={size}
 			height={size}
-			viewBox="0 0 24 24"
+			viewBox="0 0 16 16"
 			fill="none"
 			className={className}
 			aria-hidden="true"
 			focusable="false"
 		>
-			{/* 1. 米饭：以碗沿为底、向上鼓出的半圆顶 */}
-			<path d="M6.3 12.6a5.7 5.7 0 0 1 11.4 0Z" fill="currentColor" fillOpacity="0.9" />
-			{/* 2. 米粒纹理 */}
+			<path d="M8 2.4v7.3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
 			<path
-				d="M9.4 9.9v1.5M12 9.2v2.2M14.6 9.9v1.5"
-				stroke="var(--ffc-grain, #ffffff)"
-				strokeWidth="1.1"
-				strokeLinecap="round"
-			/>
-			{/* 3. 碗身：碗沿 → 碗底 → 碗沿，收口曲线 */}
-			<path
-				d="M3.3 12.6C3.9 18 7.4 21.2 12 21.2s8.1-3.2 8.7-8.6Z"
-				fill="currentColor"
-				fillOpacity="0.14"
+				d="M4.9 6.8 8 9.9l3.1-3.1"
 				stroke="currentColor"
 				strokeWidth="1.5"
+				strokeLinecap="round"
 				strokeLinejoin="round"
 			/>
+			<path d="M3 13.3h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
 		</svg>
 	);
 }
@@ -337,10 +393,10 @@ export function ExpandIcon({ size = 16, className }: IconProps): ReactNode {
 }
 
 /**
- * 按会话隔离画布：两张**错开的**画布（后面那张是「别的会话」）。
+ * 一叠画布：两张**错开的**画布（后面那张是「别的」那一叠）。
  *
  * 与 `CanvasIcon`（一张画布 + 两个节点）刻意画得不一样：那个表示「画布模式」，
- * 这个表示「一人一张」。两笔都是描边，不填色 —— 菜单里成对出现时才读得出
+ * 这个表示「一叠」。两笔都是描边，不填色 —— 菜单里成对出现时才读得出
  * 「一张 / 一叠」的差别。
  */
 export function LayersIcon({ size = 16, className }: IconProps): ReactNode {

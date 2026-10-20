@@ -266,24 +266,45 @@ export class MediaProbeCore {
 	}
 
 	/**
-	 * 按地址取一张图，以 data URL 交给客户端。
-	 *
-	 * **为什么这一步必须在宿主做**：画布节点上的图常常挂在供应商 / 中转站的
-	 * 对象存储上（跨域），浏览器直接 `fetch` 会踩 CORS，而「存成附件」必须拿到
-	 * 字节。宿主没有同源策略，取回来转成 data URL 交给页面即可。
-	 *
-	 * 三条硬规矩：
-	 * 1. **只取图片**：`content-type` 不是 `image/*` 直接拒绝 —— 这条通路只是
-	 *    「把画布上的图变成附件」，不该被当成通用下载器。
-	 * 2. **有上限**（{@link FETCH_IMAGE_MAX_BYTES}）：字节要经 RPC 过一遍，
-	 *    几兆以上只会把页面卡住；超了就报清楚，不要硬塞。
-	 * 3. **错误里带地址但不带凭证**：这里没有任何密钥，纯 GET。
+	 * 按地址取一张图，以 data URL 交给客户端（「点画布图 → 存成附件」那条路）。
 	 * @param url - 图片地址（http/https）。
 	 * @returns 取到的字节（data URL）或一句可展示的失败原因。
 	 */
-	async fetchImage(
-		url: string,
-	): Promise<{ ok: boolean; message: string; dataUrl?: string; mimeType?: string; name?: string; bytes?: number }> {
+	async fetchImage(url: string): Promise<FetchedBytes> {
+		return this.fetchBytes(url, false);
+	}
+
+	/**
+	 * 按地址取一份**媒体**字节（图或视频）—— 画布右键「导出」那条路用。
+	 *
+	 * 与 {@link fetchImage} 分成两个方法、而不是给它加一个开关参数：附件那条路
+	 * **只该收图片**（把几十兆的视频塞进聊天附件是另一种行为，也没有意义）。
+	 * @param url - 媒体地址（http/https）。
+	 * @returns 取到的字节（data URL）或一句可展示的失败原因。
+	 */
+	async fetchMedia(url: string): Promise<FetchedBytes> {
+		return this.fetchBytes(url, true);
+	}
+
+	/**
+	 * 共用的取字节实现。
+	 *
+	 * **为什么这一步必须在宿主做**：画布节点上的媒体常常挂在供应商 / 中转站的
+	 * 对象存储上（跨域），浏览器直接 `fetch` 会踩 CORS，而「存成附件」与
+	 * 「导出到本地」都必须要字节。宿主没有同源策略，取回来转成 data URL
+	 * 交给页面即可。
+	 *
+	 * 三条硬规矩：
+	 * 1. **认得出才取**：`content-type` 不在允许的范围内直接拒绝 ——
+	 *    `fetchImage` 只认 `image/*`，`fetchMedia` 还认 `video/*`。
+	 * 2. **有上限**（图 {@link FETCH_IMAGE_MAX_BYTES} / 视频 {@link FETCH_VIDEO_MAX_BYTES}）：
+	 *    字节要经 RPC 过一遍，几兆以上就会把页面卡一下；超了就报清楚，不要硬塞。
+	 * 3. **错误里带地址但不带凭证**：这里没有任何密钥，纯 GET。
+	 * @param url - 媒体地址（http/https）。
+	 * @param allowVideo - 允不允许视频（决定 MIME 判据与体积上限）。
+	 * @returns 取到的字节（data URL）或一句可展示的失败原因。
+	 */
+	private async fetchBytes(url: string, allowVideo: boolean): Promise<FetchedBytes> {
 		if (!/^https?:\/\//i.test(url)) {
 			return { ok: false, message: '只支持 http(s) 地址（本地文件请直接拖进画布）' };
 		}
@@ -294,29 +315,43 @@ export class MediaProbeCore {
 		try {
 			const response = await fetch(url, { method: 'GET', signal: controller.signal });
 			if (!response.ok) {
-				return { ok: false, message: `取图失败：HTTP ${String(response.status)}` };
+				return { ok: false, message: `取字节失败：HTTP ${String(response.status)}` };
 			}
 			const mime = (response.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
-			if (!mime.startsWith('image/')) {
+			const video = mime.startsWith('video/');
+			if (!mime.startsWith('image/') && !(video && allowVideo)) {
+				const what = allowVideo ? '不是图片或视频' : '不是图片';
 				return {
 					ok: false,
-					message: `这个地址返回的不是图片（${mime === '' ? '没有 content-type' : mime}）`,
+					message: `这个地址返回的${what}（${mime === '' ? '没有 content-type' : mime}）`,
 				};
+			}
+			const limit = video ? FETCH_VIDEO_MAX_BYTES : FETCH_IMAGE_MAX_BYTES;
+			/** 超了上限时那句话（两种媒体的上限与下一步建议都不同）。 */
+			const tooBig = (bytes: number): string => {
+				const size = `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+				const cap = `${String(limit / 1024 / 1024)} MB`;
+				return video
+					? `视频太大（${size}，上限 ${cap}）—— 字节要经页面过一次。先配「留档目录」（设置 → 肥鱼画布）让视频落到本机，再导出就不受这个上限限制`
+					: `图片太大（${size}，上限 ${cap}）—— 附件通路要把字节过一遍页面，先存到本地再拖进画布更稳`;
+			};
+			// 声明了长度就先拒绝：视频动辄几十兆，白下一遍再报错最亏。
+			const declared = Number(response.headers.get('content-length') ?? '');
+			if (Number.isFinite(declared) && declared > limit) {
+				return { ok: false, message: tooBig(declared) };
 			}
 			const buffer = Buffer.from(new Uint8Array(await response.arrayBuffer()));
-			if (buffer.byteLength > FETCH_IMAGE_MAX_BYTES) {
-				return {
-					ok: false,
-					message: `图片太大（${(buffer.byteLength / 1024 / 1024).toFixed(1)} MB，上限 ${String(FETCH_IMAGE_MAX_BYTES / 1024 / 1024)} MB）—— 附件通路要把字节过一遍页面，先存到本地再拖进画布更稳`,
-				};
+			if (buffer.byteLength > limit) {
+				return { ok: false, message: tooBig(buffer.byteLength) };
 			}
-			const ext = mime.split('/')[1] ?? 'png';
+			const which = video ? '视频' : '图片';
+			const ext = mime.split('/')[1] ?? (video ? 'mp4' : 'png');
 			return {
 				ok: true,
-				message: `已取到图片（${(buffer.byteLength / 1024).toFixed(0)} KB）`,
+				message: `已取到${which}（${(buffer.byteLength / 1024).toFixed(0)} KB）`,
 				dataUrl: `data:${mime};base64,${buffer.toString('base64')}`,
 				mimeType: mime,
-				name: fileNameFromUrl(url, ext),
+				name: fileNameFromUrl(url, ext, video),
 				bytes: buffer.byteLength,
 			};
 		} catch (error) {
@@ -327,33 +362,61 @@ export class MediaProbeCore {
 	}
 }
 
+/** {@link MediaProbeCore.fetchImage} / `fetchMedia` 的结果形状。 */
+export interface FetchedBytes {
+	/** 是否取到。 */
+	ok: boolean;
+	/** 一句可展示的说明（成功也是）。 */
+	message: string;
+	/** 内联数据（`ok` 时才有）。 */
+	dataUrl?: string;
+	/** MIME。 */
+	mimeType?: string;
+	/** 从地址猜出来的文件名。 */
+	name?: string;
+	/** 字节数。 */
+	bytes?: number;
+}
+
 /** `fetchImage` 的体积上限：字节要经 RPC 过一次页面，再大就不是「顺手存附件」了。 */
 export const FETCH_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
+ * `fetchMedia` 里**视频**的体积上限。
+ *
+ * 比图片宽得多（视频本来就大），但仍有天花板：字节要 base64 过一遍 RPC。
+ * 64 MB 的视频 ≈ 85 MB 的字符串，页面会顿一下但不至于卡死。
+ * `ponytail:` 再大就该走「留档目录 → 同源地址」那条路（`/ffc-media/…`
+ * 不经 RPC、没有上限），别在这里继续加码。
+ */
+export const FETCH_VIDEO_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
  * 从地址里猜一个像样的文件名（附件卡片上要显示它）。
- * @param url - 图片地址。
+ * @param url - 媒体地址。
  * @param ext - 由 MIME 推出的扩展名（地址里没有文件名时用它）。
+ * @param video - 这是不是视频（决定兜底名）。
  * @returns 文件名。
  */
-function fileNameFromUrl(url: string, ext: string): string {
+function fileNameFromUrl(url: string, ext: string, video: boolean): string {
 	try {
 		const last = new URL(url).pathname.split('/').pop() ?? '';
 		const decoded = decodeURIComponent(last);
-		if (/\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(decoded)) return decoded;
+		if (/\.(png|jpe?g|webp|gif|avif|bmp|mp4|webm|mov|m4v)$/i.test(decoded)) return decoded;
 		if (decoded !== '') return `${decoded}.${ext}`;
 	} catch {
 		/* 地址解析不了就退回默认名 */
 	}
-	return `canvas-image.${ext}`;
+	return `${video ? 'canvas-video' : 'canvas-image'}.${ext}`;
 }
 
 /**
  * 从 `GET /models` 的响应里挖出模型 id。
  *
- * 接受三种形状（各家网关不一致，全都在真实响应里见过）：
- *   `{ data: [{ id }] }`（OpenAI 官方）、`{ models: [...] }`、
- *   以及直接一个字符串数组。
+ * 接受四种形状（各家网关不一致，全都在真实响应里见过）：
+ *   `{ data: [{ id }] }`（OpenAI 官方）、`{ models: [...] }`、直接一个字符串数组，
+ *   以及 `{ code, data: { total, models: [...] } }` —— kie.ai 实测：列表在 `data`
+ *   里再套一层，条目里是 `model` / `slug`（`fromEntry` 认 `model`）。
  * @param json - 解析后的响应体。
  * @returns 去重后的 id 列表（保持原顺序）。
  */
@@ -374,12 +437,21 @@ export function extractModelIds(json: unknown): string[] {
 		for (const entry of json) fromEntry(entry);
 	} else if (json !== null && typeof json === 'object') {
 		const o = json as Record<string, unknown>;
-		for (const key of ['data', 'models', 'model_list', 'result']) {
-			const list = o[key];
-			if (Array.isArray(list)) {
-				for (const entry of list) fromEntry(entry);
-				if (out.length > 0) break;
+		// `data` 是对象时再往下找一层（kie 把列表套在里面）；是数组时照旧当列表读
+		const nested = o['data'];
+		const containers =
+			nested !== null && typeof nested === 'object' && !Array.isArray(nested)
+				? [o, nested as Record<string, unknown>]
+				: [o];
+		for (const container of containers) {
+			for (const key of ['data', 'models', 'model_list', 'result']) {
+				const list = container[key];
+				if (Array.isArray(list)) {
+					for (const entry of list) fromEntry(entry);
+					if (out.length > 0) break;
+				}
 			}
+			if (out.length > 0) break;
 		}
 	}
 	return [...new Set(out)];

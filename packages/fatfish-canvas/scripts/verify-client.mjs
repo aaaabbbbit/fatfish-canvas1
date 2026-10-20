@@ -313,6 +313,16 @@ check(
 	'inject 声明的服务都在统一基座可达的服务面内',
 	Array.isArray(plugin.inject) && plugin.inject.every((s) => typeof s === 'string'),
 );
+check(
+	'inject 里有 configForms（设置表单是属性访问，cordis 要求声明过依赖）',
+	Array.isArray(plugin.inject) && plugin.inject.includes('configForms'),
+	JSON.stringify(plugin.inject),
+);
+check(
+	'inject 里仍然有 slots（插槽注册表是本插件的地基）',
+	Array.isArray(plugin.inject) && plugin.inject.includes('slots'),
+	JSON.stringify(plugin.inject),
+);
 
 // ───────────────────────── 3. apply(fakeCtx) ─────────────────────────
 
@@ -328,6 +338,10 @@ const injections = [];
  * **有当前会话**的 `sessions` 面（默认这个替身故意没有当前会话，那正是
  * 首次打开页面时的真实形状）；P9 的设置页测试需要 `remote.settings` /
  * `remote.credentials`（深路径写入与凭据）与 `remote`（宿主探测服务）。
+ *
+ * `configForms` 是**插件声明的必需服务**（模块级 `inject`），因此它同时挂在
+ * 返回的 ctx 上 —— 真实 cordis 里声明过 inject 的服务就是这么访问的
+ * （`ctx.configForms.get(<entry id>)`）。
  * @param extraProvided - 覆盖/追加的服务面。
  * @returns ctx 替身。
  */
@@ -336,17 +350,19 @@ function makeFakeCtx(extraProvided = {}) {
 	const services = {
 		layout: { toggleSidebar: () => {}, openDetails: () => {}, closeDetails: () => {} },
 		// P3：生成落图的订阅桥只碰 sessions 的这两个成员。这里给一个
-		// 「没有当前会话」的最小面 —— 正是首次打开页面时的真实形状。
+		// 「没有当前会话」的最小面 —— 正是首次打开页面时的真实形状：
+		// 列表快照里**没有** `current`，当前选择体现在行的 `retainedBy` 上。
 		sessions: {
 			list: {
-				getSnapshot: () => ({ current: undefined }),
+				getSnapshot: () => ({ ids: [], byId: {}, phase: 'pending', projectionsBySession: {} }),
 				subscribe: () => () => {},
 			},
 			binding: () => undefined,
 		},
-		settingsScope: {
-			bind: (spec) => ({
-				namespace: spec.namespace,
+		// 0.2.0 的设置传输面：按 **Loader entry id** 取表单（`settingsScope` 没有了）。
+		configForms: {
+			get: (entryId) => ({
+				namespace: entryId,
 				getSnapshot: () => ({
 					status: 'ready',
 					value: { model_openai_images: 'gpt-image-1' },
@@ -357,8 +373,8 @@ function makeFakeCtx(extraProvided = {}) {
 					mode: 'host',
 				}),
 				subscribe: () => () => {},
-				set: async () => {},
-				unset: async () => {},
+				set: async () => true,
+				unset: async () => true,
 			}),
 		},
 		...extraProvided,
@@ -381,6 +397,8 @@ function makeFakeCtx(extraProvided = {}) {
 		},
 		/** 按名字取服务（与 cordis 的 ctx.get 同义）。 */
 		get: (name) => services[name],
+		/** 模块级 `inject` 声明过的服务是属性访问（这里只有 configForms 用得上）。 */
+		configForms: services.configForms,
 		slots: {
 			register: (spec, component) => {
 				sectionEntries.push({ spec, component });
@@ -400,20 +418,24 @@ function makeFakeCtx(extraProvided = {}) {
 const fakeCtx = makeFakeCtx();
 
 /**
- * 一个有「当前会话」的 `sessions` 面。
+ * 一个有「主视图持有的会话」的 `sessions` 面。
  *
- * ⚠️ **形状必须照真实建模**（本轮踩过的坑）：`SessionSnapshot` 里**没有**
- * `nodes` / `runningCalls`，会话数据只在 `binding.eventSource`
- * （`ObservableSnapshot<SessionEventWindow>`）里。早先这个替身给
- * `session.getSnapshot()` 塞了 `{ nodes, runningCalls }`，于是替身与真机一起漂移：
- * 桥在真机上读到的永远是 `undefined`，一个节点都不落、记账也不写，而离线测试全绿。
- * 现在只给**真实存在**的成员；落图用例走 `events`。
- * @param id - 当前会话 id。
+ * ⚠️ **形状必须照真实建模**（本轮踩过两次坑，都是同一类）：`SessionSnapshot` 里
+ * 没有 `nodes` / `runningCalls`，会话数据只在 `binding.eventSource`
+ * （`ObservableSnapshot<SessionEventWindow>`）里；而**列表快照里也没有 `current`** ——
+ * 当前选择体现在行的 `retainedBy.mainView` 上。替身曾经两处都按想象建模，
+ * 于是真机上桥读到的永远是 `undefined`：一个节点都不落、记账也不写，而离线测试全绿。
+ * 现在只给**真实存在**的成员；落图用例走 `events`，切会话用例走 `retain()`。
+ * @param id - 主视图持有的会话 id；undefined = 没有任何会话被持有。
  * @param events - 事件窗口条目（真实 wire 形状，见第 12 节）。
+ * @param cwd - 会话的工作区路径（画布作用域就挂在它上面；undefined = 行上还没有它）。
  * @returns sessions 服务替身。
  */
-function sessionsWith(id, events = []) {
-	const listeners = new Set();
+function sessionsWith(id, events = [], cwd) {
+	/** 本地引用计数（真实里由 `ClientSessions.retainScope` 维护）。 */
+	const retained = new Set(id === undefined ? [] : [id]);
+	const listListeners = new Set();
+	const eventListeners = new Set();
 	const session = {
 		subscribe: () => () => {},
 		// 真实 SessionSnapshot：**没有会话数据**（这正是本轮 bug 的根源）。
@@ -428,20 +450,41 @@ function sessionsWith(id, events = []) {
 			change: { kind: 'replace', entries: [] },
 		}),
 		subscribe: (listener) => {
-			listeners.add(listener);
-			return () => listeners.delete(listener);
+			eventListeners.add(listener);
+			return () => eventListeners.delete(listener);
 		},
 	};
 	return {
 		list: {
-			getSnapshot: () => ({ current: id }),
-			subscribe: () => () => {},
+			// 真实 `SessionListState`：ids / byId / phase / projectionsBySession，**没有 current**。
+			getSnapshot: () => ({
+				ids: [...retained],
+				byId: Object.fromEntries(
+					[...retained].map((key) => [
+						key,
+						{ id: key, retainedBy: { mainView: 1 }, ...(cwd === undefined ? {} : { cwd }) },
+					]),
+				),
+				phase: 'ready',
+				projectionsBySession: {},
+			}),
+			subscribe: (listener) => {
+				listListeners.add(listener);
+				return () => listListeners.delete(listener);
+			},
 		},
-		binding: (asked) => (asked === id ? { sessionId: id, session, eventSource, ctx: {} } : undefined),
+		binding: (asked) =>
+			retained.has(asked) ? { sessionId: asked, session, eventSource, ctx: {} } : undefined,
+		/** 测试用：把主视图的持有关系挪到另一个会话（真实里是 `list.set` 通知订阅者）。 */
+		retain: (next) => {
+			retained.clear();
+			retained.add(next);
+			for (const fn of listListeners) fn();
+		},
 		/** 测试用：像真实发布那样把新条目推进窗口并通知订阅者。 */
 		push: (...entries) => {
 			events.push(...entries);
-			for (const fn of listeners) fn();
+			for (const fn of eventListeners) fn();
 		},
 	};
 }
@@ -578,12 +621,34 @@ const panelEntry = overlayOf(sectionEntries2).find((e) => e.spec.id.endsWith('-p
 		sections.every((e) => e.spec.inject?.().scope !== undefined),
 	);
 	check(
-		'设置页的 inject 面还带上写入面与探测读取器（api / getProbe）',
+		'「图像 / 视频模型」的 inject 面带上写入面与探测读取器（api / getProbe）',
 		(() => {
-			const face = sections[sections.length - 1]?.spec.inject?.();
+			// 按 id 找：P32 起有两个分节，取「最后一个」会取到肥鱼画布那一页
+			const face = sections.find((e) => e.spec.id === 'fatfish-canvas-media')?.spec.inject?.();
 			return face !== undefined && 'api' in face && 'getProbe' in face;
 		})(),
-		JSON.stringify(Object.keys(sections[sections.length - 1]?.spec.inject?.() ?? {})),
+		JSON.stringify(
+			Object.keys(sections.find((e) => e.spec.id === 'fatfish-canvas-media')?.spec.inject?.() ?? {}),
+		),
+	);
+	check(
+		'「肥鱼画布」是另一个分节（id 不同、order 在后），inject 面给 scope + getApi',
+		(() => {
+			const media = sections.find((e) => e.spec.id === 'fatfish-canvas-media');
+			const canvas = sections.find((e) => e.spec.id === 'fatfish-canvas');
+			if (canvas === undefined || media === undefined) return false;
+			const face = canvas.spec.inject?.();
+			return (
+				canvas.spec.id !== media.spec.id &&
+				(canvas.spec.order ?? 0) > (media.spec.order ?? 0) &&
+				face !== undefined &&
+				'getApi' in face
+			);
+		})(),
+		JSON.stringify({
+			ids: sections.map((e) => e.spec.id),
+			canvas: Object.keys(sections.find((e) => e.spec.id === 'fatfish-canvas')?.spec.inject?.() ?? {}),
+		}),
 	);
 }
 let panelNode = null;
@@ -716,9 +781,17 @@ check(
 	`实际 ${String(collect(tree, (el) => el.type === 'img').length)}`,
 );
 check(
+	'图像节点接了加载失败的处理（onError → 显示失效说明）',
+	collect(tree, (el) => el.type === 'img').every((el) => typeof el.props.onError === 'function'),
+);
+check(
 	'视频节点渲染 <video> 且带独立播放按钮',
 	collect(tree, (el) => el.type === 'video').length === 1 &&
 		collect(tree, (el) => el.props?.className === 'ffc-node-play').length === 1,
+);
+check(
+	'视频节点接了加载失败的自愈（onError → 补一次请求）',
+	collect(tree, (el) => el.type === 'video').every((el) => typeof el.props.onError === 'function'),
 );
 check(
 	'失败节点显示原因文案',
@@ -953,7 +1026,7 @@ const buttonByLabel = (tree, label) =>
 	// 工具条必须带 data-ffc-ui：画布视口靠它把「控件的指针事件」与「拖拽起点」分开
 	check('工具条带 data-ffc-ui（画布据此不抢控件指针）', bar[0]?.props['data-ffc-ui'] === 'toolbar');
 
-	for (const label of ['全选节点', '删除选中节点', '适应内容', '新节点自动带进视野', '清空画布', '重置画布宽度', '纯画布模式']) {
+	for (const label of ['全选节点', '删除选中节点', '适应内容', '新节点自动带进视野', '清空画布', '重置画布宽度', '纯画布模式', '返回聊天界面']) {
 		const hits = buttonByLabel(tree4, label);
 		check(
 			`工具条有「${label}」按钮`,
@@ -1177,6 +1250,22 @@ const buttonByLabel = (tree, label) =>
 		bodyEl.dataset.ffcMode === 'canvas',
 		String(bodyEl.dataset.ffcMode),
 	);
+
+	// P49：出口跟着**画布自己**走。右上角那枚鲸鱼尾巴住在会话作用域席位里
+	// （没有当前会话 = 欢迎页时整行不存在），而画布模式是记住的 —— 那种情况下
+	// 顶栏这一格就是唯一的出口，因此它在纯画布模式下也必须常驻、且真的能出去。
+	// 放在这一段最后：点它会切到聊天模式，正好当作本段收尾（后面的块各自
+	// 重新物化模块、自己读存储决定模式，不受影响）。
+	{
+		const exit = buttonByLabel(tree6, '返回聊天界面')[0];
+		check(
+			'纯画布模式下顶栏仍有「返回聊天」（没有聊天列时的唯一出口）',
+			exit !== undefined && typeof exit.props.onClick === 'function',
+			`实际 ${String(buttonByLabel(tree6, '返回聊天界面').length)} 个`,
+		);
+		exit?.props.onClick();
+		check('点「返回聊天」真的回到聊天模式', bodyEl.dataset.ffcMode === 'chat', String(bodyEl.dataset.ffcMode));
+	}
 }
 
 // P10：顶栏的「视图」菜单已整块移除（视图模式与画布宽度选择都不要了）；
@@ -1365,28 +1454,30 @@ console.log('\n8c) P17：composer 的生成模型格');
 
 	/**
 	 * 起一个插件实例并取出 composer 那一格的条目。
-	 * @param value - 设置 namespace 的值；不传则用「读不到设置」的形状。
+	 * @param value - 设置分节的值；不传则用「读不到设置」的形状。
 	 * @returns `{ reg, tree }`。
 	 */
 	const setup = (value) => {
-		const scopeFor = (v) => ({
-			bind: () => ({
-				namespace: 'media-generation',
-				getSnapshot: () => ({
-					status: 'ready',
-					value: v,
-					base: undefined,
-					user: undefined,
-					revision: 1,
-					writable: true,
-					mode: 'host',
+		const formFor = (v) => ({
+			configForms: {
+				get: (entryId) => ({
+					namespace: entryId,
+					getSnapshot: () => ({
+						status: 'ready',
+						value: v,
+						base: undefined,
+						user: undefined,
+						revision: 1,
+						writable: true,
+						mode: 'host',
+					}),
+					subscribe: () => () => {},
+					set: async () => true,
+					unset: async () => true,
 				}),
-				subscribe: () => () => {},
-				set: async () => {},
-				unset: async () => {},
-			}),
+			},
 		});
-		const ctx = value === undefined ? fakeCtx : makeFakeCtx({ settingsScope: scopeFor(value) });
+		const ctx = value === undefined ? fakeCtx : makeFakeCtx(formFor(value));
 		const plugin = factory(makeRequire(pkg.name));
 		const entries = [];
 		plugin.apply({
@@ -1426,11 +1517,22 @@ console.log('\n8c) P17：composer 的生成模型格');
 		trigger?.props['aria-haspopup'] === 'menu' && trigger?.props['aria-expanded'] === false,
 		`haspopup=${String(trigger?.props['aria-haspopup'])} expanded=${String(trigger?.props['aria-expanded'])}`,
 	);
+	// P39：主界面只留一枚图标 —— 模型名与种类都不再挂在触发器旁边（搬进菜单顶部那一行）
+	const triggerLabels = collect(
+		trigger,
+		(el) => hasClass(el, 'ffc-mp-label') || hasClass(el, 'ffc-mp-value') || hasClass(el, 'ffc-mp-chevron'),
+	);
 	check(
-		'触发器是两段式标签：种类（图像）+ 当前模型名（caption 段）',
-		collect(trigger, (el) => el.type === 'span' && el.props.children === '图像').length === 1 &&
-			collect(trigger, (el) => hasClass(el, 'ffc-mp-value') && el.props.children === 'acme-large').length === 1,
-		JSON.stringify(collect(trigger, (el) => el.type === 'span').map((el) => el.props.children)),
+		'触发器只剩一枚图标：没有「图像」段 / 模型名段 / 箭头（用户要的「点了才看得见」）',
+		triggerLabels.length === 0,
+		JSON.stringify(triggerLabels.map((el) => String(el.props?.className))),
+	);
+	const triggerIcon = collect(trigger, (el) => el.props?.dangerouslySetInnerHTML !== undefined);
+	check(
+		'那枚图标就是鲸鱼尾巴（与右上角入口同一份内联标记）',
+		triggerIcon.length === 1 &&
+			String(triggerIcon[0].props.dangerouslySetInnerHTML.__html).includes('ffc-whale'),
+		JSON.stringify(triggerIcon.map((el) => String(el.props?.className))),
 	);
 	check(
 		'无障碍标签写明种类与当前模型',
@@ -1444,9 +1546,75 @@ console.log('\n8c) P17：composer 的生成模型格');
 		String(trigger?.props.title),
 	);
 	check(
-		'触发器结构是四件套：星光图标 + 种类 + 模型名 + 箭头',
-		Array.isArray(trigger?.props.children) && trigger.props.children.length === 4,
-		`子节点数 ${String(trigger?.props.children?.length)}`,
+		'选过模型（不是「自动」）时打 data-ffc-picked —— 尾巴变蓝那条样式的挂载点',
+		trigger?.props['data-ffc-picked'] === 'true',
+		String(trigger?.props['data-ffc-picked']),
+	);
+	// P41：右键这枚尾巴 = 开关设计技能。开（缺省）时不打属性 —— 颜色语义仍由
+	// picked 那条承担（默认观感不变）；关 = data-ffc-skill='false' + 一条压灰的 CSS。
+	check(
+		'右键处理挂上了（onContextMenu = 开关设计技能的入口）',
+		typeof trigger?.props.onContextMenu === 'function',
+	);
+	// P41 复测踩到的洞：toggleSkill 忘了 preventDefault，右键被浏览器原生菜单盖住。
+	// e2e 的 CDP 派发不开原生菜单，永远测不出来 —— 只能在这里用假事件逼真地查一次。
+	let skillDefaultPrevented = false;
+	if (typeof trigger?.props.onContextMenu === 'function') {
+		trigger.props.onContextMenu({ preventDefault: () => { skillDefaultPrevented = true; } });
+	}
+	check('右键会阻止浏览器原生菜单（handler 里调了 preventDefault）', skillDefaultPrevented);
+	check(
+		'缺省（没显式关）时不打 data-ffc-skill，并且 title 写明「设计技能开」',
+		trigger?.props['data-ffc-skill'] === undefined &&
+			String(trigger?.props.title).includes('设计技能开'),
+		`skill=${String(trigger?.props['data-ffc-skill'])} title=${String(trigger?.props.title)}`,
+	);
+	const skillOff = setup({ ...CONFIG, designSkillOn: false });
+	const offTrigger = collect(skillOff.tree, (el) => el.type === 'button' && el.props?.['data-ffc-ui'] === 'model-picker')[0];
+	check(
+		'设计技能关了：触发器打 data-ffc-skill=false，title 写明「设计技能关（右键切换）」',
+		offTrigger?.props['data-ffc-skill'] === 'false' &&
+			String(offTrigger?.props.title).includes('设计技能关（右键切换）'),
+		`skill=${String(offTrigger?.props['data-ffc-skill'])} title=${String(offTrigger?.props.title)}`,
+	);
+	check(
+		'关了技能也照打 data-ffc-picked（两个语义分开记：灰是样式压的，读数不撒谎）',
+		offTrigger?.props['data-ffc-picked'] === 'true',
+		String(offTrigger?.props['data-ffc-picked']),
+	);
+
+	// 档位：分辨率兄弟折成一个家族，当前质量档补在触发器上
+	// （菜单本体走 portal，替身渲染不到 —— 家族行的结构由 test-model 的纯函数用例钉住）
+	const TIERED = {
+		providers: {
+			acme: {
+				label: 'Acme 网关',
+				baseURL: 'https://gw.acme.example/v1',
+				models: [
+					{ id: 'acme-shot-1k', kind: 'image' },
+					{ id: 'acme-shot-2k', kind: 'image' },
+					{
+						id: 'acme-shot-4k',
+						kind: 'image',
+						tiers: { param: 'quality', values: ['low', 'high'], labels: { low: '低', high: '高' } },
+					},
+				],
+			},
+		},
+		defaultImage: 'acme::acme-shot-2k',
+		defaultTiers: { 'acme::acme-shot': 'high' },
+	};
+	const tiered = setup(TIERED);
+	const tieredTrigger = collect(tiered.tree, (el) => el.type === 'button' && el.props?.['data-ffc-ui'] === 'model-picker')[0];
+	check(
+		'档位：当前质量档跟着模型名（不再显示在触发器上，改由无障碍标签与菜单顶部那行承担）',
+		String(tieredTrigger?.props['aria-label']).includes('acme-shot-2k · 高'),
+		String(tieredTrigger?.props['aria-label']),
+	);
+	check(
+		'档位：没有档位的配置里模型名不变（老配置观感零变化）',
+		String(trigger?.props['aria-label']).includes('acme-large ·') === false,
+		String(trigger?.props['aria-label']),
 	);
 
 	// 点一下 = 记下「展开菜单」（替身无渲染器，因此断言的落点是状态写入本身；
@@ -1455,27 +1623,50 @@ console.log('\n8c) P17：composer 的生成模型格');
 	trigger?.props.onClick();
 	check('点它记下「菜单已展开」', stateWrites.includes(true), JSON.stringify(stateWrites));
 
-	// 读不到设置时如实显示「自动」，而不是空白或报错
+	// 读不到设置时如实说「自动」，而不是空白或报错（触发器上没字了，语义全在标签里）
 	const bare = setup(undefined);
 	const bareTrigger = collect(bare.tree, (el) => el.type === 'button' && el.props?.['data-ffc-ui'] === 'model-picker')[0];
 	check(
-		'读不到设置时显示「自动」而不是空白/报错',
-		collect(bareTrigger, (el) => el.type === 'span' && el.props.children === '自动').length === 1,
-		JSON.stringify(collect(bareTrigger, (el) => el.type === 'span').map((el) => el.props.children)),
+		'读不到设置时标签说的是「自动」而不是空白/报错',
+		String(bareTrigger?.props['aria-label']).includes('自动'),
+		String(bareTrigger?.props['aria-label']),
+	);
+	check(
+		'没选过模型（读不到设置）时**不**打 data-ffc-picked —— 尾巴保持次要文字色',
+		bareTrigger?.props['data-ffc-picked'] === undefined,
+		String(bareTrigger?.props['data-ffc-picked']),
+	);
+	check(
+		'没选过模型时 title 也如实说「自动」（不是空白）',
+		String(bareTrigger?.props.title).includes('图像：自动') && String(bareTrigger?.props.title).includes('视频：自动'),
+		String(bareTrigger?.props.title),
 	);
 }
 
-// ─────────────── 9. P7：画布按会话隔离（桥 × 作用域 × 工具条读数） ───────────────
+// ─────────── 9. 画布按工作区分隔（桥 × 作用域 × 工具条读数） ───────────
 
-console.log('\n9) P7：画布按会话隔离');
+console.log('\n9) 画布按工作区分隔');
 
 {
+	/** 工作区路径（画布作用域就是它）。 */
+	const WS = 'D:\\agent文件目录\\a画布\\泳装';
 	/** 一块只有种子节点的画布（v2 形态）。 */
-	const seedBoard = (id) =>
+	const seedBoard = (id, sessionId) =>
 		JSON.stringify({
 			version: 2,
 			nodes: [
-				{ id, kind: 'image', x: 0, y: 0, w: 120, h: 120, z: 1, status: 'ready', createdAt: 1 },
+				{
+					id,
+					kind: 'image',
+					x: 0,
+					y: 0,
+					w: 120,
+					h: 120,
+					z: 1,
+					status: 'ready',
+					createdAt: 1,
+					...(sessionId === undefined ? {} : { sessionId }),
+				},
 			],
 			viewport: { x: 0, y: 0, zoom: 1 },
 			ingested: [],
@@ -1501,43 +1692,54 @@ console.log('\n9) P7：画布按会话隔离');
 		return collect(tree, (el) => el.props?.['data-ffc-scope'] !== undefined)[0] ?? null;
 	};
 
-	// ── 9.1 偏好开、有当前会话：画布换到该会话的键上，并采用手上的画布 ──
+	// ── 9.1 默认（没写过偏好）：按工作区分，桥报来 cwd 就落到那个工作区的键上 ──
 	storage.clear();
 	storage.set('fatfish-canvas:view-mode', 'canvas');
-	storage.set('fatfish-canvas:board-scope', 'session');
-	storage.set('fatfish-canvas:board', seedBoard('kept'));
-	const badgeA = scopeBadgeOf(makeFakeCtx({ sessions: sessionsWith('session-live') }));
+	storage.set('fatfish-canvas:board', seedBoard('kept', 'session-live'));
+	const badgeA = scopeBadgeOf(makeFakeCtx({ sessions: sessionsWith('session-live', [], WS) }));
 	check(
-		'打开隔离且有会话：工具条读数是「本会话画布」',
-		badgeA?.props['data-ffc-scope'] === 'session' && String(badgeA.props.children) === '本会话画布',
+		'默认就有工作区：工具条读数是「本工作区画布」',
+		badgeA?.props['data-ffc-scope'] === 'workspace' &&
+			String(badgeA.props.children) === '本工作区画布',
 		`${String(badgeA?.props['data-ffc-scope'])} / ${String(badgeA?.props.children)}`,
 	);
 	check(
-		'桥报来会话 id 之后，画布立刻落到会话自己的键上',
-		String(storage.get('fatfish-canvas:board:session-live')).includes('"kept"'),
-		String(storage.get('fatfish-canvas:board:session-live')).slice(0, 80),
+		'读数把工作区路径带在 DOM 上（title 与 e2e 都用它）',
+		badgeA?.props['data-ffc-scope-path'] === WS &&
+			String(badgeA?.props.title).includes(WS),
+		`${String(badgeA?.props['data-ffc-scope-path'])} / ${String(badgeA?.props.title)}`,
 	);
 	check(
-		'采用当前画布不会搬空共用那块（原来的键原样保留）',
+		'属于当前会话的节点被拆进当前工作区那块画布（换键不丢东西）',
+		String(storage.get(`fatfish-canvas:board:${WS}`)).includes('"kept"'),
+		String(storage.get(`fatfish-canvas:board:${WS}`)).slice(0, 80),
+	);
+	check(
+		'拆分不搬空共用那块（它仍是全部内容的备份）',
 		String(storage.get('fatfish-canvas:board')).includes('"kept"'),
+	);
+	check(
+		'默认值不该落盘（用户没点过那枚读数）',
+		storage.get('fatfish-canvas:board-scope') == null,
+		String(storage.get('fatfish-canvas:board-scope')),
 	);
 
 	// ── 9.2 有偏好但**没有**会话：退回共用，读数如实说「共用画布」 ──
-	storage.delete('fatfish-canvas:board:session-live');
+	storage.delete(`fatfish-canvas:board:${WS}`);
 	const badgeB = scopeBadgeOf(makeFakeCtx());
 	check(
-		'打开隔离但没有会话：读数是「共用画布」（不假装已隔离）',
+		'认不出工作区（没有会话）：读数是「共用画布」（不假装已经分开）',
 		badgeB?.props['data-ffc-scope'] === 'shared' && String(badgeB.props.children) === '共用画布',
 		`${String(badgeB?.props['data-ffc-scope'])} / ${String(badgeB?.props.children)}`,
 	);
 	check(
-		'没有会话时不会凭空造出一块会话画布',
-		storage.get('fatfish-canvas:board:session-live') == null,
-		String(storage.get('fatfish-canvas:board:session-live')),
+		'没有会话时不会凭空造出一块工作区画布',
+		storage.get(`fatfish-canvas:board:${WS}`) == null,
+		String(storage.get(`fatfish-canvas:board:${WS}`)),
 	);
 
 	// ── 9.3 `sessions` 服务缺席（裁剪过的组合）：画布照常可用 ──
-	storage.delete('fatfish-canvas:board:session-live');
+	storage.delete(`fatfish-canvas:board:${WS}`);
 	const base9 = makeFakeCtx();
 	const ctxNoSessions = {
 		...base9,
@@ -1557,16 +1759,17 @@ console.log('\n9) P7：画布按会话隔离');
 		String(badgeC?.props['data-ffc-scope']),
 	);
 
-	// ── 9.4 偏好默认关：即使有会话也不隔离 ──
+	// ── 9.4 显式选了「全部共用一块」：有会话也不分工作区 ──
 	storage.clear();
 	storage.set('fatfish-canvas:view-mode', 'canvas');
-	storage.set('fatfish-canvas:board', seedBoard('shared-one'));
-	const badgeD = scopeBadgeOf(makeFakeCtx({ sessions: sessionsWith('session-live') }));
+	storage.set('fatfish-canvas:board-scope', 'shared');
+	storage.set('fatfish-canvas:board', seedBoard('shared-one', 'session-live'));
+	const badgeD = scopeBadgeOf(makeFakeCtx({ sessions: sessionsWith('session-live', [], WS) }));
 	check(
-		'默认（共用偏好）下，有会话也不换成会话画布',
+		'偏好是 shared 时：有工作区也不换画布',
 		badgeD?.props['data-ffc-scope'] === 'shared' &&
-			storage.get('fatfish-canvas:board:session-live') == null,
-		`${String(badgeD?.props['data-ffc-scope'])} / ${String(storage.get('fatfish-canvas:board:session-live'))}`,
+			storage.get(`fatfish-canvas:board:${WS}`) == null,
+		`${String(badgeD?.props['data-ffc-scope'])} / ${String(storage.get(`fatfish-canvas:board:${WS}`))}`,
 	);
 	storage.clear();
 }
@@ -1594,6 +1797,7 @@ console.log('\n10) P9：设置页的渲染结构');
 		defaultImage: 'acme::acme-large',
 		defaultVideo: '',
 		defaultVision: 'acme::acme-vl',
+		archiveDir: 'D:\\肥鱼图库',
 	};
 
 	/** 记录写入的假 api。 */
@@ -1616,11 +1820,12 @@ console.log('\n10) P9：设置页的渲染结构');
 	 *   2. 探测服务是**派生服务** `remote.mediaProbe`（`$mount` 之后才出现），
 	 *      因此要按那个**服务键**提供，插件才会用嵌套 inject 捕获到它。
 	 *   3. 捕获发生在 apply 期，`inject` 面只返回取值函数 —— 断言要读 `getProbe()`。
-	 * @param options - `{ withProbe }` 是否提供宿主探测服务。
+	 * @param options - `{ withProbe }` 是否提供宿主探测服务；`{ value }` 换一份设置值。
 	 * @returns `{ ctx, section, errors }`。
 	 */
 	const setup = (options = {}) => {
 		const withProbe = options.withProbe !== false;
+		const value = options.value ?? CONFIG;
 		const settings = {
 			mutate: async (ns, ops, expectedRevision) => {
 				if (typeof ns !== 'string' || !Array.isArray(ops)) {
@@ -1676,12 +1881,14 @@ console.log('\n10) P9：设置页的渲染结构');
 			...(withProbe
 				? { remote: { $mount: async () => () => {} }, 'remote.mediaProbe': probe }
 				: {}),
-			settingsScope: {
-				bind: (spec) => ({
-					namespace: spec.namespace,
+			configForms: {
+				// 键必须是 **Loader entry id**（本插件 = `fatfish-canvas`）：
+				// 从前这里是自建 namespace `media-generation`。
+				get: (entryId) => ({
+					namespace: entryId,
 					getSnapshot: () => ({
 						status: 'ready',
-						value: CONFIG,
+						value,
 						base: undefined,
 						user: undefined,
 						revision: 1,
@@ -1732,6 +1939,39 @@ console.log('\n10) P9：设置页的渲染结构');
 		renderError = error;
 	}
 	check('设置页渲染不抛错', renderError === null, String(renderError ?? ''));
+
+	// ── 10.0b 「肥鱼画布」页（P32）：另一个分节，装存储选项 ──
+	//
+	// 用户明确要求把存储选项从「图像 / 视频模型」挪到画布自己的页面里，
+	// 因此这里钉两件事：那一页**渲染得出来**、留档输入框**带着草稿行为**。
+	const canvasSection = a.entries.find((e) => e.spec.id === 'fatfish-canvas');
+	const canvasFace = canvasSection?.spec.inject?.();
+	let canvasTree = null;
+	let canvasError = null;
+	try {
+		canvasTree = renderDeep(canvasSection?.component(canvasFace));
+	} catch (error) {
+		canvasError = error;
+	}
+	check(
+		'「肥鱼画布」页渲染不抛错',
+		canvasSection !== undefined && canvasError === null,
+		String(canvasError ?? '没找到 fatfish-canvas 分节'),
+	);
+	const archiveInput = collect(canvasTree, (el) => el.props?.['data-archive-dir'] !== undefined)[0];
+	check(
+		'「肥鱼画布」页里有留档目录输入框，且回显已配置的值',
+		archiveInput?.props?.value === 'D:\\肥鱼图库',
+		String(archiveInput?.props?.value),
+	);
+	check(
+		'留档目录逐键不写盘（草稿 + 失焦提交）',
+		typeof archiveInput?.props?.onBlur === 'function' && typeof archiveInput?.props?.onChange === 'function',
+	);
+	check(
+		'「图像 / 视频模型」页里**没有**留档输入框了（选项已挪走，不留两份）',
+		collect(tree, (el) => el.props?.['data-archive-dir'] !== undefined).length === 0,
+	);
 
 	const cards = collect(tree, (el) => el.props?.['data-provider'] !== undefined);
 	check(
@@ -1870,6 +2110,104 @@ console.log('\n10) P9：设置页的渲染结构');
 		) && collect(treeC, (el) => el.props?.['data-action'] === 'test').every((el) => el.props.disabled === true),
 	);
 
+	// ── 10.4 常用模型：按家族一行（P29） ──
+	//
+	// 一行 = 一个模型类型：`gpt-image-2` 与它的 `-2k` / `-4k` 兄弟折进同一行，
+	// 将来网关多出来的尾缀也自动落进这一行（匹配按词干，见 shared/modelPresets）。
+	const COMMON_CONFIG = {
+		providers: {
+			acme: {
+				label: 'Acme 网关',
+				baseURL: 'https://gw.acme.example/v1',
+				apiKeyEnv: 'FFC_ACME_API_KEY',
+				models: [
+					{ id: 'gpt-image-2', kind: 'image', apiKeyEnv: '', label: '' },
+					{ id: 'gpt-image-2-2k', kind: 'image', apiKeyEnv: '', label: '' },
+					{ id: 'gpt-image-2-4k', kind: 'image', apiKeyEnv: '', label: '' },
+					{ id: 'acme-vl', kind: 'vision', apiKeyEnv: '', label: '' },
+				],
+			},
+		},
+		defaultImage: 'acme::gpt-image-2-2k',
+		commonModels: { 'acme::gpt-image-2': { pinned: true, quality: true, params: { seed: '7', n: '2' } } },
+	};
+	const d = setup({ value: COMMON_CONFIG });
+	const treeD = renderDeep(d.section.component(d.section.spec.inject()));
+	const families = collect(treeD, (el) => el.props?.['data-family'] !== undefined);
+	check(
+		'常用模型：一个家族一行（-2k / -4k 兄弟折进同一行，视觉模型不进这一块）',
+		families.length === 1 && families[0].props['data-family'] === 'acme::gpt-image-2',
+		families.map((el) => String(el.props['data-family'])).join(','),
+	);
+	check(
+		'常用模型：行上标出命中的类型预置（设置页据此显示「GPT Image 2」而不是裸 id）',
+		families[0]?.props['data-preset'] === 'gpt-image-2',
+		String(families[0]?.props['data-preset']),
+	);
+	check(
+		'常用模型：成员照实列出来（这是「新尾缀自动一起覆盖」唯一看得见的地方）',
+		String(collect(families[0], (el) => hasClass(el, 'ffc-cm-members'))[0]?.props.children).includes(
+			'gpt-image-2-4k',
+		),
+		String(collect(families[0], (el) => hasClass(el, 'ffc-cm-members'))[0]?.props.children),
+	);
+	const pinBox = collect(families[0], (el) => el.props?.['data-action'] === 'pin-common')[0];
+	check('常用模型：勾选状态来自设置（勾过的进聊天栏那格的常用分区）', pinBox?.props.checked === true);
+	check(
+		'常用模型：质量参数显示成中文取值（预置顶上来，零配置就有）',
+		String(collect(families[0], (el) => hasClass(el, 'ffc-cm-axis'))[0]?.props.children).includes('quality') &&
+			String(collect(families[0], (el) => hasClass(el, 'ffc-cm-axis'))[0]?.props.children).includes('高'),
+		String(collect(families[0], (el) => hasClass(el, 'ffc-cm-axis'))[0]?.props.children),
+	);
+	const paramBoxes = collect(families[0], (el) => el.props?.['data-param'] !== undefined);
+	check(
+		'常用模型：其他参数按预置声明渲染（尺寸是下拉、自定义键是输入框，都带「不传」这一档）',
+		paramBoxes.some((el) => el.props['data-param'] === 'size' && el.type === 'select') &&
+			paramBoxes.some((el) => el.props['data-param'] === 'seed' && el.type === 'input') &&
+			collect(families[0], (el) => el.type === 'option' && el.props.value === '').length >= 1,
+		paramBoxes.map((el) => `${String(el.props['data-param'])}:${el.type}`).join(','),
+	);
+	check(
+		'常用模型：保留键（n）不摆框 —— 它永远进不了请求体，摆出来就是「填了不生效」',
+		paramBoxes.every((el) => el.props['data-param'] !== 'n'),
+		paramBoxes.map((el) => String(el.props['data-param'])).join(','),
+	);
+	check(
+		'常用模型：填过的其他参数回显（设置里的默认值）',
+		paramBoxes.find((el) => el.props['data-param'] === 'seed')?.props.value === '7',
+		String(paramBoxes.find((el) => el.props['data-param'] === 'seed')?.props.value),
+	);
+	check(
+		'常用模型：有「自定义键」入口（预置没覆盖的网关参数也能声明）',
+		collect(families[0], (el) => el.props?.['data-field'] === 'new-param').length === 1,
+	);
+
+	// 写入路径：三件事各写各的地方（勾选 / 质量开关 / 其他参数都写 commonModels[家族]）
+	mutateCalls.length = 0;
+	pinBox?.props.onChange({ target: { checked: false } });
+	check(
+		'常用模型：取消勾选写 commonModels[家族].pinned 的 unset（键是家族，不是模型 id）',
+		mutateCalls.length === 1 &&
+			JSON.stringify(mutateCalls[0]?.ops) ===
+				JSON.stringify([{ op: 'unset', path: ['commonModels', 'acme::gpt-image-2', 'pinned'] }]),
+		JSON.stringify(mutateCalls[0]?.ops),
+	);
+	mutateCalls.length = 0;
+	paramBoxes
+		.find((el) => el.props['data-param'] === 'size')
+		?.props.onChange({ target: { value: '2048x2048' } });
+	check(
+		'常用模型：其他参数写 commonModels[家族].params.<键>（下拉一改就落盘）',
+		mutateCalls.length === 1 &&
+			JSON.stringify(mutateCalls[0]?.ops) ===
+				JSON.stringify([
+					{ op: 'set', path: ['commonModels', 'acme::gpt-image-2', 'params', 'size'], value: '2048x2048' },
+				]),
+		JSON.stringify(mutateCalls[0]?.ops),
+	);
+	// 后面那条「渲染必须是纯的」断言靠这个清零（渲染本身仍然一次都没写）
+	mutateCalls.length = 0;
+
 	check('渲染过程没有真的写设置（渲染必须是纯的）', mutateCalls.length === 0, JSON.stringify(mutateCalls));
 	check('渲染过程没有读凭据（副作用只在挂载后的 effect 里）', credentialCalls.length === 0);
 	check('渲染过程没有发起探测', probeCalls.length === 0, JSON.stringify(probeCalls));
@@ -1891,11 +2229,16 @@ console.log('\n10) P9：设置页的渲染结构');
 	check(
 		'改基址失焦真的写了设置（不是只改了草稿就回退）',
 		mutateCalls.length === 1 &&
-			mutateCalls[0].ns === 'media-generation' &&
+			mutateCalls[0].ns === 'fatfish-canvas' &&
 			JSON.stringify(mutateCalls[0].ops) ===
 				JSON.stringify([{ op: 'set', path: ['providers', 'acme', 'baseURL'], value: 'https://gw2.example/v1' }]) &&
 			mutateCalls[0].expectedRevision === 1,
 		JSON.stringify(mutateCalls),
+	);
+	check(
+		'写回的键是 Loader entry id（`fatfish-canvas`），不再是自建 namespace',
+		mutateCalls[0]?.ns === 'fatfish-canvas',
+		String(mutateCalls[0]?.ns),
 	);
 	check(
 		'写入没有把自己弄成错误态（读错信封就会炸在 undefined.settings）',
@@ -1965,7 +2308,7 @@ console.log('\n12) P3 回归：事件窗口 → 画布节点');
 	storage.set('fatfish-canvas:view-mode', 'canvas');
 	storage.set('fatfish-canvas:board', JSON.stringify({ version: 2, nodes: [], viewport: { x: 0, y: 0, zoom: 1 }, ingested: [] }));
 	const sessions1 = sessionsWith('session-live-1', [
-		callEvent('call_00_live', 'media_generate', '{"prompt":"驼色夹克模特试穿图","kind":"image","aspectRatio":"3:4"}', 41),
+		callEvent('call_00_live', 'media_generate', '{"prompt":"驼色夹克模特试穿图","kind":"image","aspectRatio":"3:4","reference":["https://example.test/ref.png","attached"]}', 41),
 	]);
 	const ctxTool = makeFakeCtx({ sessions: sessions1 });
 	factory(makeRequire(pkg.name)).apply(ctxTool);
@@ -1991,11 +2334,30 @@ console.log('\n12) P3 回归：事件窗口 → 画布节点');
 		JSON.stringify(after.nodes.map((n) => ({ s: n.status, src: n.src }))),
 	);
 	check('落图写进了幂等记账', after.ingested.length === 1, JSON.stringify(after.ingested));
+	check(
+		'参考图句柄一路到了画布节点上（tool/call 的参数 → pending → 结果到达后仍在）',
+		JSON.stringify(after.nodes[0].references) === '["https://example.test/ref.png","attached"]',
+		JSON.stringify(after.nodes[0].references),
+	);
 
 	// ── 12.2 窗口重放不重复落图（幂等） ──
 	sessions1.push(resultEvent('call_00_live', META, 42));
 	await settle();
 	check('同一个结果重放不会造第二个节点', boardOf().nodes.length === 1, String(boardOf().nodes.length));
+
+	// ── 12.2b 列表通知之后改跟新会话（真实里就是「切到另一个会话接着画」） ──
+	// 当前会话的判据是列表行上的 `retainedBy.mainView`，**不是** `current` 字段
+	// （真机没有那个字段）。这一条钉住：桥跟着列表通知走，而不是只听开头那一次。
+	sessions1.retain('session-live-1b');
+	sessions1.push(callEvent('call_00_switch', 'media_generate', '{"prompt":"切会话之后的图","kind":"image","aspectRatio":"3:4"}', 51));
+	await settle();
+	const afterSwitch = boardOf();
+	check(
+		'切会话后照常落图，且节点认的是新会话（桥没有停在旧会话上）',
+		afterSwitch.nodes.length === 2 &&
+			afterSwitch.nodes.some((n) => n.status === 'pending' && n.sessionId === 'session-live-1b'),
+		JSON.stringify(afterSwitch.nodes.map((n) => ({ s: n.status, sid: n.sessionId }))),
+	);
 
 	// ── 12.3 命令这条路：一开始就有 pending，`command/done` 后变 ready ──
 	storage.clear();
@@ -2076,12 +2438,22 @@ console.log('\n12) P3 回归：事件窗口 → 画布节点');
 
 	// ── 12.5 假的「会话快照」不能再糊弄过去 ──
 	// 这是本次 bug 的核心断言：把会话数据错放在 getSnapshot() 上，必须**不**落图。
+	// 列表这一侧照真实给（行 + retainedBy）：桥确实绑上了这个会话，
+	// 但旧形状里没有 `eventSource`，所以一个事件都读不到 —— 不落图必须是这个原因。
 	storage.clear();
 	storage.set('fatfish-canvas:view-mode', 'canvas');
 	storage.set('fatfish-canvas:board', JSON.stringify({ version: 2, nodes: [], viewport: { x: 0, y: 0, zoom: 1 }, ingested: [] }));
 	const fakeSessionCtx = makeFakeCtx({
 		sessions: {
-			list: { getSnapshot: () => ({ current: 'legacy' }), subscribe: () => () => {} },
+			list: {
+				getSnapshot: () => ({
+					ids: ['legacy'],
+					byId: { legacy: { id: 'legacy', retainedBy: { mainView: 1 } } },
+					phase: 'ready',
+					projectionsBySession: {},
+				}),
+				subscribe: () => () => {},
+			},
 			binding: () => ({
 				sessionId: 'legacy',
 				// 旧替身的形状：会话数据挂在 SessionSnapshot 上（真实运行里不存在）
@@ -2096,6 +2468,32 @@ console.log('\n12) P3 回归：事件窗口 → 画布节点');
 		boardOf().nodes.length === 0 && boardOf().ingested.length === 0,
 		JSON.stringify(boardOf()),
 	);
+	// ── 12.6 事后才打开的页面：结果与调用头都在窗口里 → 参考图也能回填 ──
+	// 真实的 `tool/result` 自己**不带参数**（只有 callId），窗口里配对的那条
+	// `tool/call` 是这类节点唯一的参考图来源 —— 桥的折叠必须把 argsRaw 一起带上
+	// （见 bridge.ts）：只留工具名的话，右键的「生成信息」在这类节点上永远查不到参考图。
+	storage.clear();
+	storage.set('fatfish-canvas:view-mode', 'canvas');
+	storage.set('fatfish-canvas:board', JSON.stringify({ version: 2, nodes: [], viewport: { x: 0, y: 0, zoom: 1 }, ingested: [] }));
+	const sessionsLate = sessionsWith('session-late', [
+		callEvent('call_late', 'media_generate', '{"prompt":"迟开页面也要看得见参考图","kind":"image","reference":"https://example.test/late-ref.png"}', 60),
+		resultEvent(
+			'call_late',
+			{ fatfishCanvas: { ...META.fatfishCanvas, prompt: '迟开页面也要看得见参考图', url: 'https://example.test/late.png' } },
+			61,
+		),
+	]);
+	factory(makeRequire(pkg.name)).apply(makeFakeCtx({ sessions: sessionsLate }));
+	await settle();
+	const late = boardOf().nodes.find((n) => n.id === 'gen_call_late');
+	check(
+		'结果与调用头都在窗口里时：提示词与参考图一起回填（不必等下一次生成）',
+		late?.status === 'ready' &&
+			late?.prompt === '迟开页面也要看得见参考图' &&
+			JSON.stringify(late?.references) === '["https://example.test/late-ref.png"]',
+		JSON.stringify(late),
+	);
+
 	storage.clear();
 	})();
 }

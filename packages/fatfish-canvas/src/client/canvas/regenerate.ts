@@ -65,6 +65,23 @@ export function referenceOf(node: { src?: string | undefined }): string | null {
 export const REFERENCE_FALLBACK_PROMPT = '参考这张图，生成一张新的变体';
 
 /**
+ * 一组节点里**能当参考图**的地址（按传入顺序）。
+ *
+ * 顺序会一路传到供应商那里（「先主体、后背景」这类语义靠它），因此调用方有责任
+ * 给一个确定的顺序 —— 画布菜单按 (y, x) 排，与导出同一套规矩。
+ * @param nodes - 画布节点（按期望的参考顺序）。
+ * @returns 地址列表；一个都没有时是空数组。
+ */
+export function referencesOf(nodes: readonly { src?: string | undefined }[]): string[] {
+	const out: string[] = [];
+	for (const node of nodes) {
+		const handle = referenceOf(node);
+		if (handle !== null) out.push(handle);
+	}
+	return out;
+}
+
+/**
  * 组装「退回提示词」那条路的正文。
  * @param prompt - 原始提示词。
  * @param kind - 媒体种类。
@@ -85,19 +102,22 @@ export function regeneratePrompt(prompt: string, kind: string, ratio?: string): 
  * @param prompt - 原始提示词。
  * @param kind - 媒体种类。
  * @param ratio - 画幅比例。
- * @param reference - 参考图地址（画布右键那条路用它，见 `referenceOf`）。
+ * @param references - 参考图地址（**按顺序**，画布右键那条路用它，见 `referencesOf`）。
  * @returns 完整命令行。
  */
 export function regenerateCommandLine(
 	prompt: string,
 	kind = 'image',
 	ratio?: string,
-	reference?: string,
+	references?: readonly string[],
 ): string {
 	const parts = [`/${MEDIA_COMMAND_NAME}`];
 	if (kind === 'video') parts.push('--video');
 	if (ratio !== undefined && ratio !== '') parts.push(`--ratio ${ratio}`);
-	if (reference !== undefined && reference !== '') parts.push(`--ref ${reference}`);
+	// 多张就是多个 `--ref`（命令行语法里它是可重复的，顺序 = 参数顺序）
+	for (const reference of references ?? []) {
+		if (reference !== '') parts.push(`--ref ${reference}`);
+	}
 	parts.push(prompt);
 	return `${parts.join(' ')} `;
 }
@@ -126,25 +146,26 @@ function commandMissed(result: unknown): boolean {
  * @param prompt - 原始提示词。
  * @param kind - 媒体种类（默认 image）。
  * @param ratio - 画幅比例。
- * @param reference - 参考图地址（可选）。
+ * @param references - 参考图地址（可选，**按顺序**；多张就是多个 `--ref`）。
  * @returns 实际走通的路径；都失败时 null。
  */
 export async function regenerate(
 	prompt: string,
 	kind = 'image',
 	ratio?: string,
-	reference?: string,
+	references?: readonly string[],
 ): Promise<'command' | 'prompt' | null> {
 	if (target === null || prompt === '') return null;
 	const session = target;
+	const refs = (references ?? []).filter((item) => item !== '');
 
 	try {
-		const result = await session.command(regenerateCommandLine(prompt, kind, ratio, reference));
+		const result = await session.command(regenerateCommandLine(prompt, kind, ratio, refs));
 		if (!commandMissed(result)) return 'command';
 	} catch {
 		/* 命令面不可用：退回提示词 */
 	}
-	if (reference !== undefined && reference !== '') return null;
+	if (refs.length > 0) return null;
 
 	try {
 		await session.prompt([{ type: 'text', text: regeneratePrompt(prompt, kind, ratio) }], 'queue');

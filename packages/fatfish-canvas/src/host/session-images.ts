@@ -8,9 +8,10 @@
  * `textOnlyImageText`）。于是「用户贴了图 + 让模型基于它生成」这条路里，模型手上
  * 只有一个 8 位摘要，它**没法**把图交给生成 API，我们也**不能**指望它编出一个地址。
  *
- * 解法不是改平台，而是让工具自己去会话里把那张图捞出来：会话日志里图片是
+ * 解法不是改平台，而是让工具自己去会话里把那些图捞出来：会话日志里图片是
  * **持久附件引用**（`{ type:'image', attachment: { attachmentId, mediaType, bytes, … } }`），
  * 宿主拿它去 `ctx.attachments.readImage()` 就能取到字节。模型全程不需要看见任何像素。
+ * 一轮里附了多张时**全都捞出来、按贴进来的顺序**（多图编辑要的就是这个顺序）。
  *
  * ## 两条边界
  *
@@ -39,42 +40,46 @@ export interface SessionLike {
 }
 
 /**
- * 从一条消息的 `content` 里取第一张顶层图片的引用。
+ * 从一条消息的 `content` 里取**所有**顶层图片的引用（按出现顺序）。
  * @param data - 事件负载（`user/message` 的 `UserMessage`）。
- * @returns 图片引用；没有顶层图片时 undefined。
+ * @returns 图片引用列表；没有顶层图片时是空数组。
  */
-function imageRefOf(data: unknown): MediaAttachmentRef | undefined {
-	if (data === null || typeof data !== 'object') return undefined;
+function imageRefsOf(data: unknown): MediaAttachmentRef[] {
+	if (data === null || typeof data !== 'object') return [];
 	const content = (data as { content?: unknown }).content;
-	if (!Array.isArray(content)) return undefined;
+	if (!Array.isArray(content)) return [];
+	const out: MediaAttachmentRef[] = [];
 	for (const block of content) {
 		if (block === null || typeof block !== 'object') continue;
 		const typed = block as { type?: unknown; attachment?: unknown };
 		if (typed.type !== 'image') continue;
 		const ref = typed.attachment as MediaAttachmentRef | undefined;
-		if (ref !== undefined && typeof ref.attachmentId === 'string' && ref.attachmentId !== '') return ref;
+		if (ref !== undefined && typeof ref.attachmentId === 'string' && ref.attachmentId !== '') out.push(ref);
 	}
-	return undefined;
+	return out;
 }
 
 /**
- * 用户**在这一回合**附的最新一张图片。
+ * 用户**在这一回合**附的全部图片（按贴进来的先后顺序）。
  *
  * 从日志末尾往回走：遇到 `turn/start` 说明已经走出本回合 → 没有；遇到带顶层图片的
  * `user/message` → 就是它。工具结果那些 `tool/result` 事件天然被跳过（没有顶层图片块）。
- * @param session - 会话面（缺席时返回 undefined）。
- * @returns 图片的持久附件引用；没有时 undefined。
+ *
+ * 只取**最后一条**带图的消息：用户连发两条、各贴一张时，「本回合的参考图」应当
+ * 是最近那次表达，而不是把两轮意图混在一起。
+ * @param session - 会话面（缺席时返回空数组）。
+ * @returns 图片的持久附件引用（按顺序）；没有时是空数组。
  */
-export function attachedImageRef(session: SessionLike | undefined): MediaAttachmentRef | undefined {
-	if (session === undefined || typeof session.snapshotEvents !== 'function') return undefined;
+export function attachedImageRefs(session: SessionLike | undefined): MediaAttachmentRef[] {
+	if (session === undefined || typeof session.snapshotEvents !== 'function') return [];
 	const events = session.snapshotEvents();
 	for (let index = events.length - 1; index >= 0; index -= 1) {
 		const event = events[index];
 		if (event === undefined) continue;
-		if (event.type === 'turn/start') return undefined;
+		if (event.type === 'turn/start') return [];
 		if (event.type !== 'user/message') continue;
-		const ref = imageRefOf(event.data);
-		if (ref !== undefined) return ref;
+		const refs = imageRefsOf(event.data);
+		if (refs.length > 0) return refs;
 	}
-	return undefined;
+	return [];
 }

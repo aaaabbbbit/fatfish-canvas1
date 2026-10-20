@@ -29,22 +29,37 @@ import { applyToDocument, ensureFrameTag, getMode, subscribe } from './state';
 import { CanvasPanel } from './CanvasPanel';
 import { CanvasEntryButton } from './EntryButton';
 import { MediaSettings } from './settings/MediaSettings';
+import { CanvasSettings } from './settings/CanvasSettings';
 import { ModelPicker } from './settings/ModelPicker';
 import { MediaToolRow } from './toolview/MediaToolRow';
+import { UserMessageCopy } from './chat/UserMessageCopy';
 import { installCanvasIngest } from './canvas/bridge';
 import { installCanvasDrop } from './canvas/dropfiles';
 import { installBoardScope } from './canvas/scope';
 import { installViewShortcut } from './shortcut';
-import { MEDIA_NS } from './shared/catalog';
+import { SETTINGS_ENTRY_ID } from './shared/catalog';
 import { setMediaApi, setMediaScope } from './settings/models';
 import { MEDIA_TOOL_NAME } from './shared/media';
-import { PROBE_CLIENT_CONTRIBUTION, PROBE_NAMESPACE } from './shared/probe';
+import {
+	PROBE_CLIENT_CONTRIBUTION,
+	PROBE_NAMESPACE,
+	unwrapFetchedImage,
+	type FetchedImageOutcome,
+} from './shared/probe';
 
 /** cordis 插件名。 */
 export const name = 'fatfish-canvas';
 
-/** 必需服务：插槽注册表（由 dsh-client-runtime 提供）。 */
-export const inject = ['slots'];
+/**
+ * 必需服务：插槽注册表（由 dsh-client-runtime 提供）与设置表单
+ * （`configForms`，由 @deepseek-ai/dsh-client-ui-settings 提供）。
+ *
+ * `configForms` 是**必需**的（而不是像布局那样走嵌套 inject）：本插件的两个
+ * 设置分节都要它，且 `ctx.configForms` 是服务属性访问 —— cordis 要求当前
+ * fiber 声明过该依赖，否则直接抛。package.json 的 `dsh.client.inject` 同时
+ * 声明了 `@deepseek-ai/dsh-client-ui-settings`，浏览器侧的装载次序才是对的。
+ */
+export const inject = ['slots', 'configForms'];
 
 /** 画布面板条目的稳定 id。 */
 const OVERLAY_PANEL = 'fatfish-canvas-panel';
@@ -67,6 +82,13 @@ export interface MediaProbeFace {
 	 * @param url - 图片地址。
 	 */
 	fetchImage(url: string): Promise<unknown>;
+	/**
+	 * 按地址取**媒体**字节（图或视频）—— 画布右键「导出」用。
+	 *
+	 * 与 {@link fetchImage} 分开：那条附件通路只该收图片，导出要的是原样落盘。
+	 * @param url - 媒体地址。
+	 */
+	fetchMedia(url: string): Promise<unknown>;
 }
 
 /**
@@ -103,6 +125,47 @@ let probeFace: MediaProbeFace | undefined;
  */
 export function getProbeFace(): MediaProbeFace | undefined {
 	return probeFace;
+}
+
+/**
+ * 请宿主按地址取一份媒体字节（图或视频），**并把远程信封拆开**。
+ *
+ * 取字节的调用点有三个（点图送进聊天框、画布右键导出、导出时的视频），
+ * 三者要的判断完全一样，因此信封只在这里拆一次：漏拆的症状是「宿主明明取到了，
+ * 页面说取不到」（见 `shared/probe.ts` 的 `unwrapFetchedImage`）。
+ * @param method - 走哪个宿主方法（`fetchImage` 只收图 / `fetchMedia` 还收视频）。
+ * @param url - 媒体地址（http/https）。
+ * @returns 内联数据，或一句可直接展示的失败原因。
+ */
+async function viaHost(method: 'fetchImage' | 'fetchMedia', url: string): Promise<FetchedImageOutcome> {
+	const probe = getProbeFace();
+	if (probe === undefined) {
+		return { ok: false, message: '取图服务还没就绪（宿主半边没加载完），稍后再试' };
+	}
+	try {
+		return unwrapFetchedImage(await probe[method](url));
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { ok: false, message: `取图服务调用失败（${reason}）` };
+	}
+}
+
+/**
+ * 请宿主按地址取一张图（附件通路的入口）。
+ * @param url - 图片地址（http/https）。
+ * @returns 内联数据，或一句可直接展示的失败原因。
+ */
+export async function fetchImageViaHost(url: string): Promise<FetchedImageOutcome> {
+	return viaHost('fetchImage', url);
+}
+
+/**
+ * 请宿主按地址取一份媒体字节（图或视频）—— 导出用（视频上限 64MB）。
+ * @param url - 媒体地址（http/https）。
+ * @returns 内联数据，或一句可直接展示的失败原因。
+ */
+export async function fetchMediaViaHost(url: string): Promise<FetchedImageOutcome> {
+	return viaHost('fetchMedia', url);
 }
 
 /**
@@ -174,7 +237,7 @@ export function apply(ctx: Context): void {
 	// 绑定 —— 这一点是读它的产物确认的，早期版本我曾按 `key`/`locale` 写，结果
 	// 分节注册成功但导航里不出现）。
 	//
-	// P9 起这个页面要三样东西：读配置的 scope、写嵌套叶子的 `connection.api`、
+	// P9 起这个页面要三样东西：读配置的表单、写嵌套叶子的 `connection.api`、
 	// 以及宿主探测服务（测试连接 / 获取模型列表）。
 	//
 	// ⚠️ 后两样必须**先捕获再递进去**，绝不在这个 inject 面里现解析：
@@ -184,36 +247,39 @@ export function apply(ctx: Context): void {
 	// 那一抛发生在分节的 inject 面里 → React 把整棵子树丢掉 →
 	// 现象是「设置导航里有这一项，点开却一片空白」（本轮真实踩到，靠抓浏览器异常定位）。
 	// 现在读的是模块级持有变量：读不到就是 undefined（按钮置灰并说明原因），不抛。
-	ctx.inject(['settingsScope'], (scoped) => {
-		const scope = scoped.settingsScope.bind<Record<string, unknown>>({ namespace: MEDIA_NS });
-		// P17：画布工具条那格「生成模型」读的是同一份设置，但它拿不到分节的 inject 面
-		// （它在 shell.overlay 里），只能读模块级持有变量 —— 在这里接上。
-		setMediaScope(scope);
-		scoped.effect(
-			() => () => {
-				setMediaScope(undefined);
+	//
+	// 读配置那一半换过一次形状：0.1.5 是 `settingsScope.bind({ namespace })`，
+	// 0.2.0 起是 `ctx.configForms.get(<Loader entry id>)`（`settingsScope` 这个
+	// 服务整个没有了）。同一个 entry id 上拿到的是**同一份**表单实例，因此
+	// 下面两处 get 共用它。
+	const mediaForm = ctx.configForms.get<Record<string, unknown>>(SETTINGS_ENTRY_ID);
+	// P17：画布工具条那格「生成模型」读的是同一份设置，但它拿不到分节的 inject 面
+	// （它在 shell.overlay 里），只能读模块级持有变量 —— 在这里接上。
+	setMediaScope(mediaForm);
+	ctx.effect(
+		() => () => {
+			setMediaScope(undefined);
+		},
+		'fatfish-canvas: media model scope',
+	);
+	ctx.slots.inject('settings.section', () =>
+		ctx.slots.register(
+			{
+				name: 'settings.section',
+				id: 'fatfish-canvas-media',
+				order: 40,
+				label: '图像 / 视频模型',
+				inject: () => ({
+					scope: mediaForm,
+					api: hostApi,
+					// 传**取值函数**而不是当时的值：`$mount` 是异步的，
+					// 页面可能先渲染一次、之后探测服务才就绪。
+					getProbe: () => probeFace,
+				}),
 			},
-			'fatfish-canvas: media model scope',
-		);
-		scoped.slots.inject('settings.section', () =>
-			scoped.slots.register(
-				{
-					name: 'settings.section',
-					id: 'fatfish-canvas-media',
-					order: 40,
-					label: '图像 / 视频模型',
-					inject: () => ({
-						scope,
-						api: hostApi,
-						// 传**取值函数**而不是当时的值：`$mount` 是异步的，
-						// 页面可能先渲染一次、之后探测服务才就绪。
-						getProbe: () => probeFace,
-					}),
-				},
-				MediaSettings,
-			),
-		);
-	});
+			MediaSettings,
+		),
+	);
 
 	// ── 4b. 宿主写入面（remote.settings / remote.credentials） ──────────
 	//
@@ -235,6 +301,29 @@ export function apply(ctx: Context): void {
 			'fatfish-canvas: media model write face',
 		);
 	});
+
+	// ── 4c. 「肥鱼画布」自己的设置页（P32） ─────────────────────────────
+	//
+	// 与「图像 / 视频模型」同一个席位、同一份表单与写入面，只是**另开一页**：
+	// 存储这类选项混在供应商配置里既难找，也让那一页越来越长（用户明确要求）。
+	// order 45 = 排在图像 / 视频模型（40）后面、紧挨着。
+	ctx.slots.inject('settings.section', () =>
+		ctx.slots.register(
+			{
+				name: 'settings.section',
+				id: 'fatfish-canvas',
+				order: 45,
+				label: '肥鱼画布',
+				inject: () => ({
+					// 同一个 entry id → 与上面那一页拿到的是同一份表单实例
+					scope: ctx.configForms.get<Record<string, unknown>>(SETTINGS_ENTRY_ID),
+					// 取值函数而不是当时的值：`remote.settings` 是异步就绪的派生服务
+					getApi: () => hostApi,
+				}),
+			},
+			CanvasSettings,
+		),
+	);
 
 	// ── 4c. 挂上远程贡献（客户端 → 宿主的调用面） ────────────────────────
 	//
@@ -316,6 +405,27 @@ export function apply(ctx: Context): void {
 		),
 	);
 
+	// ── 7b. 聊天侧：用户消息上的「复制（含图）」 ────────────────────────
+	//
+	// 平台**没有**「用户消息操作」席位（`conversation.chat.assistant-actions`
+	// 只给 assistant 的回合尾），而插槽注册表按 priority 升序取第一个同 key 的
+	// 条目 —— 因此这里用 `priority: -1` **顶替** ui-chat 自己那条 `user` 渲染器。
+	// 不写 priority 会直接撞上「keyed slot … already has an entry for key "user"」
+	// 而注册失败（那条报错自己就写着 register at a different priority to shadow it）。
+	//
+	// 顶替的代价与边界写在 `chat/UserMessageCopy.tsx` 文件头：图片仍走本体的
+	// `renderMessageImages`，只有样式是自己的一套。
+	ctx.slots.inject('conversation.chat.node', () =>
+		ctx.slots.register(
+			{
+				name: 'conversation.chat.node',
+				key: 'user',
+				priority: -1,
+			},
+			UserMessageCopy,
+		),
+	);
+
 	// ── 8. 米饭碗入口（P10：会话头部右上角，与 session log 同席位） ──────
 	//
 	// 席位是 `conversation.session.header.utilities` —— 聊天区头部**右对齐**的
@@ -327,9 +437,11 @@ export function apply(ctx: Context): void {
 	// 不写 order 的话两者同为 0，次序取决于插件装载先后 —— 那不是设计，是巧合。
 	//
 	// ⚠️ 该席位是**会话作用域**：没有当前会话时（新会话欢迎页）它不渲染。
-	// 那种情况下进入画布靠快捷键 Ctrl/⌘ + Shift + B（按钮 title 里写着）。
+	// 那种情况下进入画布靠快捷键 Ctrl/⌘ + Shift + B（按钮 title 里写着），
+	// **退出**靠画布顶栏那格常驻的「返回聊天」（P49 —— 出口不能只住在会话
+	// 作用域的席位上：画布模式是记住的，刷新会直接落回画布）。
 	// 纯画布模式（canvas-only）收起了整列聊天，头部跟着不存在 —— 那种模式下的
-	// 出口是顶栏的「纯画布」按钮与 Esc，见 CanvasPanel。
+	// 出口是顶栏的「纯画布」与「返回聊天」两格，见 CanvasPanel。
 	ctx.slots.inject('conversation.session.header.utilities', () =>
 		ctx.slots.register(
 			{
