@@ -1591,6 +1591,7 @@ pwsh 的 `Invoke-RestMethod` 打 GitHub（匿名限流）**全部不通**。
 > | e2e 全 401、页面全空 | **§3.38**（令牌只在 `dsh web` 启动那一行；`lib/web-url.txt` 会过期） |
 > | 命令**根本起不来**：`SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区根>)` | **58**（DSH 自己 provision 写权限那一步失败，不是你的命令） |
 > | 根目录能写、`packages/**` 一律写不进（`EPERM: open '…\lib\index.js'`） | **58**（低完整性标签只挂在工作区根、子目录不继承 —— **别去修 ACL**） |
+> | `git add / commit / push` 报 `.git/index.lock: Permission denied`（读命令却都正常） | **58** 症状 C（`.git/` 同样不继承标签 —— 那条 git 命令用完全权限跑，别删锁） |
 > | 截图「改了代码，图一模一样」 | **38**（不覆盖同名文件 / `file://` 缓存） |
 > | 右上角那枚入口量到 `null` | **32** 末尾（席位是会话作用域，先真的开会话） |
 > | 改了宿主但没生效 | §3.4 + **15**（写进「等重启」清单） |
@@ -2191,6 +2192,11 @@ pwsh 的 `Invoke-RestMethod` 打 GitHub（匿名限流）**全部不通**。
       非受限进程是 Medium 完整性，不需要标签。（本机跑过一次 ACL 修复，它只解决症状 A：
       补上的 `WRITE_OWNER` 是 DSH provision 的前提；报告与备份在
       `D:\agent文件目录\acl-recovery\`。）
+    - **症状 C（2026-10-20 踩到）**：读命令（`git status/diff/log`）都正常，一到动 `.git`
+      就 `fatal: Unable to create '…/.git/index.lock': Permission denied` ——
+      `git add` / `commit` / `push` 全废，看着像仓库坏了或有个残留锁。**同一个机制**：
+      `.git/` 是子目录、不继承低完整性标签。修法同上 —— 把**那条 git 命令**用完全权限跑一次，
+      不要删锁文件、不要改 ACL。
     - **判据**：`whoami /groups` 里有没有 `Low Mandatory Level` —— 有就是受限模式，
       写盘问题先查标签，再考虑 ACL。
 59. **`ambient.d.ts` 是手写的 —— 它写错名字时 tsc 全绿、浏览器里整个席位崩掉**
